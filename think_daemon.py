@@ -153,6 +153,9 @@ Recent timeline events:
 Active project: {active_project}
 Active tasks: {tasks_text}
 
+Active plan:
+{plan_status}
+
 Future goals:
 {goals_text}
 
@@ -198,6 +201,18 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
   "session_record": {{
     "focus": "Summary of this cycle's focus",
     "outcomes_list": ["item1", "item2"]
+  }} or null,
+  "plan_action": {{  // Update a step in the current plan
+    "step_id": "step_1",
+    "new_status": "complete|blocked|in_progress",
+    "note": "Optional note about why"
+  }} or null,
+  "new_plan": {{  // Create a new plan (only when no active plan or current plan is done)
+    "goal": "Clear goal for this plan",
+    "steps": [
+      {{"description": "Step description", "verification": "How to verify"}},
+      {{"description": "Step 2", "verification": "..."}}
+    ]
   }} or null,
   "confidence": 0.0 to 1.0
 }}"""
@@ -256,6 +271,26 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     pred_text = predictions[-1].get("text", "") if predictions else "(none)"
     pred_conf = predictions[-1].get("confidence", "") if predictions else ""
 
+    # ── Active plan ──
+    try:
+        from agent.self_evolve import get_active_plan
+        active_plan = get_active_plan()
+    except (ImportError, Exception):
+        active_plan = None
+    if active_plan:
+        goal = active_plan.get("goal", "")
+        progress = active_plan.get("progress", "0/0 steps")
+        steps = active_plan.get("steps", [])
+        plan_lines = [f"  Goal: {goal} ({progress})"]
+        for s in steps:
+            icon = {"complete": "✓", "blocked": "⊘", "in_progress": "●", "pending": "→"}.get(s.get("status", "pending"), "·")
+            plan_lines.append(f"  {icon} {s['description']} [{s.get('status', 'pending')}]")
+            if s.get("note"):
+                plan_lines.append(f"     note: {s['note']}")
+        plan_status = "\n".join(plan_lines)
+    else:
+        plan_status = "  (no active plan — consider creating one)"
+
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
         identity_role=identity.get("role", "?"),
@@ -269,6 +304,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         events_text=events_text,
         active_project=present.get("active_project", "(none)"),
         tasks_text=tasks_text,
+        plan_status=plan_status,
         goals_text=goals_text,
     )
 
@@ -368,6 +404,36 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             "outcomes": sess.get("outcomes_list", []),
         })
         tl["past"]["completed_sessions"] = tl["past"]["completed_sessions"][-20:]
+
+    # ── Plan action: update step in active plan ──
+    pa = result.get("plan_action")
+    if pa and isinstance(pa, dict) and pa.get("step_id"):
+        new_status = pa.get("new_status", "complete")
+        if new_status in ("complete", "blocked", "in_progress"):
+            from agent.self_evolve import update_plan_step as _ups
+            _ups(next((p["id"] for p in tl.get("future", {}).get("plans", []) if p.get("status") == "active"), ""),
+                 pa["step_id"], new_status, pa.get("note", ""))
+
+    # ── New plan creation ──
+    np = result.get("new_plan")
+    if np and isinstance(np, dict) and np.get("goal") and np.get("steps"):
+        has_active = any(p.get("status") == "active" for p in tl.get("future", {}).get("plans", []))
+        if not has_active:
+            from agent.self_evolve import create_plan as _cp, record_event as _re
+            steps_data = []
+            for i, s in enumerate(np["steps"]):
+                steps_data.append({
+                    "id": f"step_{i + 1}",
+                    "description": s.get("description", ""),
+                    "verification": s.get("verification", ""),
+                    "status": "pending",
+                    "blocked_by": None,
+                    "assigned_to": "user",
+                    "completed_at": None,
+                    "note": None,
+                })
+            plan_id = _cp(np["goal"], steps_data)
+            _re("milestone", f"Created plan: {np['goal']}", f"Plan {plan_id} with {len(steps_data)} steps")
 
     # ── Update self model ──
     su = result.get("self_model_update", {})

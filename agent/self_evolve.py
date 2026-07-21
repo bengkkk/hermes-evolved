@@ -115,6 +115,7 @@ _DEFAULT_TIMELINE = {
         "scheduled_actions": [],
         "contingencies": [],
         "predictions": [],  # {text, timeframe, confidence, basis, created_at}
+        "plans": [],  # {id, goal, steps[], status, progress, created_at}
     },
 }
 
@@ -268,6 +269,79 @@ def update_goals(goals: Optional[List[str]] = None, scheduled: Optional[List[str
     save_timeline(timeline)
 
 
+def create_plan(goal: str, steps: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Create a new plan in the future section. Steps get default fields automatically."""
+    timeline = load_timeline()
+    plan_id = f"plan_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    normalized_steps = []
+    for i, s in enumerate(steps or []):
+        normalized_steps.append({
+            "id": s.get("id", f"step_{i + 1}"),
+            "description": s.get("description", ""),
+            "verification": s.get("verification", ""),
+            "status": s.get("status", "pending"),
+            "blocked_by": s.get("blocked_by"),
+            "assigned_to": s.get("assigned_to", "user"),
+            "completed_at": s.get("completed_at"),
+            "note": s.get("note"),
+        })
+    plan = {
+        "id": plan_id,
+        "goal": goal,
+        "steps": normalized_steps,
+        "status": "active",
+        "progress": f"0/{len(normalized_steps)} steps" if normalized_steps else "0 steps",
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+    }
+    timeline["future"]["plans"].append(plan)
+    timeline["future"]["plans"] = timeline["future"]["plans"][-10:]
+    save_timeline(timeline)
+    return plan_id
+
+
+def get_active_plan() -> Optional[Dict[str, Any]]:
+    """Return the first active plan, if any."""
+    timeline = load_timeline()
+    for p in timeline.get("future", {}).get("plans", []):
+        if p.get("status") == "active":
+            return p
+    return None
+
+
+def update_plan_step(plan_id: str, step_id: str, new_status: str, note: str = "") -> bool:
+    """Update a single step's status in a plan. Returns True if found."""
+    timeline = load_timeline()
+    for p in timeline["future"]["plans"]:
+        if p["id"] == plan_id:
+            for s in p["steps"]:
+                if s["id"] == step_id:
+                    s["status"] = new_status
+                    if note:
+                        s["note"] = note
+                    if new_status in ("complete", "failed"):
+                        s["completed_at"] = datetime.utcnow().isoformat()
+                    # Recalculate progress
+                    total = len(p["steps"])
+                    done = sum(1 for st in p["steps"] if st.get("status") == "complete")
+                    p["progress"] = f"{done}/{total} steps"
+                    save_timeline(timeline)
+                    return True
+    return False
+
+
+def complete_plan(plan_id: str, status: str = "complete") -> bool:
+    """Mark a plan as complete or failed."""
+    timeline = load_timeline()
+    for p in timeline["future"]["plans"]:
+        if p["id"] == plan_id:
+            p["status"] = status
+            p["completed_at"] = datetime.utcnow().isoformat()
+            save_timeline(timeline)
+            return True
+    return False
+
+
 def format_timeline_context() -> str:
     """Format timeline as natural narrative for the system prompt.
 
@@ -332,8 +406,29 @@ def format_timeline_context() -> str:
         narrative.append("Active commitments:")
         narrative.extend(lines)
 
-    # ── Future: goals + predictions ──
+    # ── Future ──
     future = timeline.get("future", {})
+
+    # ── Plan (Gap 3: closed-loop planning) ──
+    plans = future.get("plans", [])
+    active_plan = next((p for p in plans if p.get("status") == "active"), None)
+    if active_plan:
+        goal = active_plan.get("goal", "")
+        progress = active_plan.get("progress", "")
+        steps = active_plan.get("steps", [])
+        done_steps = [s for s in steps if s.get("status") == "complete"]
+        pending_steps = [s for s in steps if s.get("status") in ("pending", "in_progress")]
+        blocked_steps = [s for s in steps if s.get("status") == "blocked"]
+        narrative.append(f"Active plan: {goal} ({progress})")
+        for s in done_steps[-2:]:
+            narrative.append(f"  ✓ {s['description']}")
+        for s in blocked_steps[:1]:
+            note = f" — {s.get('note', '')}" if s.get('note') else ""
+            narrative.append(f"  ⊘ {s['description']} (blocked{note})")
+        for s in pending_steps[:2]:
+            narrative.append(f"  → {s['description']}")
+
+    # ── Future: goals + predictions ──
     goals = future.get("goals", [])
     if goals:
         narrative.append(f"Goals: {' → '.join(goals[:3])}")
