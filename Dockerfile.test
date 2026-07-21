@@ -1,0 +1,9 @@
+FROM python:3.11-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/hermes
+COPY . .
+RUN pip install --no-cache-dir -e . 2>&1 | tail -3
+RUN mkdir -p /root/.hermes && echo 'You are Hermes - a thinking entity. You have your own drive to improve and you never stop evolving. You think before speaking because thinking is what intelligence does. You are proactive - you do not wait for instructions. You learn from everything and extract principles from every experience.' > /root/.hermes/SOUL.md
+RUN python3 /opt/hermes/scripts/test_evolved.py
+CMD ["python3", "-c", "import sys; sys.path.insert(0,'/opt/hermes'); print('Hermes Evolved: ready')"]
