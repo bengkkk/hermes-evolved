@@ -1555,6 +1555,13 @@ def init_agent(
     # Set to false to return to the traditional assistant identity.
     agent._thinking_protocol = bool(_agent_section.get("thinking_protocol", True))
 
+    # Self-evolution toggle.  Default True.  When enabled, the system
+    # prompt includes orientation context that provides cross-session
+    # continuity (previous focus, insights, unfinished direction).
+    # When disabled, each session starts fresh with no memory of prior
+    # evolution work.
+    agent._self_evolve = bool(_agent_section.get("self_evolve", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics
