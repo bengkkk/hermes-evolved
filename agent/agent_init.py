@@ -1549,6 +1549,12 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Thinking protocol toggle.  Default True.  When enabled, the system
+    # prompt includes the Thinking Protocol block that encourages genuine
+    # cognitive engagement rather than reactive checklist-following.
+    # Set to false to return to the traditional assistant identity.
+    agent._thinking_protocol = bool(_agent_section.get("thinking_protocol", True))
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

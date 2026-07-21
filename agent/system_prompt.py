@@ -195,6 +195,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # Thinking protocol — added as part of the agent's core identity,
+    # not as a checklist of rules. Describes a way of being, not a
+    # procedure to follow. Gated by config so users who prefer the
+    # traditional assistant identity can opt out.
+    if getattr(agent, "_thinking_protocol", True):
+        from agent.prompt_builder import THINKING_PROTOCOL
+        stable_parts.append(THINKING_PROTOCOL)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
