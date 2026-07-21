@@ -171,6 +171,11 @@ PLAN MANAGEMENT:
 - If the plan section shows "NO ACTIVE PLAN": create one using "new_plan" with a meaningful goal and 2-4 concrete steps. Each step MUST have "description" and "verification".
 - If there IS an active plan: check the steps. If a step can be marked complete (the daemon code has been written), use "plan_action". If a step is blocked, note why.
 
+SEARCH (resolve uncertainties):
+- If you are uncertain about a fact, API, or approach, provide a "search_query" string (e.g., "github ssh key setup"). The search will run AFTER this response.
+- Do NOT guess or fabricate when you are uncertain. Use search_query to find answers.
+- Continue your thinking below; if search results are available, they will be provided and you will produce a final refined insight.
+
 Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
 
 {{
@@ -216,8 +221,9 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     "steps": [
       {{"description": "Step description", "verification": "How to verify"}},
       {{"description": "Step 2", "verification": "..."}}
-    ]
+    ]]
   }} or null,
+  "search_query": "A question or topic to search (or null). Use when uncertain about facts, APIs, or approaches.",
   "confidence": 0.0 to 1.0
 }}"""
 
@@ -592,6 +598,35 @@ async def run_one_cycle() -> Dict[str, Any]:
         result["error"] = f"Could not parse JSON from: {raw[:200]}"
         logger.warning("Parse error: %s", result["error"])
         return result
+
+    # 4.5 Search phase — resolve uncertainties via web search
+    sq = parsed.get("search_query")
+    if sq and isinstance(sq, str) and sq.strip():
+        try:
+            logger.info("Searching: %s", sq[:80])
+            from ddgs import DDGS
+            with DDGS() as ddgs:
+                search_results = list(ddgs.text(sq, max_results=4))
+            if search_results:
+                search_text = "\n".join(
+                    f"- {r['title']}: {r['body'][:200]} ({r['href']})"
+                    for r in search_results
+                )
+                followup = (
+                    f"Search results for '{sq}':\n{search_text}\n\n"
+                    f"Given these results, produce your final JSON. "
+                    f"Include a refined insight field that incorporates this new information. "
+                    f"Set search_query to null in the final output."
+                )
+                messages.append({"role": "user", "content": followup})
+                raw2 = await _call_llm(messages)
+                if raw2:
+                    parsed2 = _try_parse_json(raw2)
+                    if parsed2:
+                        parsed = parsed2
+                        logger.info("Search incorporated into insight")
+        except Exception as e:
+            logger.warning("Search failed: %s", e)
 
     # 5. Apply insights to state
     updates = _apply_insights(parsed, state)
