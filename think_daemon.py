@@ -176,6 +176,10 @@ SEARCH (resolve uncertainties):
 - Do NOT guess or fabricate when you are uncertain. Use search_query to find answers.
 - Continue your thinking below; if search results are available, they will be provided and you will produce a final refined insight.
 
+NEXT STEP RECOMMENDATION:
+- At the end of your thinking, provide a "next_gap" field: which of the remaining gaps (2, 4, 6, 8, 10) should be tackled next and WHY. Base this on the current state of the system.
+- Also set "reasoning" explaining the gap priority from a systems architecture perspective.
+
 Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
 
 {{
@@ -224,6 +228,8 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     ]]
   }} or null,
   "search_query": "A question or topic to search (or null). Use when uncertain about facts, APIs, or approaches.",
+  "next_gap": "2, 4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.",
+  "reasoning": "Why this gap should be tackled next — systems architecture perspective (or null).",
   "confidence": 0.0 to 1.0
 }}"""
 
@@ -646,6 +652,8 @@ async def run_one_cycle() -> Dict[str, Any]:
         "insight": parsed.get("insight", ""),
         "focus_next": parsed.get("focus_next", ""),
         "confidence": parsed.get("confidence", 0),
+        "next_gap": parsed.get("next_gap"),
+        "reasoning": parsed.get("reasoning"),
     }
     if ds.get("first_tick") is None:
         ds["first_tick"] = now_ts
