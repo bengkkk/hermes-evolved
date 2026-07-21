@@ -167,6 +167,10 @@ Think deeply for one cycle. Consider:
 3. What am I uncertain about that I should resolve?
 4. Is there a decision I should record in my timeline?
 
+PLAN MANAGEMENT:
+- If the plan section shows "NO ACTIVE PLAN": create one using "new_plan" with a meaningful goal and 2-4 concrete steps. Each step MUST have "description" and "verification".
+- If there IS an active plan: check the steps. If a step can be marked complete (the daemon code has been written), use "plan_action". If a step is blocked, note why.
+
 Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
 
 {{
@@ -275,7 +279,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     try:
         from agent.self_evolve import get_active_plan
         active_plan = get_active_plan()
-    except (ImportError, Exception):
+    except (ImportError, Exception) as e:
         active_plan = None
     if active_plan:
         goal = active_plan.get("goal", "")
@@ -289,7 +293,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
                 plan_lines.append(f"     note: {s['note']}")
         plan_status = "\n".join(plan_lines)
     else:
-        plan_status = "  (no active plan — consider creating one)"
+        plan_status = "  (NO ACTIVE PLAN)"
 
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
@@ -541,6 +545,29 @@ async def run_one_cycle() -> Dict[str, Any]:
         "self_model": sm,
         "orientation": orient,
     }
+
+    # 1.5 Auto-create initial plan if none exists
+    try:
+        from agent.self_evolve import get_active_plan, create_plan, record_event
+        if get_active_plan() is None:
+            plan_id = create_plan(
+                "Complete hermes-evolved self-evolution framework",
+                steps=[
+                    {"description": "Finalize Timeline and SelfModel data layer",
+                     "verification": "timeline.json has past/present/future sections"},
+                    {"description": "Inject orientation into system prompt",
+                     "verification": "format_orientation_context() content reaches session"},
+                    {"description": "Set up persistent cognition daemon",
+                     "verification": "think_daemon.py --once completes in < 60s"},
+                    {"description": "Push evolve code to GitHub",
+                     "verification": "git push succeeds"},
+                ]
+            )
+            record_event("milestone", f"Auto-created initial plan: {plan_id}")
+            # Reload state so the plan appears in the prompt
+            state["timeline"] = load_timeline()
+    except ImportError:
+        pass
 
     # 2. Build prompt
     prompt = _build_thinking_prompt(state)
