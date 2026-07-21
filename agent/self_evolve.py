@@ -101,17 +101,20 @@ _DEFAULT_TIMELINE = {
     "past": {
         "events": [],
         "completed_sessions": [],
+        "outcomes": [],  # {id, event_id, summary, impact, timestamp}
     },
     "present": {
         "active_project": None,
         "active_tasks": [],
         "waiting_for": [],
         "last_session_focus": None,
+        "commitments": [],  # {id, what, deadline, status, created_at}
     },
     "future": {
         "goals": [],
         "scheduled_actions": [],
         "contingencies": [],
+        "predictions": [],  # {text, timeframe, confidence, basis, created_at}
     },
 }
 
@@ -123,12 +126,16 @@ def load_timeline() -> Dict[str, Any]:
         return dict(_DEFAULT_TIMELINE)
     try:
         data = json.loads(TIMELINE_FILE.read_text(encoding="utf-8"))
-        # Merge with defaults for forward compatibility
+        # Merge: start from defaults, then overlay existing data so new
+        # schema fields (outcomes, commitments, predictions) are never lost.
         merged = dict(_DEFAULT_TIMELINE)
-        merged.update(data)
         for section in ("past", "present", "future"):
-            if section in data:
+            if section in data and isinstance(data[section], dict):
                 merged[section].update(data[section])
+        # Non-section top-level keys (e.g. version)
+        for k in data:
+            if k not in ("past", "present", "future"):
+                merged[k] = data[k]
         return merged
     except (json.JSONDecodeError, OSError) as e:
         logger.debug("Could not load timeline: %s", e)
@@ -176,6 +183,63 @@ def record_session_completion(session_id: str, focus: str, outcomes: List[str]):
     save_timeline(timeline)
 
 
+def record_outcome(event_id: str, summary: str, impact: str = "") -> None:
+    """Record an outcome linked to a past event."""
+    timeline = load_timeline()
+    outcome = {
+        "id": datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+        "event_id": event_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "summary": summary,
+        "impact": impact,
+    }
+    timeline["past"]["outcomes"].append(outcome)
+    timeline["past"]["outcomes"] = timeline["past"]["outcomes"][-50:]
+    save_timeline(timeline)
+
+
+def add_commitment(what: str, deadline: Optional[str] = None, status: str = "active") -> None:
+    """Track a commitment with an optional deadline."""
+    timeline = load_timeline()
+    commit = {
+        "id": datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+        "what": what,
+        "deadline": deadline,
+        "status": status,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    timeline["present"]["commitments"].append(commit)
+    timeline["present"]["commitments"] = timeline["present"]["commitments"][-30:]
+    save_timeline(timeline)
+
+
+def update_commitment(commit_id: str, status: str = "done") -> None:
+    """Mark a commitment as done/expired."""
+    timeline = load_timeline()
+    for c in timeline["present"]["commitments"]:
+        if c["id"] == commit_id:
+            c["status"] = status
+            break
+    save_timeline(timeline)
+
+
+def add_prediction(text: str, timeframe: Optional[str] = None,
+                   confidence: Optional[float] = None, basis: Optional[str] = None) -> None:
+    """Record a prediction about future outcomes."""
+    timeline = load_timeline()
+    pred = {
+        "id": datetime.utcnow().strftime("%Y%m%d%H%M%S"),
+        "text": text,
+        "timeframe": timeframe,
+        "confidence": confidence,
+        "basis": basis,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    timeline["future"]["predictions"].append(pred)
+    timeline["future"]["predictions"] = timeline["future"]["predictions"][-50:]
+    save_timeline(timeline)
+
+
 def update_present_state(active_project: Optional[str] = None, tasks: Optional[List[str]] = None,
                          waiting_for: Optional[List[str]] = None, focus: Optional[str] = None):
     """Update the present state in the timeline."""
@@ -205,53 +269,85 @@ def update_goals(goals: Optional[List[str]] = None, scheduled: Optional[List[str
 
 
 def format_timeline_context() -> str:
-    """Format timeline section for the system prompt."""
+    """Format timeline as natural narrative for the system prompt.
+
+    Output reads like a briefing, not a data dump — the agent
+    should feel it's picking up where it left off.
+    """
     timeline = load_timeline()
-    parts = ["## Timeline"]
+    narrative = ["## Timeline"]
 
-    # Past — recent session (most recent first)
+    # ── Past: last session + recent outcomes ──
     completed = timeline.get("past", {}).get("completed_sessions", [])
-    recent = completed[-3:] if completed else []
-    if recent:
-        parts.append("Completed sessions:")
-        for s in reversed(recent):
-            focus = s.get("focus", "—")
-            outcomes = s.get("outcomes", [])
-            outcome_str = "; ".join(outcomes[:2]) if outcomes else ""
-            parts.append(f"  • {focus}{' — ' + outcome_str if outcome_str else ''}")
+    recent_session = completed[-1] if completed else None
+    if recent_session:
+        focus = recent_session.get("focus", "—")
+        n_outcomes = len(recent_session.get("outcomes", []))
+        narrative.append(f"Last session focus: {focus}")
+        if n_outcomes:
+            narrative.append(f"Completed {n_outcomes} items.")
 
-    # Past — recent events
+    # ── Past: recent events (up to 2, most impactful) ──
     events = timeline.get("past", {}).get("events", [])
-    recent_events = events[-3:] if events else []
-    if recent_events:
-        parts.append("Recent events:")
-        for e in recent_events:
-            parts.append(f"  • {e.get('summary', '—')}")
+    recent = events[-3:] if events else []
+    if recent:
+        lines = []
+        for e in recent:
+            lines.append(f"  · {e.get('summary', '—')}")
+        narrative.append("Recent events:")
+        narrative.extend(lines)
 
-    # Present
+    # ── Outcomes ──
+    outcomes = timeline.get("past", {}).get("outcomes", [])
+    recent_outcomes = outcomes[-2:] if outcomes else []
+    if recent_outcomes:
+        lines = [f"  · {o.get('summary', '—')}" + (f" ({o.get('impact', '')})" if o.get('impact') else "")
+                 for o in recent_outcomes]
+        narrative.append("Results:")
+        narrative.extend(lines)
+
+    # ── Present: active context ──
     present = timeline.get("present", {})
-    active = present.get("active_project")
-    if active:
-        parts.append(f"Active project: {active}")
+    project = present.get("active_project")
     tasks = present.get("active_tasks", [])
-    if tasks:
-        parts.append(f"Active tasks: {'; '.join(tasks[:3])}")
     waiting = present.get("waiting_for", [])
+    bits = []
+    if project:
+        bits.append(f"project: {project}")
+    if tasks:
+        bits.append(f"tasks: {'; '.join(tasks[:3])}")
     if waiting:
-        parts.append(f"Waiting for: {'; '.join(waiting[:2])}")
+        bits.append(f"waiting: {'; '.join(waiting[:2])}")
+    if bits:
+        narrative.append("Current state — " + "; ".join(bits))
 
-    # Future goals
+    # ── Commitments ──
+    commitments = present.get("commitments", [])
+    active_commits = [c for c in commitments if c.get("status") == "active"]
+    if active_commits:
+        lines = []
+        for c in active_commits[:3]:
+            deadline_str = f" (by {c['deadline']})" if c.get("deadline") else ""
+            lines.append(f"  · {c['what']}{deadline_str}")
+        narrative.append("Active commitments:")
+        narrative.extend(lines)
+
+    # ── Future: goals + predictions ──
     future = timeline.get("future", {})
     goals = future.get("goals", [])
     if goals:
-        parts.append("Goals:")
-        for g in goals[:3]:
-            parts.append(f"  → {g}")
-    scheduled = future.get("scheduled_actions", [])
-    if scheduled:
-        parts.append(f"Scheduled: {'; '.join(scheduled[:2])}")
+        narrative.append(f"Goals: {' → '.join(goals[:3])}")
+    predictions = future.get("predictions", [])
+    if predictions:
+        last_pred = predictions[-1]
+        pred_text = last_pred.get("text", "")
+        pred_tf = last_pred.get("timeframe", "")
+        pred_conf = last_pred.get("confidence", "")
+        tf_str = f" [{pred_tf}]" if pred_tf else ""
+        conf_str = f" (confidence: {pred_conf})" if pred_conf else ""
+        narrative.append(f"Prediction:{tf_str} {pred_text}{conf_str}")
 
-    return "\n".join(parts)
+    return "\n".join(narrative)
 
 
 # ═════════════════════════════════════════════════════════════════

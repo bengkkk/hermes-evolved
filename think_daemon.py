@@ -180,6 +180,25 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     "unknown": "New unknown area or null",
     "new_commitment": "New commitment or null"
   }},
+  "outcome_to_record": {{
+    "event_id": "auto",
+    "summary": "What actually resulted from this event",
+    "impact": "The effect"
+  }} or null,
+  "commitment": {{
+    "what": "Concrete commitment I am making",
+    "deadline": "YYYY-MM-DD" or null
+  }} or null,
+  "prediction": {{
+    "text": "Prediction about future trajectory",
+    "timeframe": "3 days" or null,
+    "confidence": 0.0 to 1.0,
+    "basis": "Why I predict this"
+  }} or null,
+  "session_record": {{
+    "focus": "Summary of this cycle's focus",
+    "outcomes_list": ["item1", "item2"]
+  }} or null,
   "confidence": 0.0 to 1.0
 }}"""
 
@@ -217,9 +236,25 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     goals = future.get("goals", [])
     goals_text = "\n".join(f"  → {g}" for g in goals[:5]) if goals else "  (none)"
 
-    # Commitments
-    commit_list = commits.get("promised_features", []) + commits.get("active_obligations", [])
-    commitments_text = "; ".join(commit_list[:5]) if commit_list else "(none)"
+    # Commitments (from timeline + self_model)
+    tl_commits = present.get("commitments", [])
+    active_commits = [c for c in tl_commits if c.get("status") == "active"]
+    timeline_commit_text = "; ".join(c["what"] for c in active_commits[:3]) if active_commits else "(none)"
+    sm_commit_list = commits.get("promised_features", []) + commits.get("active_obligations", [])
+    all_commits = timeline_commit_text
+    if sm_commit_list:
+        all_commits += "; " + "; ".join(sm_commit_list[:3])
+
+    # Recent outcomes
+    outcomes = tl.get("past", {}).get("outcomes", [])
+    outcomes_text = "\n".join(
+        f"  · {o.get('summary','—')}" for o in outcomes[-3:]
+    ) if outcomes else "  (none)"
+
+    # Existing predictions
+    predictions = future.get("predictions", [])
+    pred_text = predictions[-1].get("text", "") if predictions else "(none)"
+    pred_conf = predictions[-1].get("confidence", "") if predictions else ""
 
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
@@ -230,7 +265,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         strengths="; ".join(strengths[:5]) if strengths else "(none)",
         weaknesses="; ".join(weaknesses[:3]) if weaknesses else "(none)",
         unknown="; ".join(unknown[:3]) if unknown else "(none)",
-        commitments=commitments_text,
+        commitments=all_commits,
         events_text=events_text,
         active_project=present.get("active_project", "(none)"),
         tasks_text=tasks_text,
@@ -268,11 +303,13 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     orient = state.get("orientation", load_orientation())
 
     # ── Record event in timeline ──
+    event_id = None
     event = result.get("event_to_record")
     if event and isinstance(event, dict) and event.get("summary"):
         now = datetime.now(timezone.utc).isoformat()
+        event_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         tl.setdefault("past", {}).setdefault("events", []).append({
-            "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+            "id": event_id,
             "type": event.get("type", "reflection"),
             "timestamp": now,
             "summary": event["summary"],
@@ -280,6 +317,57 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         })
         # Keep last 50
         tl["past"]["events"] = tl["past"]["events"][-50:]
+
+    # ── Record outcome ──
+    outcome = result.get("outcome_to_record")
+    if outcome and isinstance(outcome, dict) and outcome.get("summary"):
+        target_event_id = outcome.get("event_id", "auto")
+        if target_event_id == "auto" and event_id:
+            target_event_id = event_id
+        tl.setdefault("past", {}).setdefault("outcomes", []).append({
+            "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+            "event_id": target_event_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": outcome["summary"],
+            "impact": outcome.get("impact", ""),
+        })
+        tl["past"]["outcomes"] = tl["past"]["outcomes"][-50:]
+
+    # ── Record commitment ──
+    new_commit = result.get("commitment")
+    if new_commit and isinstance(new_commit, dict) and new_commit.get("what"):
+        tl.setdefault("present", {}).setdefault("commitments", []).append({
+            "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+            "what": new_commit["what"],
+            "deadline": new_commit.get("deadline"),
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tl["present"]["commitments"] = tl["present"]["commitments"][-30:]
+
+    # ── Record prediction ──
+    pred = result.get("prediction")
+    if pred and isinstance(pred, dict) and pred.get("text"):
+        tl.setdefault("future", {}).setdefault("predictions", []).append({
+            "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+            "text": pred["text"],
+            "timeframe": pred.get("timeframe"),
+            "confidence": pred.get("confidence"),
+            "basis": pred.get("basis"),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        tl["future"]["predictions"] = tl["future"]["predictions"][-50:]
+
+    # ── Record session summary ──
+    sess = result.get("session_record")
+    if sess and isinstance(sess, dict) and sess.get("focus"):
+        tl.setdefault("past", {}).setdefault("completed_sessions", []).append({
+            "session_id": f"cycle_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "focus": sess["focus"],
+            "outcomes": sess.get("outcomes_list", []),
+        })
+        tl["past"]["completed_sessions"] = tl["past"]["completed_sessions"][-20:]
 
     # ── Update self model ──
     su = result.get("self_model_update", {})
