@@ -1,0 +1,37 @@
+# Minimal dev Dockerfile for hermes-evolved
+# Build: docker build -t hermes-evolved -f Dockerfile.evolved .
+# Run:   docker run -it --rm -v ~/.hermes:/root/.hermes hermes-evolved [command]
+
+FROM python:3.11-slim
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates curl ripgrep gcc python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/hermes-evolved
+
+# Install uv
+RUN pip install --no-cache-dir "uv>=0.6,<1"
+
+# Copy manifests first (layer caching)
+COPY pyproject.toml uv.lock ./
+RUN touch README.md
+
+# Install dependencies (project not yet installed)
+RUN uv sync --frozen --no-install-project --no-dev
+
+# Now copy source code
+COPY . .
+
+# Install our project in editable mode
+RUN uv pip install --no-cache-dir --no-deps -e "."
+
+# Runtime env
+ENV HERMES_HOME=/root/.hermes
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/opt/hermes-evolved/.venv/bin:$PATH"
+
+ENTRYPOINT ["uv", "run", "hermes"]
+CMD ["--help"]

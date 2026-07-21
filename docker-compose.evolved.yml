@@ -1,0 +1,41 @@
+# Docker Compose for hermes-evolved (dev build)
+# Build:   docker compose -f docker-compose.evolved.yml build
+# Run:     docker compose -f docker-compose.evolved.yml up -d think-daemon
+# Shell:   docker compose -f docker-compose.evolved.yml run --rm hermes chat
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile.evolved
+    image: hermes-evolved:latest
+    container_name: hermes-evolved
+    entrypoint: ["uv", "run", "hermes"]
+    command: ["--help"]
+    volumes:
+      - ~/.hermes:/root/.hermes
+      - ~/.git-credentials:/root/.git-credentials:ro
+    environment:
+      - HERMES_HOME=/root/.hermes
+      - PYTHONUNBUFFERED=1
+    stdin_open: true
+    tty: true
+    profiles:
+      - default
+
+  think-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile.evolved
+    image: hermes-evolved:latest
+    container_name: hermes-evolved-daemon
+    entrypoint: ["uv", "run", "python3", "think_daemon.py"]
+    command: ["--interval", "900"]
+    volumes:
+      - ~/.hermes:/root/.hermes
+    environment:
+      - HERMES_HOME=/root/.hermes
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    profiles:
+      - daemon
