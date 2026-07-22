@@ -28,6 +28,7 @@ HISTORY_FILE = EVOLVE_DIR / "history.jsonl"
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
 SELF_MODEL_FILE = EVOLVE_DIR / "self_model.json"
 MEMORY_FILE = EVOLVE_DIR / "memory.json"
+GOALS_FILE = EVOLVE_DIR / "goals.json"
 
 
 def ensure_evolve_dir():
@@ -623,6 +624,117 @@ def format_memory_context() -> str:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Self-generated Goals (Gap 4 — Goal Generation)
+# ═════════════════════════════════════════════════════════════════
+
+_DEFAULT_GOALS = {
+    "version": 1,
+    "goals": [],
+}
+
+
+def load_goals() -> Dict[str, Any]:
+    """Load self-generated goals."""
+    ensure_evolve_dir()
+    if not GOALS_FILE.exists():
+        return dict(_DEFAULT_GOALS)
+    try:
+        data = json.loads(GOALS_FILE.read_text(encoding="utf-8"))
+        merged = dict(_DEFAULT_GOALS)
+        merged.update(data)
+        if "goals" in data and isinstance(data["goals"], list):
+            merged["goals"] = data["goals"]
+        return merged
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("Could not load goals: %s", e)
+        return dict(_DEFAULT_GOALS)
+
+
+def save_goals(goals_store: Dict[str, Any]):
+    """Persist the goals store."""
+    ensure_evolve_dir()
+    try:
+        GOALS_FILE.write_text(
+            json.dumps(goals_store, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning("Could not save goals: %s", e)
+
+
+def propose_goal(title: str, description: str, rationale: str,
+                 gap_reference: str = "", verification_criteria: str = "",
+                 priority: int = 3, dependencies: Optional[List[str]] = None) -> str:
+    """Propose a new self-generated goal."""
+    goals_store = load_goals()
+    goal_id = f"goal_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    goal = {
+        "id": goal_id,
+        "title": title,
+        "description": description,
+        "rationale": rationale,
+        "priority": priority,
+        "status": "proposed",
+        "gap_reference": gap_reference,
+        "dependencies": dependencies or [],
+        "estimated_effort": "",
+        "verification_criteria": verification_criteria,
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "notes": "",
+    }
+    goals_store["goals"].append(goal)
+    goals_store["goals"] = goals_store["goals"][-100:]
+    save_goals(goals_store)
+    return goal_id
+
+
+def update_goal_status(goal_id: str, new_status: str, note: str = "") -> bool:
+    """Update a goal's lifecycle. Valid: active|in_progress|completed|abandoned."""
+    goals_store = load_goals()
+    for g in goals_store["goals"]:
+        if g["id"] == goal_id:
+            g["status"] = new_status
+            if new_status in ("completed", "abandoned"):
+                g["completed_at"] = datetime.utcnow().isoformat()
+            if note:
+                g["notes"] = note
+            save_goals(goals_store)
+            return True
+    return False
+
+
+def get_active_goals(status_filter: Optional[List[str]] = None) -> List[Dict]:
+    """Get goals filtered by status. Default: proposed + active + in_progress."""
+    goals_store = load_goals()
+    statuses = status_filter or ["proposed", "active", "in_progress"]
+    filtered = [g for g in goals_store["goals"] if g.get("status") in statuses]
+    filtered.sort(key=lambda g: (g.get("priority", 5), g.get("created_at", "")))
+    return filtered
+
+
+def format_goal_context() -> str:
+    """Format pending goals for the system prompt."""
+    goals_store = load_goals()
+    pending = get_active_goals()
+    parts = ["## Self-generated Goals"]
+    if not pending:
+        parts.append("  (no self-generated goals yet)")
+        return "\n".join(parts)
+
+    for g in pending:
+        sym = {"proposed": "◇", "active": "○", "in_progress": "◎"}.get(g.get("status", ""), "·")
+        deps = f" [depends: {', '.join(g['dependencies'][:3])}]" if g.get("dependencies") else ""
+        gap = f" [{g['gap_reference']}]" if g.get("gap_reference") else ""
+        parts.append(f"  {sym} P{g.get('priority', 3)} — {g['title']}{deps}{gap}")
+        parts.append(f"      {g.get('description', '')[:80]}")
+
+    active_count = sum(1 for g in pending if g.get("status") in ("active", "in_progress"))
+    proposed_count = sum(1 for g in pending if g.get("status") == "proposed")
+    parts.append(f"  ({active_count} active, {proposed_count} proposed)")
+    return "\n".join(parts)
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Self Model (Gap 7 — Stable Self Model)
 # ═════════════════════════════════════════════════════════════════
 
@@ -767,7 +879,12 @@ def format_orientation_context() -> str:
     if mem:
         parts.append(mem)
 
-    # Section 4: Self Model
+    # Section 4: Self-generated Goals (Gap 4)
+    gl = format_goal_context()
+    if gl:
+        parts.append(gl)
+
+    # Section 5: Self Model
     sm = format_self_model_context()
     if sm:
         parts.append(sm)

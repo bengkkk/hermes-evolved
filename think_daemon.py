@@ -171,6 +171,13 @@ PLAN MANAGEMENT:
 - If the plan section shows "NO ACTIVE PLAN": create one using "new_plan" with a meaningful goal and 2-4 concrete steps. Each step MUST have "description" and "verification".
 - If there IS an active plan: check the steps. If a step can be marked complete (the daemon code has been written), use "plan_action". If a step is blocked, note why.
 
+GOAL GENERATION:
+- You can propose new self-generated goals for the system's evolution.
+- Goals should improve the system, fill remaining gaps (4, 6, 8, 10), and be based on what you've learned.
+- Use "new_goal" to propose (include title, description, rationale, priority 1-5, gap_reference).
+- Use "goal_action" to transition existing goals (active → in_progress → completed).
+- Prioritize: what unblocks the most other capabilities?
+
 SEARCH (resolve uncertainties):
 - If you are uncertain about a fact, API, or approach, provide a "search_query" string (e.g., "github ssh key setup"). The search will run AFTER this response.
 - Do NOT guess or fabricate when you are uncertain. Use search_query to find answers.
@@ -244,7 +251,20 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     "trigger": "When this applies",
     "procedure": "What to do"
   }} or null,
-  "next_gap": "2, 4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.",
+  "new_goal": {{  // Propose a new self-generated goal (Gap 4)
+    "title": "Clear goal name",
+    "description": "What success looks like",
+    "rationale": "Why this matters for self-evolution",
+    "gap_reference": "Which gap it addresses (4, 6, 8, or 10)",
+    "priority": 1 to 5,
+    "verification_criteria": "How to know it's done"
+  }} or null,
+  "goal_action": {{  // Update existing goal lifecycle
+    "goal_id": "goal_...",
+    "new_status": "active|in_progress|completed|abandoned",
+    "note": "Why this change"
+  }} or null,
+  "next_gap": "4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.", — which gap to tackle next (or null). Based on system state analysis.",
   "reasoning": "Why this gap should be tackled next — systems architecture perspective (or null).",
   "confidence": 0.0 to 1.0
 }}"""
@@ -509,6 +529,23 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     if pr and isinstance(pr, dict) and pr.get("pattern") and pr.get("trigger") and pr.get("procedure"):
         from agent.self_evolve import add_procedural as _ap
         _ap(pattern=pr["pattern"], trigger=pr["trigger"], procedure=pr["procedure"])
+
+    # ── Self-generated Goals (Gap 4) ──
+    ng = result.get("new_goal")
+    if ng and isinstance(ng, dict) and ng.get("title") and ng.get("description"):
+        from agent.self_evolve import propose_goal as _pg, record_event as _re
+        gid = _pg(title=ng["title"], description=ng["description"],
+                   rationale=ng.get("rationale", ""),
+                   gap_reference=ng.get("gap_reference", ""),
+                   verification_criteria=ng.get("verification_criteria", ""),
+                   priority=ng.get("priority", 3))
+        _re("milestone", f"Proposed new goal: {ng['title']}", f"Goal {gid}")
+
+    ga = result.get("goal_action")
+    if ga and isinstance(ga, dict) and ga.get("goal_id") and ga.get("new_status"):
+        from agent.self_evolve import update_goal_status as _ugs, record_event as _re
+        if _ugs(ga["goal_id"], ga["new_status"], ga.get("note", "")):
+            _re("milestone", f"Goal {ga['goal_id']} → {ga['new_status']}", ga.get("note", ""))
 
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")
