@@ -71,12 +71,20 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 # ═════════════════════════════════════════════════════════════════
 
 def _load_json(path: Path, default: Any) -> Any:
-    """Load a JSON file, returning default on failure."""
+    """Load a JSON file, returning default on failure. Validates version if present."""
     try:
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
+            # Schema version check — if stored version is newer than expected, reset
+            if isinstance(data, dict) and "version" in data:
+                dv = data["version"]
+                dd = default.get("version", 1) if isinstance(default, dict) else 1
+                if dv > dd + 1:  # more than 1 version ahead? something went wrong
+                    logger.warning("%s has version %d, expected <= %d — resetting to default", path.name, dv, dd)
+                    return default
+            return data
     except (json.JSONDecodeError, OSError) as e:
-        logger.debug("Could not load %s: %s", path.name, e)
+        logger.warning("Could not load %s: %s — resetting to default", path.name, e)
     return default
 
 
@@ -97,6 +105,25 @@ def load_daemon_state() -> Dict[str, Any]:
 
 def save_daemon_state(state: Dict[str, Any]) -> None:
     _save_json(DAEMON_STATE_FILE, state)
+
+
+def _print_cycle_stats() -> None:
+    """Print reliability metrics to stdout."""
+    ds = load_daemon_state()
+    cs = ds.get("cycle_stats", {})
+    total = cs.get("total", 0)
+    if total <= 1:
+        return
+    ok_rate = cs.get("ok", 0) / total * 100
+    failures = cs.get("error", 0) + cs.get("parse_error", 0)
+    print(f"  reliability: {cs.get('ok',0)} ok / {failures} fail / {ok_rate:.0f}% success")
+    print(f"     avg {cs.get('avg_duration',0):.1f}s / max {cs.get('max_duration',0):.1f}s / total {total} cycles")
+    if ok_rate < 80 and total >= 5:
+        print("  health: degraded — below 80% success rate")
+    elif cs.get("error", 0) == 0 and total >= 3:
+        print("  health: stable — no failures")
+    else:
+        print("  health: acceptable")
 
 
 def load_timeline() -> Dict[str, Any]:
@@ -580,26 +607,39 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         logger.error("Could not import Hermes auxiliary_client. Is HERMES_ROOT correct?")
         return None
 
-    try:
-        response = await async_call_llm(
-            task=task,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=512,
-        )
-        # response is an OpenAI-style response object
-        if hasattr(response, "choices") and response.choices:
-            return response.choices[0].message.content
-        # Fallback: dict-style
-        if isinstance(response, dict):
-            choices = response.get("choices", [])
-            if choices:
-                return choices[0].get("message", {}).get("content", "")
-        logger.warning("Unexpected response shape from async_call_llm: %s", type(response).__name__)
-        return None
-    except Exception as e:
-        logger.warning("LLM call failed: %s", e)
-        return None
+    max_retries = 3
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = await asyncio.wait_for(
+                async_call_llm(
+                    task=task,
+                    messages=messages,
+                    temperature=0.3,
+                    max_tokens=512,
+                ),
+                timeout=90.0,
+            )
+            # response is an OpenAI-style response object
+            if hasattr(response, "choices") and response.choices:
+                return response.choices[0].message.content
+            # Fallback: dict-style
+            if isinstance(response, dict):
+                choices = response.get("choices", [])
+                if choices:
+                    return choices[0].get("message", {}).get("content", "")
+            logger.warning("Unexpected response shape: %s", type(response).__name__)
+            return None
+        except asyncio.TimeoutError:
+            logger.warning("LLM call attempt %d/%d timed out after 90s", attempt, max_retries)
+            last_error = "timeout"
+        except Exception as e:
+            logger.warning("LLM call attempt %d/%d failed: %s", attempt, max_retries, e)
+            last_error = str(e)
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
+    logger.error("LLM call failed after %d retries: %s", max_retries, last_error)
+    return None
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -607,7 +647,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
 # ═════════════════════════════════════════════════════════════════
 
 async def run_one_cycle() -> Dict[str, Any]:
-    """Run a single thinking cycle, returning a result dict with status and any updates."""
+    """Run a single thinking cycle with reliability wrapping."""
     start_time = time.time()
     result = {
         "status": "ok",
@@ -616,8 +656,54 @@ async def run_one_cycle() -> Dict[str, Any]:
         "error": None,
     }
 
-    # 1. Load current state
+    # ── Pre-cycle health snapshot ──
     ds = load_daemon_state()
+    ds.setdefault("cycle_stats", {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
+                                      "avg_duration": 0.0, "max_duration": 0.0})
+    cs = ds["cycle_stats"]
+    cs["total"] += 1
+
+    # ── Main cycle with timeout ──
+    try:
+        result = await asyncio.wait_for(
+            _run_cycle_body(result, ds),
+            timeout=120.0,
+        )
+    except asyncio.TimeoutError:
+        result["status"] = "timeout"
+        result["error"] = "Cycle exceeded 120s hard limit"
+        logger.warning("Cycle timed out after 120s")
+    except Exception as e:
+        result["status"] = "crash"
+        result["error"] = f"Cycle crashed: {e}"
+        logger.exception("Cycle crashed: %s", e)
+
+    # ── Post-cycle stats ──
+    dur = time.time() - start_time
+    result["tick_duration"] = round(dur, 1)
+
+    if result["status"] == "ok":
+        cs["ok"] += 1
+    elif result["status"] in ("error", "crash", "timeout"):
+        cs["error"] += 1
+    elif result["status"] == "parse_error":
+        cs["parse_error"] = cs.get("parse_error", 0) + 1
+    else:
+        cs["error"] += 1
+
+    n = cs["ok"] + cs["error"] + cs.get("parse_error", 0)
+    cs["avg_duration"] = round((cs.get("avg_duration", 0) * max(n - 1, 0) + dur) / max(n, 1), 1)
+    cs["max_duration"] = max(cs.get("max_duration", 0), dur)
+
+    ds["cycle_stats"] = cs
+    save_daemon_state(ds)
+    return result
+
+
+async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[str, Any]:
+    """Core cycle body, extracted so run_one_cycle can wrap it with timeout."""
+    _cycle_start_time = time.time()
+    # 1. Load current state
     tl = load_timeline()
     sm = load_self_model()
     orient = load_orientation()
@@ -731,7 +817,7 @@ async def run_one_cycle() -> Dict[str, Any]:
     save_daemon_state(ds)
 
     # 8. Build result
-    elapsed = time.time() - start_time
+    elapsed = time.time() - _cycle_start_time
     result["tick_duration"] = round(elapsed, 2)
     result["insight"] = parsed.get("insight", "")
     result["focus_next"] = parsed.get("focus_next", "")
@@ -815,13 +901,14 @@ def main():
 
     if args.once:
         r = asyncio.run(run_one_cycle())
-        # Print one-line summary for cron delivery
         status = r.get("status", "error")
         if status == "ok":
             insight = r.get("insight", "")[:80]
             print(f"[{status}] tick {r.get('tick_duration',0):.1f}s — {insight}")
         else:
             print(f"[{status}] {r.get('error', 'unknown error')}")
+        # Print reliability stats
+        _print_cycle_stats()
     else:
         asyncio.run(run_daemon(args.interval, args.cycles))
 
