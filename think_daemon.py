@@ -203,7 +203,18 @@ GOAL GENERATION:
 - Goals should improve the system, fill remaining gaps (4, 6, 8, 10), and be based on what you've learned.
 - Use "new_goal" to propose (include title, description, rationale, priority 1-5, gap_reference).
 - Use "goal_action" to transition existing goals (active → in_progress → completed).
-- Prioritize: what unblocks the most other capabilities?
+|- Prioritize: what unblocks the most other capabilities?
+
+ACTION CAPABILITIES (Gap 10):
+- You can now execute actions directly in the container.
+- Use the "action" field. Supported types:
+  - write_file: write a file (set path + content)
+  - shell: run a shell command (set command)
+  - git_commit: add + commit (set message)
+  - install_package: pip install (set package)
+- Actions execute after JSON. Results in next cycle context.
+- Always verify. Prefer small incremental steps.
+- Example: {{"type": "write_file", "path": "tmp/test.txt", "content": "hello"}}
 
 SEARCH (resolve uncertainties):
 - If you are uncertain about a fact, API, or approach, provide a "search_query" string (e.g., "github ssh key setup"). The search will run AFTER this response.
@@ -248,6 +259,15 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
   "session_record": {{
     "focus": "Summary of this cycle's focus",
     "outcomes_list": ["item1", "item2"]
+  }} or null,
+  "action": {{
+    "type": "write_file|shell|git_commit|install_package",
+    "description": "What this action does",
+    "path": "for write_file",
+    "content": "file content",
+    "command": "shell command",
+    "package": "package name",
+    "message": "commit message"
   }} or null,
   "plan_action": {{  // Update a step in the current plan
     "step_id": "step_1",
@@ -574,6 +594,53 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         if _ugs(ga["goal_id"], ga["new_status"], ga.get("note", "")):
             _re("milestone", f"Goal {ga['goal_id']} → {ga['new_status']}", ga.get("note", ""))
 
+    # ── Actions (Gap 10) ──
+    act = result.get("action")
+    if act and isinstance(act, dict) and act.get("type"):
+        atype = act["type"]
+        desc = act.get("description", "")
+        logger.info("Executing action: %s — %s", atype, desc[:60])
+        try:
+            from agent.self_evolve import add_episodic as _add_ep
+            import subprocess, pathlib as _pl
+            if atype == "write_file":
+                apath = act.get("path", "")
+                acontent = act.get("content", "")
+                if apath and acontent:
+                    p = _pl.Path(apath)
+                    if not p.is_absolute():
+                        p = _pl.Path("/tmp/hermes-evolved") / apath
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(acontent)
+                    _add_ep("action", "Wrote " + apath, desc)
+            elif atype == "shell":
+                acmd = act.get("command", "")
+                if acmd:
+                    r = subprocess.run(acmd, shell=True, capture_output=True, text=True, timeout=60)
+                    rv = (r.stdout[:200] + "\n" + r.stderr[:200])[:300]
+                    _add_ep("action", "Shell: " + acmd[:60], "exit=" + str(r.returncode) + ": " + rv)
+            elif atype == "git_commit":
+                amsg = act.get("message", "")
+                if amsg:
+                    subprocess.run(["git", "add", "-A"], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
+                    r = subprocess.run(["git", "commit", "-m", amsg], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
+                    _add_ep("action", "Commit: " + amsg[:60], r.stdout[:200])
+            elif atype == "install_package":
+                apkg = act.get("package", "")
+                if apkg:
+                    r = subprocess.run(["pip", "install", apkg, "--break-system-packages"], capture_output=True, text=True, timeout=120)
+                    _add_ep("action", "Installed: " + apkg, "exit=" + str(r.returncode) + ": " + r.stdout[:200])
+            else:
+                logger.warning("Unknown action type: %s", atype)
+        except subprocess.TimeoutExpired:
+            logger.warning("Action %s timed out", atype)
+            _add_ep("action", "Action timed out: " + atype, desc)
+        except Exception as e:
+            logger.warning("Action %s failed: %s", atype, e)
+            _add_ep("action", "Action failed: " + atype, str(e)[:200])
+        finally:
+            from agent.self_evolve import save_memory, load_memory
+            save_memory(load_memory())
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")
     focus_next = result.get("focus_next", "")
