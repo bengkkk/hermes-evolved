@@ -228,6 +228,22 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     ]]
   }} or null,
   "search_query": "A question or topic to search (or null). Use when uncertain about facts, APIs, or approaches.",
+  "episodic_record": {{
+    "mtype": "success|failure|observation",
+    "summary": "What happened (brief)",
+    "details": "More detail if needed",
+    "salience": 0.0 to 1.0
+  }} or null,
+  "semantic_record": {{
+    "topic": "What this knowledge is about",
+    "fact": "The fact or insight learned",
+    "confidence": 0.0 to 1.0
+  }} or null,
+  "procedural_record": {{
+    "pattern": "Name of the pattern",
+    "trigger": "When this applies",
+    "procedure": "What to do"
+  }} or null,
   "next_gap": "2, 4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.",
   "reasoning": "Why this gap should be tackled next — systems architecture perspective (or null).",
   "confidence": 0.0 to 1.0
@@ -475,6 +491,24 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             commits.setdefault("promised_features", [])
             if new_commit not in commits["promised_features"]:
                 commits["promised_features"].append(new_commit)
+
+    # ── Multi-type Memory (Gap 2) ──
+    er = result.get("episodic_record")
+    if er and isinstance(er, dict) and er.get("summary"):
+        from agent.self_evolve import add_episodic as _ae
+        _ae(mtype=er.get("mtype", "observation"), summary=er["summary"],
+            details=er.get("details", ""), salience=er.get("salience", 0.5))
+
+    sr = result.get("semantic_record")
+    if sr and isinstance(sr, dict) and sr.get("topic") and sr.get("fact"):
+        from agent.self_evolve import add_semantic as _asem
+        _asem(topic=sr["topic"], fact=sr["fact"],
+              source=sr.get("source", "experience"), confidence=sr.get("confidence", 0.7))
+
+    pr = result.get("procedural_record")
+    if pr and isinstance(pr, dict) and pr.get("pattern") and pr.get("trigger") and pr.get("procedure"):
+        from agent.self_evolve import add_procedural as _ap
+        _ap(pattern=pr["pattern"], trigger=pr["trigger"], procedure=pr["procedure"])
 
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")

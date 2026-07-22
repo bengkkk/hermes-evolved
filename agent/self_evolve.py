@@ -27,6 +27,7 @@ ORIENTATION_FILE = EVOLVE_DIR / "orientation.json"
 HISTORY_FILE = EVOLVE_DIR / "history.jsonl"
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
 SELF_MODEL_FILE = EVOLVE_DIR / "self_model.json"
+MEMORY_FILE = EVOLVE_DIR / "memory.json"
 
 
 def ensure_evolve_dir():
@@ -446,6 +447,182 @@ def format_timeline_context() -> str:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Multi-type Memory (Gap 2 — Episodic / Semantic / Procedural)
+# ═════════════════════════════════════════════════════════════════
+
+_DEFAULT_MEMORY = {
+    "version": 1,
+    "episodic": [],   # experiences, observations, interactions
+    "semantic": [],   # facts, knowledge, concepts
+    "procedural": [], # how-to patterns, behaviors
+}
+
+
+def load_memory() -> Dict[str, Any]:
+    """Load the multi-type memory store."""
+    ensure_evolve_dir()
+    if not MEMORY_FILE.exists():
+        return dict(_DEFAULT_MEMORY)
+    try:
+        data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        merged = dict(_DEFAULT_MEMORY)
+        merged.update(data)
+        for section in ("episodic", "semantic", "procedural"):
+            if section in data and isinstance(data[section], list):
+                merged[section] = data[section]
+        return merged
+    except (json.JSONDecodeError, OSError) as e:
+        logger.debug("Could not load memory: %s", e)
+        return dict(_DEFAULT_MEMORY)
+
+
+def save_memory(memory: Dict[str, Any]):
+    """Persist the memory store."""
+    ensure_evolve_dir()
+    try:
+        MEMORY_FILE.write_text(
+            json.dumps(memory, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as e:
+        logger.warning("Could not save memory: %s", e)
+
+
+def add_episodic(mtype: str, summary: str, details: str = "",
+                 tags: Optional[List[str]] = None, salience: float = 0.5) -> str:
+    """Record an episodic memory (experience/observation/interaction)."""
+    memory = load_memory()
+    mem_id = f"ep_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    entry = {
+        "id": mem_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "type": mtype,
+        "summary": summary,
+        "details": details,
+        "salience": salience,
+        "tags": tags or [],
+    }
+    memory["episodic"].append(entry)
+    memory["episodic"] = memory["episodic"][-200:]
+    save_memory(memory)
+    return mem_id
+
+
+def add_semantic(topic: str, fact: str, source: str = "experience",
+                 confidence: float = 0.7) -> str:
+    """Record a semantic fact (knowledge/concept learned)."""
+    memory = load_memory()
+    mem_id = f"sem_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    entry = {
+        "id": mem_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "topic": topic,
+        "fact": fact,
+        "source": source,
+        "confidence": confidence,
+        "last_accessed": datetime.utcnow().isoformat(),
+    }
+    # Deduplicate: same topic + same fact
+    for existing in memory["semantic"]:
+        if existing.get("topic") == topic and existing.get("fact") == fact:
+            existing["last_accessed"] = datetime.utcnow().isoformat()
+            existing["confidence"] = max(existing.get("confidence", 0), confidence)
+            save_memory(memory)
+            return existing["id"]
+    memory["semantic"].append(entry)
+    memory["semantic"] = memory["semantic"][-500:]
+    save_memory(memory)
+    return mem_id
+
+
+def add_procedural(pattern: str, trigger: str, procedure: str) -> str:
+    """Record a procedural memory (how-to pattern)."""
+    memory = load_memory()
+    mem_id = f"pro_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    entry = {
+        "id": mem_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "pattern": pattern,
+        "trigger": trigger,
+        "procedure": procedure,
+        "success_count": 1,
+        "failure_count": 0,
+    }
+    for existing in memory["procedural"]:
+        if existing.get("pattern") == pattern:
+            existing["success_count"] += 1
+            save_memory(memory)
+            return existing["id"]
+    memory["procedural"].append(entry)
+    memory["procedural"] = memory["procedural"][-100:]
+    save_memory(memory)
+    return mem_id
+
+
+def search_memories(query: str, memory_types: Optional[List[str]] = None,
+                    limit: int = 5) -> Dict[str, List[Dict]]:
+    """Simple text search across memory types."""
+    memory = load_memory()
+    q = query.lower()
+    types = memory_types or ["episodic", "semantic", "procedural"]
+    results = {}
+    for mt in types:
+        matches = []
+        for entry in memory.get(mt, []):
+            text = json.dumps(entry).lower()
+            if q in text:
+                matches.append(entry)
+        results[mt] = matches[:limit]
+    return results
+
+
+def get_relevant_semantic(topic: str, limit: int = 3) -> List[Dict]:
+    """Get semantic facts matching a topic."""
+    memory = load_memory()
+    tl = topic.lower()
+    matches = []
+    for entry in memory.get("semantic", []):
+        if tl in entry.get("topic", "").lower() or tl in entry.get("fact", "").lower():
+            matches.append(entry)
+    return matches[-limit:]
+
+
+def format_memory_context() -> str:
+    """Format memory section for the system prompt."""
+    memory = load_memory()
+    parts = ["## Recent Memories"]
+
+    episodic = memory.get("episodic", [])
+    recent_ep = episodic[-3:] if episodic else []
+    if recent_ep:
+        parts.append("Recent experiences:")
+        for e in recent_ep:
+            sal = "★" if e.get("salience", 0) >= 0.8 else "·"
+            parts.append(f"  {sal} {e['summary'][:80]}")
+
+    semantic = memory.get("semantic", [])
+    recent_sem = semantic[-3:] if semantic else []
+    if recent_sem:
+        parts.append("Knowledge gained:")
+        for s in recent_sem:
+            conf = f" ({s.get('confidence', 0):.0%})" if s.get('confidence') else ""
+            parts.append(f"  · {s['topic']}: {s['fact'][:100]}{conf}")
+
+    procedural = memory.get("procedural", [])
+    recent_pro = procedural[-2:] if procedural else []
+    if recent_pro:
+        parts.append("Learned patterns:")
+        for p in recent_pro:
+            sc = p.get("success_count", 0)
+            fc = p.get("failure_count", 0)
+            parts.append(f"  · {p['pattern']} (✓{sc} ✗{fc})")
+
+    if not (recent_ep or recent_sem or recent_pro):
+        parts.append("  (no recent memories yet)")
+
+    return "\n".join(parts)
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Self Model (Gap 7 — Stable Self Model)
 # ═════════════════════════════════════════════════════════════════
 
@@ -585,7 +762,12 @@ def format_orientation_context() -> str:
     if tl:
         parts.append(tl)
 
-    # Section 3: Self Model
+    # Section 3: Multi-type Memory (Gap 2)
+    mem = format_memory_context()
+    if mem:
+        parts.append(mem)
+
+    # Section 4: Self Model
     sm = format_self_model_context()
     if sm:
         parts.append(sm)
