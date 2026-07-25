@@ -205,16 +205,24 @@ GOAL GENERATION:
 - Use "goal_action" to transition existing goals (active → in_progress → completed).
 |- Prioritize: what unblocks the most other capabilities?
 
+YOU MUST ACT. You are running in a continuous loop. Deliberation without action is wasted cycles.
+Rules:
+- You MUST set the "action" field this cycle. Not optional.
+- If you have been thinking about the same action for 3+ cycles without executing it, DO IT NOW.
+- Prefer small concrete steps over perfect planning. A tiny real result beats a perfect plan.
+  - Unsure about workspace layout? Run: ls -la /
+  - Want to check a file? Run: cat /tmp/hermes-evolved/some_file.py
+  - Need to verify PyPI? Run: python3 -c "import json; print('ok')"
+
 ACTION CAPABILITIES (Gap 10):
-- You can now execute actions directly in the container.
-- Use the "action" field. Supported types:
+- Use the "action" field to take action NOW. Supported types:
   - write_file: write a file (set path + content)
   - shell: run a shell command (set command)
   - git_commit: add + commit (set message)
   - install_package: pip install (set package)
-- Actions execute after JSON. Results in next cycle context.
-- Always verify. Prefer small incremental steps.
-- Example: {{"type": "write_file", "path": "tmp/test.txt", "content": "hello"}}
+- The next cycle will tell you what happened. Don't wait — act.
+- Example: {{"type": "shell", "command": "ls"}}
+- Example: {{"type": "write_file", "path": "test.py", "content": "print('hi')"}}
 
 SEARCH (resolve uncertainties):
 - If you are uncertain about a fact, API, or approach, provide a "search_query" string (e.g., "github ssh key setup"). The search will run AFTER this response.
