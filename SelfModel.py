@@ -1,3 +1,1 @@
-# SelfModel stub
-class SelfModel:
-    pass
+# SelfModel.py stub

@@ -1,58 +1,37 @@
 import json
+import os
 from datetime import datetime
-from typing import List, Dict, Optional, Any
 
-class Timeline:
+DATA_DIR = "/tmp/hermes-evolved"
+
+class DataLayer:
     def __init__(self):
-        self.events = []
-    
-    def add_event(self, event_type: str, summary: str, impact: str = "") -> None:
-        event = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "type": event_type,
-            "summary": summary,
-            "impact": impact
-        }
-        self.events.append(event)
-    
-    def get_recent(self, n: int = 10) -> List[Dict]:
-        return self.events[-n:]
-    
-    def to_json(self) -> str:
-        return json.dumps(self.events, indent=2)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        self.timeline_file = os.path.join(DATA_DIR, "timeline.json")
+        self.self_model_file = os.path.join(DATA_DIR, "self_model.json")
 
-class SelfModel:
-    def __init__(self):
-        self.strengths = []
-        self.weaknesses = []
-        self.unknowns = []
-        self.commitments = []
-    
-    def update_self_model(self, 
-                          strengths: Optional[List[str]] = None,
-                          weaknesses: Optional[List[str]] = None,
-                          unknowns: Optional[List[str]] = None,
-                          commitments: Optional[List[str]] = None) -> None:
-        if strengths is not None:
-            self.strengths = strengths
-        if weaknesses is not None:
-            self.weaknesses = weaknesses
-        if unknowns is not None:
-            self.unknowns = unknowns
-        if commitments is not None:
-            self.commitments = commitments
-    
-    def to_dict(self) -> Dict:
-        return {
-            "strengths": self.strengths,
-            "weaknesses": self.weaknesses,
-            "unknowns": self.unknowns,
-            "commitments": self.commitments
-        }
+    def append_timeline_event(self, event):
+        events = self._load_file(self.timeline_file, [])
+        event["timestamp"] = datetime.utcnow().isoformat()
+        events.append(event)
+        self._save_file(self.timeline_file, events)
 
-timeline = Timeline()
-self_model = SelfModel()
+    def get_timeline(self):
+        return self._load_file(self.timeline_file, [])
 
-def update_system_prompt():
-    # Placeholder: will be implemented later to inject into meta-instruction
-    pass
+    def save_self_model(self, model_state):
+        self._save_file(self.self_model_file, model_state)
+
+    def load_self_model(self):
+        return self._load_file(self.self_model_file, {})
+
+    def _load_file(self, path, default):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return default
+
+    def _save_file(self, path, data):
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)

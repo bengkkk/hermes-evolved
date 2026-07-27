@@ -1,3 +1,1 @@
-# Timeline stub
-class Timeline:
-    pass
+# Timeline.py stub
