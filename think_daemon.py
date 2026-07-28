@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -35,19 +34,13 @@ _HERMES_ROOT = Path(__file__).resolve().parent
 if str(_HERMES_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERMES_ROOT))
 
+# ── Consolidated data layer ──
+from data_layer import get_evolve_dir, safe_read_json, safe_write_json
+
 logger = logging.getLogger("think_daemon")
 
-# ── Paths ──
-EVOLVE_DIR = (
-    Path(os.environ.get("HERMES_HOME", "~/.hermes"))
-    if os.environ.get("HERMES_HOME")
-    else Path.home() / ".hermes" / "evolve"
-)
-if not os.environ.get("HERMES_HOME"):
-    EVOLVE_DIR = Path.home() / ".hermes" / "evolve"
-else:
-    EVOLVE_DIR = Path(os.environ["HERMES_HOME"]) / "evolve"
-
+# ── Paths (delegated to data_layer for the base directory) ──
+EVOLVE_DIR = get_evolve_dir()
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
 SELF_MODEL_FILE = EVOLVE_DIR / "self_model.json"
 ORIENTATION_FILE = EVOLVE_DIR / "orientation.json"
@@ -67,44 +60,15 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 
 
 # ═════════════════════════════════════════════════════════════════
-#  State helpers
+#  State helpers (delegated to data_layer for the heavy lifting)
 # ═════════════════════════════════════════════════════════════════
 
-def _load_json(path: Path, default: Any) -> Any:
-    """Load a JSON file, returning default on failure. Validates version if present."""
-    try:
-        if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            # Schema version check — if stored version is newer than expected, reset
-            if isinstance(data, dict) and "version" in data:
-                dv = data["version"]
-                dd = default.get("version", 1) if isinstance(default, dict) else 1
-                if dv > dd + 1:  # more than 1 version ahead? something went wrong
-                    logger.warning("%s has version %d, expected <= %d — resetting to default", path.name, dv, dd)
-                    return default
-            return data
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("Could not load %s: %s — resetting to default", path.name, e)
-    return default
-
-
-def _save_json(path: Path, data: Any) -> None:
-    """Atomically write a JSON file."""
-    try:
-        EVOLVE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
-    except OSError as e:
-        logger.warning("Could not write %s: %s", path.name, e)
-
-
 def load_daemon_state() -> Dict[str, Any]:
-    return _load_json(DAEMON_STATE_FILE, dict(_DEFAULT_DAEMON_STATE))
+    return safe_read_json(DAEMON_STATE_FILE, dict(_DEFAULT_DAEMON_STATE))
 
 
 def save_daemon_state(state: Dict[str, Any]) -> None:
-    _save_json(DAEMON_STATE_FILE, state)
+    safe_write_json(DAEMON_STATE_FILE, state)
 
 
 def _print_cycle_stats() -> None:
@@ -127,33 +91,33 @@ def _print_cycle_stats() -> None:
 
 
 def load_timeline() -> Dict[str, Any]:
-    return _load_json(TIMELINE_FILE, {
+    return safe_read_json(TIMELINE_FILE, {
         "version": 1, "past": {"events": [], "completed_sessions": []},
         "present": {}, "future": {"goals": []},
     })
 
 
 def save_timeline(data: Dict[str, Any]) -> None:
-    _save_json(TIMELINE_FILE, data)
+    safe_write_json(TIMELINE_FILE, data)
 
 
 def load_self_model() -> Dict[str, Any]:
-    return _load_json(SELF_MODEL_FILE, {
+    return safe_read_json(SELF_MODEL_FILE, {
         "version": 1, "identity": {"name": "Hermes (evolved)"},
         "state": {}, "capabilities": {}, "commitments": {},
     })
 
 
 def save_self_model(data: Dict[str, Any]) -> None:
-    _save_json(SELF_MODEL_FILE, data)
+    safe_write_json(SELF_MODEL_FILE, data)
 
 
 def load_orientation() -> Optional[Dict[str, Any]]:
-    return _load_json(ORIENTATION_FILE, None)
+    return safe_read_json(ORIENTATION_FILE, None)
 
 
 def save_orientation(data: Dict[str, Any]) -> None:
-    _save_json(ORIENTATION_FILE, data)
+    safe_write_json(ORIENTATION_FILE, data)
 
 
 # ═════════════════════════════════════════════════════════════════

@@ -1,15 +1,16 @@
 """
-Data layer for Hermes Evolved — single authoritative source for Timeline
-and SelfModel persistence.
+Data layer for Hermes Evolved — single authoritative source for Timeline,
+SelfModel, and persistent state management.
 
 Consolidates 10+ fragmented implementations into one canonical module with:
 - File-backed persistence with atomic writes
 - Modern datetime (timezone-aware, no deprecated utcnow())
+- Robust JSON I/O with version validation and error handling
 - Full type hints
 - Both in-memory and persistent access patterns
 
 Usage:
-    from data_layer import Timeline, SelfModel
+    from data_layer import Timeline, SelfModel, safe_read_json, safe_write_json
 
     # In-memory
     tl = Timeline()
@@ -19,6 +20,10 @@ Usage:
     sm = SelfModel.load()  # or SelfModel() to start fresh
     sm.add_strength("file-backed persistence")
     sm.save()
+
+    # Low-level utilities (shared by daemon and self_evolve)
+    data = safe_read_json(path, default={})
+    safe_write_json(path, data)
 
 Storage paths default to ~/.hermes/evolve/ (same as agent/self_evolve.py),
 override via HERMES_EVOLVE_DIR env var.
@@ -46,7 +51,66 @@ _EVOLVE_DIR = Path(
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Helpers
+#  Public helpers — reusable across daemon, self_evolve, and tests
+# ═══════════════════════════════════════════════════════════════════
+
+def get_evolve_dir() -> Path:
+    """Return the evolve data directory (created on first access)."""
+    _EVOLVE_DIR.mkdir(parents=True, exist_ok=True)
+    return _EVOLVE_DIR
+
+
+def safe_read_json(path: Path, default: Any = None) -> Any:
+    """Read and parse a JSON file with version validation and resilience.
+
+    Args:
+        path: Path to the JSON file.
+        default: Value returned on failure. If dict with a ``"version"`` key,
+                 used for schema version validation (rejects versions more
+                 than 1 ahead of the default).
+
+    Returns:
+        Parsed data on success, *default* on failure or version mismatch.
+    """
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            # Schema version check — guard against downgrade corruption
+            if isinstance(data, dict) and isinstance(default, dict):
+                dv = data.get("version", 1)
+                dd = default.get("version", 1)
+                if dv > dd + 1:
+                    logger.warning(
+                        "%s has version %d, expected <= %d — resetting",
+                        path.name, dv, dd,
+                    )
+                    return default
+            return data
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("Could not read %s: %s — returning default", path.name, e)
+    return default
+
+
+def safe_write_json(path: Path, data: Any) -> None:
+    """Atomically write a JSON file with crash safety and error resilience.
+
+    Writes to a ``.tmp`` staging file, then renames atomically.
+    Logs a warning on failure instead of raising.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
+        tmp.replace(path)
+    except OSError as e:
+        logger.warning("Could not write %s: %s", path.name, e)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Internal helpers (used by classes below; prefer safe_read/write for external use)
 # ═══════════════════════════════════════════════════════════════════
 
 def _now_iso() -> str:
