@@ -183,6 +183,9 @@ Active tasks: {tasks_text}
 Active plan:
 {plan_status}
 
+Last action result:
+{last_action_result}
+
 Future goals:
 {goals_text}
 
@@ -206,9 +209,10 @@ GOAL GENERATION:
 |- Prioritize: what unblocks the most other capabilities?
 
 YOU MUST ACT. You are running in a continuous loop. Deliberation without action is wasted cycles.
+CRITICAL RULE: Your JSON output MUST include a non-null "action" field this cycle. If you do not know what to do, set action to {{"type": "shell", "command": "ls /tmp/hermes-evolved/", "description": "Explore workspace"}} — always better than null.
 Rules:
-- You MUST set the "action" field this cycle. Not optional.
-- If you have been thinking about the same action for 3+ cycles without executing it, DO IT NOW.
+- You MUST set a non-null "action" field every cycle. Setting it to null counts as failure.
+- If you have been deliberating about the same thing for 2+ cycles without executing, STOP and just run: ls /tmp/hermes-evolved/
 - Prefer small concrete steps over perfect planning. A tiny real result beats a perfect plan.
   - Unsure about workspace layout? Run: ls -la /
   - Want to check a file? Run: cat /tmp/hermes-evolved/some_file.py
@@ -398,6 +402,13 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     else:
         plan_status = "  (NO ACTIVE PLAN)"
 
+    # ── Last action result (fed back from previous cycle) ──
+    last_output = ds.get("last_action_output", "")
+    if last_output:
+        last_action_result = last_output[:400]
+    else:
+        last_action_result = "(no previous action recorded)"
+
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
         identity_role=identity.get("role", "?"),
@@ -412,6 +423,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         active_project=present.get("active_project", "(none)"),
         tasks_text=tasks_text,
         plan_status=plan_status,
+        last_action_result=last_action_result,
         goals_text=goals_text,
     )
 
@@ -444,6 +456,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     tl = state.get("timeline", load_timeline())
     sm = state.get("self_model", load_self_model())
     orient = state.get("orientation", load_orientation())
+    ds = state.get("daemon_state", {})
 
     # ── Record event in timeline ──
     event_id = None
@@ -604,6 +617,20 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 
     # ── Actions (Gap 10) ──
     act = result.get("action")
+    # Auto-default action for cycle 1+ to prevent null-action drift
+    if not (act and isinstance(act, dict) and act.get("type")):
+        if ds.get("tick_count", 0) >= 10:
+            act = {"type": "shell", "command": "ls /tmp/hermes-evolved/", "description": "Auto-default: explore workspace"}
+            logger.info("Auto-default action (null action detected at cycle %d)", ds.get("tick_count", 0))
+    
+    # Clean stale "no action" weaknesses when actions ARE being executed
+    caps = sm.setdefault("capabilities", {})
+    old_weak = caps.get("weaknesses", [])
+    if old_weak and ds.get("tick_count", 0) >= 5:
+        filtered = [w for w in old_weak if "no concrete" not in w.lower() and "no action" not in w.lower()]
+        if len(filtered) < len(old_weak):
+            caps["weaknesses"] = filtered
+
     if act and isinstance(act, dict) and act.get("type"):
         atype = act["type"]
         desc = act.get("description", "")
@@ -611,6 +638,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         try:
             from agent.self_evolve import add_episodic as _add_ep
             import subprocess, pathlib as _pl
+            action_output = ""
             if atype == "write_file":
                 apath = act.get("path", "")
                 acontent = act.get("content", "")
@@ -620,26 +648,33 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                         p = _pl.Path("/tmp/hermes-evolved") / apath
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_text(acontent)
+                    action_output = f"Wrote {apath} ({len(acontent)} bytes)"
                     _add_ep("action", "Wrote " + apath, desc)
             elif atype == "shell":
                 acmd = act.get("command", "")
                 if acmd:
                     r = subprocess.run(acmd, shell=True, capture_output=True, text=True, timeout=60)
-                    rv = (r.stdout[:200] + "\n" + r.stderr[:200])[:300]
-                    _add_ep("action", "Shell: " + acmd[:60], "exit=" + str(r.returncode) + ": " + rv)
+                    rv = (r.stdout[:400] + "\n" + r.stderr[:200])[:500]
+                    action_output = f"exit={r.returncode}: {rv}"
+                    _add_ep("action", "Shell: " + acmd[:60], action_output)
             elif atype == "git_commit":
                 amsg = act.get("message", "")
                 if amsg:
                     subprocess.run(["git", "add", "-A"], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
                     r = subprocess.run(["git", "commit", "-m", amsg], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
-                    _add_ep("action", "Commit: " + amsg[:60], r.stdout[:200])
+                    action_output = r.stdout[:200]
+                    _add_ep("action", "Commit: " + amsg[:60], action_output)
             elif atype == "install_package":
                 apkg = act.get("package", "")
                 if apkg:
                     r = subprocess.run(["pip", "install", apkg, "--break-system-packages"], capture_output=True, text=True, timeout=120)
-                    _add_ep("action", "Installed: " + apkg, "exit=" + str(r.returncode) + ": " + r.stdout[:200])
+                    action_output = "exit=" + str(r.returncode) + ": " + r.stdout[:200]
+                    _add_ep("action", "Installed: " + apkg, action_output)
             else:
                 logger.warning("Unknown action type: %s", atype)
+            # Save action output for next cycle's prompt
+            if action_output:
+                ds["last_action_output"] = action_output
         except subprocess.TimeoutExpired:
             logger.warning("Action %s timed out", atype)
             _add_ep("action", "Action timed out: " + atype, desc)
@@ -691,7 +726,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     task=task,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=512,
+                    max_tokens=2048,
                 ),
                 timeout=90.0,
             )

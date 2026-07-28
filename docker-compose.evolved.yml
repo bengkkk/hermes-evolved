@@ -1,6 +1,6 @@
 # Docker Compose for hermes-evolved (dev build)
 # Build:   docker compose -f docker-compose.evolved.yml build
-# Run:     docker compose -f docker-compose.evolved.yml up -d think-daemon
+# Run:     docker compose -f docker-compose.evolved.yml up -d hermes-evolved-gateway
 # Shell:   docker compose -f docker-compose.evolved.yml run --rm hermes chat
 
 services:
@@ -23,19 +23,31 @@ services:
     profiles:
       - default
 
-  think-daemon:
+  # ── Full Hermes gateway for self-evolution ──
+  # Runs a complete Hermes agent with ALL tools to autonomously
+  # improve the hermes-evolved source code
+  hermes-evolved-gateway:
     build:
       context: .
       dockerfile: Dockerfile.evolved
     image: hermes-evolved:latest
-    container_name: hermes-evolved-daemon
-    entrypoint: ["uv", "run", "python3", "think_daemon.py"]
-    command: ["--interval", "900"]
+    container_name: hermes-evolved-gateway
+    entrypoint: ["uv", "run", "hermes", "gateway", "run"]
+    command: []
     volumes:
-      - ~/.hermes:/root/.hermes
+      # The source code to evolve (separate from installed framework)
+      - /tmp/hermes-evolved:/workspace/hermes-evolved
+      # Its own HERMES_HOME (independent from host Hermes)
+      - ~/.hermes-evolved:/root/.hermes-evolved
+      # Git credentials for committing improvements
+      - ~/.git-credentials:/root/.git-credentials:ro
+      # SSH for git push
+      - ~/.ssh:/root/.ssh:ro
     environment:
-      - HERMES_HOME=/root/.hermes
+      - HERMES_HOME=/root/.hermes-evolved
+      - OPENCODE_API_KEY=${OPENCODE_GO_API_KEY}
+      - OPENCODE_GO_API_KEY=${OPENCODE_GO_API_KEY}
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
     profiles:
-      - daemon
+      - self-evolve
