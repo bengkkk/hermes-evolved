@@ -141,6 +141,20 @@ def _compute_prediction_error(
     if tool_success and not tool_failure:
         return 0.15  # Tool reported success
 
+    # ── Informational non-error messages ──
+    # Some commands exit with non-zero code to signal "no work to do"
+    # rather than an actual error. Detect these patterns and treat
+    # them as low-error informational outcomes.
+    informational_nonerror = bool(re.search(
+        r"(nothing to commit|working tree clean|already up.to.date|"
+        r"no changes|nothing changed|nothing to do|"
+        r"0 files changed|0 insertions|0 deletions)",
+        a_lower,
+    ))
+    if informational_nonerror:
+        # The command ran fine but had nothing to do — low error
+        return 0.15
+
     # ── Exit-code aware comparison ──
     # Actual output often contains "exit=N:" — check if exit code
     # correlates with expected success/failure keywords.
