@@ -54,6 +54,7 @@ SELF_MODEL_FILE = EVOLVE_DIR / "self_model.json"
 ORIENTATION_FILE = EVOLVE_DIR / "orientation.json"
 DAEMON_STATE_FILE = EVOLVE_DIR / "daemon_state.json"
 DAEMON_LOG_FILE = EVOLVE_DIR / "daemon.log"
+DAEMON_LOCK_FILE = EVOLVE_DIR / "daemon.lock"
 
 # ── Default state ──
 _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
@@ -96,6 +97,60 @@ def _print_cycle_stats() -> None:
         print("  health: stable — no failures")
     else:
         print("  health: acceptable")
+
+
+# ── PID lock ─────────────────────────────────────────────────────
+
+def _acquire_daemon_lock() -> bool:
+    """Acquire a PID-based lock to prevent concurrent daemon runs.
+
+    Returns True if lock was acquired or already held by this process,
+    False if another daemon is already running.
+    Lock is released automatically on normal shutdown.
+    """
+    import os as _os
+    my_pid = _os.getpid()
+    if DAEMON_LOCK_FILE.exists():
+        try:
+            existing_pid = int(DAEMON_LOCK_FILE.read_text().strip())
+            if existing_pid == my_pid:
+                # Lock already held by us — that's fine
+                logger.debug("Daemon lock already held by this PID %d", my_pid)
+                return True
+            # Check if the PID is still alive
+            try:
+                _os.kill(existing_pid, 0)   # signal 0 = test existence
+                logger.warning(
+                    "Daemon lock held by PID %d — skipping concurrent run",
+                    existing_pid,
+                )
+                return False
+            except OSError:
+                # PID no longer exists — stale lock, take it over
+                logger.info("Stale daemon lock (PID %d gone), taking over", existing_pid)
+        except (ValueError, OSError, IOError):
+            logger.warning("Corrupted daemon lock file, overwriting")
+    DAEMON_LOCK_FILE.write_text(str(my_pid))
+    logger.debug("Acquired daemon lock (PID %d)", my_pid)
+    return True
+
+
+def _release_daemon_lock() -> None:
+    """Release the PID lock file."""
+    import os as _os
+    try:
+        if DAEMON_LOCK_FILE.exists():
+            current = DAEMON_LOCK_FILE.read_text().strip()
+            if current == str(_os.getpid()):
+                DAEMON_LOCK_FILE.unlink()
+                logger.debug("Released daemon lock")
+            else:
+                logger.warning(
+                    "Won't release lock owned by PID %s (we are %d)",
+                    current, _os.getpid(),
+                )
+    except Exception as e:
+        logger.warning("Failed to release daemon lock: %s", e)
 
 
 def load_timeline() -> Dict[str, Any]:
@@ -624,6 +679,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         logger.info("Executing action: %s — %s", atype, desc[:60])
 
         # ── World Model: record action BEFORE execution ──
+        action_guidance = None
         try:
             wm = state.get("world_model")
             if wm is None:
@@ -631,6 +687,15 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             # Estimate expected outcome from description + type
             expected = f"{atype}: {desc[:100]}" if desc else atype
             triple_id = wm.record_action(atype, desc or atype, expected)
+
+            # ── Proactive risk assessment: check action guidance ──
+            try:
+                guidance = wm.format_action_guidance(atype, desc)
+                if guidance:
+                    logger.warning("Action risk assessment:\n%s", guidance)
+                    action_guidance = guidance
+            except Exception as e:
+                logger.warning("Action guidance check failed (non-blocking): %s", e)
         except Exception as e:
             logger.warning("World model record failed (non-blocking): %s", e)
             triple_id = None
@@ -681,8 +746,15 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 # Action produced no output — record that as the outcome
                 wm.complete_action(triple_id, "(no output)")
 
-            # Save action output for next cycle's prompt
+            # Build output for next cycle's prompt (guidance + outcome)
+            combined_output = ""
+            if action_guidance:
+                combined_output += f"[RISK WARNING] {action_guidance}\n"
             if action_output:
+                combined_output += action_output
+            if combined_output:
+                ds["last_action_output"] = combined_output
+            elif action_output:
                 ds["last_action_output"] = action_output
 
         except subprocess.TimeoutExpired:
@@ -1000,41 +1072,49 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
         interval_seconds: Time between thinking cycles (default 10 min).
         max_cycles: Max cycles before exit. 0 = unlimited.
     """
-    logger.info(
-        "Daemon started, interval=%ds, max_cycles=%s, evolve_dir=%s",
-        interval_seconds, max_cycles or "unlimited", EVOLVE_DIR,
-    )
+    # ── Acquire PID lock ──
+    if not _acquire_daemon_lock():
+        logger.info("Daemon already running — skipping this start attempt")
+        return
 
-    # Initialize daemon state if needed
-    ds = load_daemon_state()
-    ds["interval_seconds"] = interval_seconds
-    ds["status"] = "running"
-    save_daemon_state(ds)
+    try:
+        logger.info(
+            "Daemon started, interval=%ds, max_cycles=%s, evolve_dir=%s",
+            interval_seconds, max_cycles or "unlimited", EVOLVE_DIR,
+        )
 
-    cycle = 0
-    while True:
-        cycle += 1
-        if max_cycles and cycle > max_cycles:
-            logger.info("Reached max cycles (%d), exiting", max_cycles)
-            break
-
-        try:
-            await run_one_cycle()
-        except Exception as e:
-            logger.error("Cycle failed unexpectedly: %s", e, exc_info=True)
-
-        # Sleep — but allow early exit via state file check
+        # Initialize daemon state if needed
         ds = load_daemon_state()
-        if ds.get("status") == "shutdown":
-            logger.info("Shutdown requested via daemon_state.json")
-            break
+        ds["interval_seconds"] = interval_seconds
+        ds["status"] = "running"
+        save_daemon_state(ds)
 
-        await asyncio.sleep(interval_seconds)
+        cycle = 0
+        while True:
+            cycle += 1
+            if max_cycles and cycle > max_cycles:
+                logger.info("Reached max cycles (%d), exiting", max_cycles)
+                break
 
-    ds = load_daemon_state()
-    ds["status"] = "stopped"
-    save_daemon_state(ds)
-    logger.info("Daemon stopped.")
+            try:
+                await run_one_cycle()
+            except Exception as e:
+                logger.error("Cycle failed unexpectedly: %s", e, exc_info=True)
+
+            # Sleep — but allow early exit via state file check
+            ds = load_daemon_state()
+            if ds.get("status") == "shutdown":
+                logger.info("Shutdown requested via daemon_state.json")
+                break
+
+            await asyncio.sleep(interval_seconds)
+
+        ds = load_daemon_state()
+        ds["status"] = "stopped"
+        save_daemon_state(ds)
+        logger.info("Daemon stopped.")
+    finally:
+        _release_daemon_lock()
 
 
 # ═════════════════════════════════════════════════════════════════
