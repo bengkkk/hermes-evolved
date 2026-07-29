@@ -277,10 +277,11 @@ class TestDaemonState:
         td = evolve_env["module"]
         state = td.load_daemon_state()
         assert state["status"] == "initialized"
-        assert state["version"] == 1
+        assert state["version"] == 2, f"Expected version 2, got {state.get('version')}"
         assert state["tick_count"] == 0
         assert state.get("first_tick") is None
         assert state.get("interval_seconds") == 600
+        assert state.get("cycle_history") == [], "Expected empty cycle_history"
 
     def test_save_and_load_round_trip(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
@@ -692,6 +693,141 @@ class TestPrintCycleStats:
 
         output = captured.getvalue()
         assert "degraded" in output.lower()
+
+
+class TestDaemonStateMigration:
+    """Version migration tests for daemon_state.json."""
+
+    def test_v1_to_v2_migration_adds_cycle_history(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds_path = evolve_env["paths"]["daemon_state_file"]
+        # Write a version 1 state without cycle_history
+        import json as _json
+        ds_path.parent.mkdir(parents=True, exist_ok=True)
+        ds_path.write_text(_json.dumps({"version": 1, "status": "initialized", "tick_count": 5}))
+        loaded = td.load_daemon_state()
+        assert loaded["version"] == 2, f"Expected version 2, got {loaded['version']}"
+        assert "cycle_history" in loaded, "cycle_history should be added during migration"
+        assert loaded["cycle_history"] == [], "cycle_history should be empty list after migration"
+        assert loaded["tick_count"] == 5, "Existing data should be preserved"
+
+    def test_v2_state_unchanged(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds_path = evolve_env["paths"]["daemon_state_file"]
+        import json as _json
+        ds_path.parent.mkdir(parents=True, exist_ok=True)
+        ds_path.write_text(_json.dumps({
+            "version": 2, "status": "running", "tick_count": 10, "cycle_history": [
+                {"status": "ok", "error": None, "duration": 5.0}
+            ]
+        }))
+        loaded = td.load_daemon_state()
+        assert loaded["version"] == 2
+        assert loaded["tick_count"] == 10
+        assert len(loaded["cycle_history"]) == 1
+
+
+class TestCycleHistory:
+    """cycle_history tracks per-cycle outcomes for diagnostics."""
+
+    def test_cycle_history_appended_on_ok(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds = td.load_daemon_state()
+        ds.setdefault("cycle_history", [])
+        td.save_daemon_state(ds)
+
+        # Simulate a successful cycle recording
+        entry = {
+            "timestamp": "2026-07-29T10:00:00+00:00",
+            "status": "ok",
+            "error": None,
+            "duration": 12.5,
+            "tick_count": 1,
+        }
+        ds["cycle_history"].append(entry)
+        ds["cycle_history"] = ds["cycle_history"][-20:]
+        td.save_daemon_state(ds)
+
+        loaded = td.load_daemon_state()
+        assert len(loaded["cycle_history"]) == 1
+        assert loaded["cycle_history"][0]["status"] == "ok"
+        assert loaded["cycle_history"][0]["error"] is None
+        assert loaded["cycle_history"][0]["duration"] == 12.5
+
+    def test_cycle_history_tracks_errors(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds = td.load_daemon_state()
+
+        # Add error entries
+        for i, (status, err) in enumerate([
+            ("ok", None),
+            ("error", "LLM returned no response"),
+            ("timeout", "Cycle exceeded 120s hard limit"),
+            ("parse_error", "Could not parse JSON from: xy"),
+        ]):
+            ds.setdefault("cycle_history", []).append({
+                "timestamp": f"2026-07-29T10:0{i}:00+00:00",
+                "status": status,
+                "error": err,
+                "duration": 10.0 + i * 5,
+                "tick_count": i,
+            })
+        ds["cycle_history"] = ds["cycle_history"][-20:]
+        td.save_daemon_state(ds)
+
+        loaded = td.load_daemon_state()
+        assert len(loaded["cycle_history"]) == 4
+        error_entries = [c for c in loaded["cycle_history"] if c["status"] != "ok"]
+        assert len(error_entries) == 3
+        statuses = [c["status"] for c in error_entries]
+        assert "timeout" in statuses
+        assert "parse_error" in statuses
+        assert "error" in statuses
+
+    def test_cycle_history_persists_large_list(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds = td.load_daemon_state()
+        ds["cycle_history"] = [{"status": "ok", "error": None, "duration": 1.0,
+                                 "tick_count": i, "timestamp": "2026-07-29T10:00:00"}
+                               for i in range(25)]
+        td.save_daemon_state(ds)
+
+        loaded = td.load_daemon_state()
+        assert len(loaded["cycle_history"]) == 25, "save_daemon_state preserves full list"
+
+    def test_print_cycle_stats_shows_recent_failures(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds = td.load_daemon_state()
+        ds["cycle_stats"] = {"total": 6, "ok": 3, "error": 2, "parse_error": 1,
+                              "avg_duration": 8.0, "max_duration": 25.0}
+        ds["cycle_history"] = [
+            {"status": "ok", "error": None, "duration": 5.0, "tick_count": 0,
+             "timestamp": "2026-07-29T10:00:00"},
+            {"status": "timeout", "error": "Cycle exceeded 120s hard limit",
+             "duration": 120.0, "tick_count": 0,
+             "timestamp": "2026-07-29T10:05:00"},
+            {"status": "ok", "error": None, "duration": 6.0, "tick_count": 1,
+             "timestamp": "2026-07-29T10:10:00"},
+            {"status": "error", "error": "LLM returned no response",
+             "duration": 45.0, "tick_count": 1,
+             "timestamp": "2026-07-29T10:15:00"},
+            {"status": "ok", "error": None, "duration": 4.5, "tick_count": 2,
+             "timestamp": "2026-07-29T10:20:00"},
+        ]
+        td.save_daemon_state(ds)
+
+        captured = io.StringIO()
+        out = sys.stdout
+        sys.stdout = captured
+        try:
+            td._print_cycle_stats()
+        finally:
+            sys.stdout = out
+
+        output = captured.getvalue()
+        assert "recent failures" in output.lower()
+        assert "timeout" in output
+        assert "LLM returned" in output
 
 
 # ═══════════════════════════════════════════════════════════════════

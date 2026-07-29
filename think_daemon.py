@@ -58,13 +58,14 @@ DAEMON_LOCK_FILE = EVOLVE_DIR / "daemon.lock"
 
 # ── Default state ──
 _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "status": "initialized",
     "first_tick": None,
     "last_tick": None,
     "tick_count": 0,
     "interval_seconds": 600,
     "last_output": None,
+    "cycle_history": [],  # list of {timestamp, status, error, duration, tick_count} — last 20
 }
 
 
@@ -73,7 +74,13 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 # ═════════════════════════════════════════════════════════════════
 
 def load_daemon_state() -> Dict[str, Any]:
-    return safe_read_json(DAEMON_STATE_FILE, dict(_DEFAULT_DAEMON_STATE))
+    data = safe_read_json(DAEMON_STATE_FILE, dict(_DEFAULT_DAEMON_STATE))
+    # Migrate from version 1 → version 2: add cycle_history
+    if data.get("version") == 1:
+        data["version"] = 2
+        if "cycle_history" not in data:
+            data["cycle_history"] = []
+    return data
 
 
 def save_daemon_state(state: Dict[str, Any]) -> None:
@@ -97,6 +104,17 @@ def _print_cycle_stats() -> None:
         print("  health: stable — no failures")
     else:
         print("  health: acceptable")
+
+    # Recent failure details for diagnostics
+    history = ds.get("cycle_history", [])
+    recent_fails = [c for c in history[-5:] if c.get("status") != "ok"]
+    if recent_fails:
+        print(f"  recent failures ({len(recent_fails)} in last {min(5, len(history))} cycles):")
+        for c in recent_fails[-3:]:
+            err = (c.get("error") or "?")[:80]
+            dur = c.get("duration", "?")
+            ts = (c.get("timestamp") or "?")[11:19]  # HH:MM:SS only
+            print(f"    [{ts}] {c['status']} ({dur}s): {err}")
 
 
 # ── PID lock ─────────────────────────────────────────────────────
@@ -212,6 +230,9 @@ Active plan:
 
 Last action result:
 {last_action_result}
+
+Daemon health (cycle reliability):
+{daemon_health}
 
 World Model (prediction accuracy and discrepancy feedback):
 {world_model_context}
@@ -449,6 +470,26 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         logger.warning("Failed to load world model context: %s", e)
         world_model_context = "  (world model unavailable — will be initialized on first action)"
 
+    # ── Daemon health (failure diagnostics for the LLM) ──
+    history = ds.get("cycle_history", [])
+    if history:
+        total_ok = sum(1 for c in history if c.get("status") == "ok")
+        total_fail = len(history) - total_ok
+        health_parts = [
+            f"  Reliability: {total_ok} ok / {total_fail} fail / {len(history)} total cycles",
+        ]
+        # Show last 3 failures with details
+        recent_fails = [c for c in history if c.get("status") != "ok"][-3:]
+        if recent_fails:
+            health_parts.append("  Recent failures:")
+            for c in recent_fails:
+                dur = c.get("duration", "?")
+                err = c.get("error", "?")[:60]
+                health_parts.append(f"    · {c['status']} ({dur}s): {err}")
+        daemon_health = "\n".join(health_parts)
+    else:
+        daemon_health = "  (no cycle history yet — first run)"
+
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
         identity_role=identity.get("role", "?"),
@@ -464,6 +505,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         tasks_text=tasks_text,
         plan_status=plan_status,
         last_action_result=last_action_result,
+        daemon_health=daemon_health,
         world_model_context=world_model_context,
         goals_text=goals_text,
         workspace_root=_WORKSPACE_ROOT_STR,
@@ -1041,6 +1083,17 @@ async def run_one_cycle() -> Dict[str, Any]:
     n = cs["ok"] + cs["error"] + cs.get("parse_error", 0)
     cs["avg_duration"] = round((cs.get("avg_duration", 0) * max(n - 1, 0) + dur) / max(n, 1), 1)
     cs["max_duration"] = max(cs.get("max_duration", 0), dur)
+
+    # ── Per-cycle history for diagnostics ──
+    history_entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": result["status"],
+        "error": result.get("error"),
+        "duration": round(dur, 1),
+        "tick_count": ds.get("tick_count", 0),
+    }
+    ds.setdefault("cycle_history", []).append(history_entry)
+    ds["cycle_history"] = ds["cycle_history"][-20:]
 
     # Ensure first_tick is set even on the first error cycle
     if ds.get("first_tick") is None:
