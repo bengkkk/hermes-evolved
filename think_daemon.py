@@ -475,22 +475,70 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
 # ═════════════════════════════════════════════════════════════════
 
 def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    """Extract JSON from LLM response, handling markdown fences."""
-    # Remove markdown code fences
+    """Extract a JSON dict from LLM response, handling markdown fences.
+
+    Strategy (in order):
+      1. Strip whitespace.
+      2. If ``text`` contains markdown code fences (````` `````),
+         extract everything between the first set of fence markers.
+      3. Find the first ``'{'`` and last ``'}'`` in the extracted
+         region and try to parse that substring as JSON.
+      4. Return the parsed dict, or ``None`` on failure (including
+         when the result is a JSON array or primitive — we only
+         accept ``dict``-typed responses).
+
+    This is deliberately more permissive than a strict parser because
+    LLM output can include preamble text, trailing commentary, or
+    extra whitespace around fences.
+    """
     cleaned = text.strip()
-    if cleaned.startswith("```"):
-        # Find the first { or [
-        start = cleaned.find("{")
-        if start >= 0:
-            cleaned = cleaned[start:]
-        # Remove trailing ```
-        end = cleaned.rfind("}")
-        if end >= 0:
-            cleaned = cleaned[: end + 1]
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
+
+    # ── Strip markdown code fences if present ──
+    # Handle both ```json ... ``` and ``` ... ```
+    fence_start = cleaned.find("```")
+    if fence_start >= 0:
+        # Find the closing fence after the opening one
+        content_start = fence_start + 3
+        # Skip optional language tag on the same line
+        first_newline = cleaned.find("\n", content_start)
+        if first_newline >= 0:
+            content_start = first_newline + 1
+        fence_end = cleaned.rfind("```")
+        if fence_end > content_start:
+            cleaned = cleaned[content_start:fence_end].strip()
+        else:
+            cleaned = cleaned[content_start:].strip()
+
+    # ── Locate the outermost JSON object ──
+    obj_start = cleaned.find("{")
+    obj_end = cleaned.rfind("}")
+    if obj_start < 0 or obj_end < 0 or obj_end <= obj_start:
+        # No complete JSON object found
+        try:
+            result = json.loads(cleaned)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, ValueError):
+            pass
         return None
+
+    candidate = cleaned[obj_start : obj_end + 1]
+    try:
+        result = json.loads(candidate)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # ── Last resort: try parsing the entire cleaned text ──
+    try:
+        result = json.loads(cleaned)
+        if isinstance(result, dict):
+            return result
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
 
 
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
