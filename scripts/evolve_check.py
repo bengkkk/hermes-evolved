@@ -13,7 +13,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-REPO_DIR = Path("/tmp/hermes-evolved")
+# Detect workspace root from script location, falling back to env or default
+_REPO_DIR = Path(__file__).resolve().parent.parent
 EVOLVE_DIR = Path(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))) / "evolve"
 ORIENTATION_FILE = EVOLVE_DIR / "orientation.json"
 HISTORY_FILE = EVOLVE_DIR / "history.jsonl"
@@ -22,17 +23,17 @@ HISTORY_FILE = EVOLVE_DIR / "history.jsonl"
 def run(cmd, cwd=None):
     """Run a shell command and return stdout."""
     result = subprocess.run(
-        cmd, shell=True, capture_output=True, text=True, timeout=60, cwd=cwd or str(REPO_DIR)
+        cmd, shell=True, capture_output=True, text=True, timeout=60, cwd=cwd or str(_REPO_DIR)
     )
     return result.stdout.strip(), result.stderr.strip(), result.returncode
 
 
 def check_repo():
     """Check if the repo is ready, pull latest."""
-    if not (REPO_DIR / ".git").exists():
+    if not (_REPO_DIR / ".git").exists():
         print("⚠️  Repo not cloned. Cloning...")
         out, err, code = run(
-            f"git clone https://github.com/bengkkk/hermes-evolved.git {REPO_DIR}",
+            f"git clone https://github.com/bengkkk/hermes-evolved.git {_REPO_DIR}",
             cwd="/tmp",
         )
         if code != 0:
@@ -57,7 +58,7 @@ def check_repo():
             print(f"❌ Checkout failed: {err}")
             return False
 
-    print(f"📂 Repo ready at {REPO_DIR} on evolve/real-thinking")
+    print(f"📂 Repo ready at {_REPO_DIR} on evolve/real-thinking")
     return True
 
 

@@ -42,6 +42,11 @@ logger = logging.getLogger("think_daemon")
 # ── World Model integration (Gap 6) ──
 from world_model import WorldModel, load_world_model, save_world_model
 
+# ── Auto-detect workspace root from script location ──
+# This adapts to wherever the repo is cloned (bare VM, Docker, etc.)
+_WORKSPACE_ROOT: Path = Path(__file__).resolve().parent
+_WORKSPACE_ROOT_STR: str = str(_WORKSPACE_ROOT)
+
 # ── Paths (delegated to data_layer for the base directory) ──
 EVOLVE_DIR = get_evolve_dir()
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
@@ -179,13 +184,13 @@ GOAL GENERATION:
 |- Prioritize: what unblocks the most other capabilities?
 
 YOU MUST ACT. You are running in a continuous loop. Deliberation without action is wasted cycles.
-CRITICAL RULE: Your JSON output MUST include a non-null "action" field this cycle. If you do not know what to do, set action to {{"type": "shell", "command": "ls /tmp/hermes-evolved/", "description": "Explore workspace"}} — always better than null.
+CRITICAL RULE: Your JSON output MUST include a non-null "action" field this cycle. If you do not know what to do, set action to {{"type": "shell", "command": "ls {workspace_root}/", "description": "Explore workspace"}} — always better than null.
 Rules:
 - You MUST set a non-null "action" field every cycle. Setting it to null counts as failure.
-- If you have been deliberating about the same thing for 2+ cycles without executing, STOP and just run: ls /tmp/hermes-evolved/
+- If you have been deliberating about the same thing for 2+ cycles without executing, STOP and just run: ls {workspace_root}/
 - Prefer small concrete steps over perfect planning. A tiny real result beats a perfect plan.
   - Unsure about workspace layout? Run: ls -la /
-  - Want to check a file? Run: cat /tmp/hermes-evolved/some_file.py
+  - Want to check a file? Run: cat {workspace_root}/some_file.py
   - Need to verify PyPI? Run: python3 -c "import json; print('ok')"
 
 ACTION CAPABILITIES (Gap 10):
@@ -406,6 +411,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         last_action_result=last_action_result,
         world_model_context=world_model_context,
         goals_text=goals_text,
+        workspace_root=_WORKSPACE_ROOT_STR,
     )
 
 
@@ -601,7 +607,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # Auto-default action for cycle 1+ to prevent null-action drift
     if not (act and isinstance(act, dict) and act.get("type")):
         if ds.get("tick_count", 0) >= 10:
-            act = {"type": "shell", "command": "ls /tmp/hermes-evolved/", "description": "Auto-default: explore workspace"}
+            act = {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: explore workspace"}
             logger.info("Auto-default action (null action detected at cycle %d)", ds.get("tick_count", 0))
     
     # Clean stale "no action" weaknesses when actions ARE being executed
@@ -640,7 +646,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 if apath and acontent:
                     p = _pl.Path(apath)
                     if not p.is_absolute():
-                        p = _pl.Path("/tmp/hermes-evolved") / apath
+                        p = _WORKSPACE_ROOT / apath
                     p.parent.mkdir(parents=True, exist_ok=True)
                     p.write_text(acontent)
                     action_output = f"Wrote {apath} ({len(acontent)} bytes)"
@@ -655,8 +661,8 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             elif atype == "git_commit":
                 amsg = act.get("message", "")
                 if amsg:
-                    subprocess.run(["git", "add", "-A"], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
-                    r = subprocess.run(["git", "commit", "-m", amsg], cwd="/tmp/hermes-evolved", capture_output=True, text=True, timeout=30)
+                    subprocess.run(["git", "add", "-A"], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
+                    r = subprocess.run(["git", "commit", "-m", amsg], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
                     action_output = r.stdout[:200]
                     _add_ep("action", "Commit: " + amsg[:60], action_output)
             elif atype == "install_package":
