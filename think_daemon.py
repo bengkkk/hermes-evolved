@@ -1774,6 +1774,337 @@ def _run_verification() -> int:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Bootstrap (initialize evolve data with meaningful defaults)
+# ═════════════════════════════════════════════════════════════════
+
+
+def bootstrap_evolve_data() -> int:
+    """Initialize the evolve data directory with meaningful seed data.
+
+    Creates all 6 evolve data files (~/.hermes/evolve/*.json) with proper
+    defaults if they don't already exist.  Idempotent — only writes files
+    that are missing, never overwrites existing data.
+
+    This ensures the Hermes session's ``format_orientation_context()``
+    returns useful cross-session continuity instead of empty templates.
+
+    Returns:
+        0 on success, 1 if any file creation failed.
+    """
+    import json as _json
+    from datetime import datetime, timezone as _tz
+    from pathlib import Path as _Path
+
+    EVOLVE_DIR.mkdir(parents=True, exist_ok=True)
+    errors = 0
+    now = datetime.now(_tz.utc).isoformat()
+
+    # ── 1. self_model.json ──
+    target = SELF_MODEL_FILE
+    if not target.exists():
+        try:
+            _json.dump({
+                "version": 1,
+                "identity": {
+                    "name": "Hermes (evolved)",
+                    "role": "Self-evolving AI system",
+                },
+                "state": {
+                    "evolution_version": 6,
+                    "current_gap_focus": "Gap 6 — World Model",
+                    "total_cycles": 0,
+                    "remaining_gaps": ["4", "6", "8", "10"],
+                },
+                "capabilities": {
+                    "strengths": [
+                        "File-backed persistent state (data_layer.py)",
+                        "World model with predict→act→observe→learn loop",
+                        "Persistent cognition daemon with LLM fallback",
+                        "Orientation context integrated into Hermes system prompt",
+                    ],
+                    "weaknesses": [
+                        "World model has no action history yet",
+                        "No self-generated goals defined",
+                        "No multi-type memory accumulated",
+                    ],
+                    "unknown_areas": [
+                        "Hermes provider/model resolution chain for daemon LLM calls",
+                        "How to persist a background daemon across process restarts",
+                    ],
+                },
+                "commitments": {
+                    "promised_features": [
+                        "Always explore before acting on plan steps",
+                    ],
+                    "active_obligations": [],
+                },
+            }, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    # ── 2. timeline.json ──
+    target = TIMELINE_FILE
+    if not target.exists():
+        try:
+            _json.dump({
+                "version": 1,
+                "past": {
+                    "events": [
+                        {
+                            "id": "bootstrap",
+                            "type": "milestone",
+                            "timestamp": now,
+                            "summary": "Initialized evolve data layer",
+                            "impact": "Hermes session now has cross-session continuity context",
+                        },
+                    ],
+                    "outcomes": [],
+                    "completed_sessions": [],
+                },
+                "present": {
+                    "active_project": "hermes-evolved self-evolution framework",
+                    "active_tasks": [
+                        "Finalize data layer and inject orientation",
+                        "Set up persistent cognition daemon",
+                    ],
+                    "commitments": [],
+                    "waiting_for": [],
+                },
+                "future": {
+                    "goals": [
+                        "Complete self-evolution framework (Phase 2)",
+                        "Achieve fully autonomous AGI with self-directed evolution (Phase 3)",
+                    ],
+                    "predictions": [],
+                    "plans": [],
+                },
+            }, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    # ── 3. orientation.json ──
+    target = ORIENTATION_FILE
+    if not target.exists():
+        try:
+            _json.dump({
+                "version": 1,
+                "focus": "Complete hermes-evolved self-evolution framework",
+                "insights": [
+                    "Data layer, world model, and think_daemon are all built and tested (244 tests passing). "
+                    "Next: seed the evolve data and enable the daemon to run continuously.",
+                ],
+                "next_steps": [
+                    "Bootstrap evolve data files with meaningful defaults",
+                    "Run initial daemon cycle",
+                    "Set up persistent daemon via cron or systemd",
+                ],
+            }, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    # ── 4. world_model.json — already handled by WorldModel class defaults,
+    #    but create it explicitly so the file exists on disk.
+    target = EVOLVE_DIR / "world_model.json"
+    if not target.exists():
+        try:
+            # Avoid circular import: construct the default dict directly
+            _DEFAULT = {
+                "version": 4,
+                "action_triples": [],
+                "predictions": [],
+                "prediction_accuracy": {
+                    "total_predictions": 0,
+                    "verified_predictions": 0,
+                    "correct_predictions": 0,
+                    "incorrect_predictions": 0,
+                    "avg_prediction_error": 0.0,
+                    "total_triples": 0,
+                    "avg_triple_error": 0.0,
+                    "calibration_buckets": [],
+                    "error_history": [],
+                },
+                "discrepancy_patterns": [],
+                "per_type_accuracy": {},
+            }
+            _json.dump(_DEFAULT, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    # ── 5. goals.json ──
+    target = EVOLVE_DIR / "goals.json"
+    if not target.exists():
+        try:
+            _json.dump({
+                "version": 1,
+                "goals": [],
+            }, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    # ── 6. daemon_state.json — already handled by _DEFAULT_DAEMON_STATE
+    target = DAEMON_STATE_FILE
+    if not target.exists():
+        try:
+            ds = dict(_DEFAULT_DAEMON_STATE)
+            ds["first_tick"] = now
+            ds["status"] = "initialized"
+            _json.dump(ds, target.open("w"))
+            logger.info("Bootstrapped %s", target)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", target, e)
+            errors += 1
+
+    if errors == 0:
+        logger.info("Evolve data bootstrap complete (%d files)", 6)
+    else:
+        logger.warning("Evolve data bootstrap finished with %d error(s)", errors)
+    return errors
+
+
+def _show_status() -> int:
+    """Print a human-readable snapshot of the current system state."""
+    import json as _json
+
+    evolve = EVOLVE_DIR
+    if not evolve.exists():
+        print("Evolve directory does not exist. Run --bootstrap first.")
+        return 1
+
+    # ── Daemon status ──
+    ds = load_daemon_state()
+    print("=" * 56)
+    print("  Hermes Evolved — System Status")
+    print("=" * 56)
+    print(f"\n  Evolve dir: {evolve}")
+    print(f"  Data files: {sum(1 for f in evolve.iterdir() if f.suffix == '.json')} JSON files")
+
+    # Daemon health
+    cs = ds.get("cycle_stats", {})
+    total = cs.get("total", 0)
+    ok = cs.get("ok", 0)
+    errors_c = cs.get("error", 0)
+    parse_errors = cs.get("parse_error", 0)
+    ok_rate = (ok / total * 100) if total > 0 else 0
+    print(f"\n  ┌─ Daemon")
+    print(f"  │ Status:   {ds.get('status', 'unknown')}")
+    print(f"  │ PID lock: {DAEMON_LOCK_FILE.read_text().strip() if DAEMON_LOCK_FILE.exists() else 'none'}")
+    print(f"  │ First:    {(ds.get('first_tick') or '?')[:19]}")
+    print(f"  │ Last:     {(ds.get('last_tick') or '?')[:19]}")
+    print(f"  │ Cycles:   {total} ({ok} ok, {errors_c} fail, {parse_errors} parse_err) — {ok_rate:.0f}% success")
+    if total > 0:
+        print(f"  │ Avg dur:  {cs.get('avg_duration', 0):.1f}s, Max: {cs.get('max_duration', 0):.1f}s")
+
+    # Recent cycles
+    history = ds.get("cycle_history", [])
+    if history:
+        recent = history[-5:]
+        print(f"  │ Last {len(recent)} cycles:")
+        for c in recent:
+            ts = (c.get("timestamp") or "?")[11:19]
+            dur = c.get("duration", 0)
+            status = c.get("status", "?")[:8]
+            err = (c.get("error") or "")[:40]
+            if status == "ok":
+                print(f"  │   [{ts}] ✓ {dur:.1f}s")
+            else:
+                print(f"  │   [{ts}] ✗ {status} ({dur:.1f}s) — {err}")
+
+    # ── World model ──
+    try:
+        wm_path = evolve / "world_model.json"
+        if wm_path.exists():
+            wm_data = _json.loads(wm_path.read_text())
+            triples = wm_data.get("action_triples", [])
+            completed = [t for t in triples if t.get("completed")]
+            predictions = wm_data.get("predictions", [])
+            verified = [p for p in predictions if p.get("verified")]
+            acc = wm_data.get("prediction_accuracy", {})
+            per_type = wm_data.get("per_type_accuracy", {})
+            patterns = wm_data.get("discrepancy_patterns", [])
+
+            print(f"\n  ┌─ World Model")
+            print(f"  │ Triples:   {len(triples)} total, {len(completed)} completed")
+            if completed:
+                avg_err = acc.get("avg_triple_error", 0)
+                print(f"  │ Avg err:   {avg_err:.3f}")
+            print(f"  │ Predict:   {len(predictions)} total, {len(verified)} verified")
+            if verified:
+                correct = acc.get("correct_predictions", 0)
+                incorrect = acc.get("incorrect_predictions", 0)
+                decided = correct + incorrect
+                if decided > 0:
+                    print(f"  │ Accuracy:  {correct}/{decided} ({round(correct/decided*100)}% decided)")
+            if patterns:
+                print(f"  │ Patterns:  {len(patterns)} discrepancy pattern(s)")
+                for p in patterns:
+                    pt = p.get("action_type", "?")
+                    pc = p.get("count", 0)
+                    pa = p.get("avg_error", 0)
+                    print(f"  │   • {pt}: {pc} high-error, avg {pa:.2f}")
+            if per_type:
+                print(f"  │ Per-type:")
+                for atype, stats in sorted(per_type.items()):
+                    icon = "✓" if stats["avg_error"] <= 0.25 else ("△" if stats["avg_error"] <= 0.4 else "✗")
+                    print(f"  │   {icon} {atype}: n={stats['count']}, err={stats['avg_error']:.3f}")
+    except Exception as e:
+        print(f"  │ (world model load failed: {e})")
+
+    # ── Self-model ──
+    try:
+        sm_path = evolve / "self_model.json"
+        if sm_path.exists():
+            sm = _json.loads(sm_path.read_text())
+            ident = sm.get("identity", {})
+            state = sm.get("state", {})
+            caps = sm.get("capabilities", {})
+
+            print(f"\n  ┌─ Self Model")
+            print(f"  │ Identity: {ident.get('name', '?')} — {ident.get('role', '?')}")
+            print(f"  │ Version:  v{state.get('evolution_version', '?')}")
+            print(f"  │ Focus:    {state.get('current_gap_focus', '(none)')}")
+            gaps = state.get("remaining_gaps", [])
+            if gaps:
+                print(f"  │ Gaps:     {', '.join(gaps)}")
+            strengths = caps.get("strengths", [])
+            if strengths:
+                print(f"  │ Strength: {strengths[0][:70]}")
+            weaknesses = caps.get("weaknesses", [])
+            if weaknesses:
+                print(f"  │ Weakness: {weaknesses[0][:70]}")
+    except Exception as e:
+        print(f"  │ (self-model load failed: {e})")
+
+    # ── Timeline stats ──
+    try:
+        tl_path = evolve / "timeline.json"
+        if tl_path.exists():
+            tl = _json.loads(tl_path.read_text())
+            events = tl.get("past", {}).get("events", [])
+            sessions = tl.get("past", {}).get("completed_sessions", [])
+            project = tl.get("present", {}).get("active_project", "")
+            print(f"\n  ┌─ Timeline")
+            print(f"  │ Events:   {len(events)}")
+            print(f"  │ Sessions: {len(sessions)}")
+            if project:
+                print(f"  │ Project:  {project}")
+    except Exception as e:
+        print(f"  │ (timeline load failed: {e})")
+
+    print("\n" + "=" * 56)
+    return 0
+
+
+# ═════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═════════════════════════════════════════════════════════════════
 
@@ -1784,6 +2115,8 @@ def main():
     parser.add_argument("--interval", type=int, default=600, help="Seconds between thinking cycles (default: 600 = 10 min)")
     parser.add_argument("--cycles", type=int, default=0, help="Max cycles before exit (0 = unlimited)")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument("--bootstrap", action="store_true", help="Initialize evolve data files with meaningful seed data (idempotent)")
+    parser.add_argument("--status", action="store_true", help="Show system status snapshot (daemon health, world model stats, cycle reliability)")
     parser.add_argument("--verify", action="store_true", help="Run a no-LLM verification of the full predict→act→observe→learn cycle")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
@@ -1797,6 +2130,15 @@ def main():
 
     if args.verify:
         exit_code = _run_verification()
+        sys.exit(exit_code)
+
+    if args.bootstrap:
+        errors = bootstrap_evolve_data()
+        print(f"Bootstrap complete: {errors} error(s)" if errors == 0 else f"Bootstrap finished with {errors} error(s)")
+        sys.exit(errors)
+
+    if args.status:
+        exit_code = _show_status()
         sys.exit(exit_code)
 
     if args.once:
