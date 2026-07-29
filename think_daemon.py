@@ -275,9 +275,14 @@ ACTION CAPABILITIES (Gap 10):
   - shell: run a shell command (set command)
   - git_commit: add + commit (set message)
   - install_package: pip install (set package)
+- CRITICAL: Before every action, set "expected_outcome" to PREDICT what the output will be
+  (e.g. "Written main.py (245 bytes)" or "exit=0: files listed"). The daemon compares this
+  against the actual result to compute prediction error and improve future calibration.
+  Without this field, the prediction error defaults to comparing type+description against output,
+  which is less informative.
 - The next cycle will tell you what happened. Don't wait — act.
-- Example: {{"type": "shell", "command": "ls"}}
-- Example: {{"type": "write_file", "path": "test.py", "content": "print('hi')"}}
+- Example: {{"type": "shell", "command": "ls", "expected_outcome": "exit=0: list of files in workspace"}}
+- Example: {{"type": "write_file", "path": "test.py", "content": "print('hi')", "expected_outcome": "Wrote test.py (14 bytes)"}}
 
 SEARCH (resolve uncertainties):
 - If you are uncertain about a fact, API, or approach, provide a "search_query" string (e.g., "github ssh key setup"). The search will run AFTER this response.
@@ -326,6 +331,7 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
   "action": {{
     "type": "write_file|shell|git_commit|install_package",
     "description": "What this action does",
+    "expected_outcome": "PREDICT what the output of this action will look like (e.g. 'Written main.py (245 bytes)' or 'exit=0: files listed'). Used to calibrate prediction accuracy.",
     "path": "for write_file",
     "content": "file content",
     "command": "shell command",
@@ -774,8 +780,9 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             wm = state.get("world_model")
             if wm is None:
                 wm = load_world_model()
-            # Estimate expected outcome from description + type
-            expected = f"{atype}: {desc[:100]}" if desc else atype
+            # Estimate expected outcome: use LLM's prediction if provided,
+            # otherwise fall back to action type + description.
+            expected = act.get("expected_outcome") or f"{atype}: {desc[:100]}" if desc else atype
             triple_id = wm.record_action(atype, desc or atype, expected)
 
             # ── Proactive risk assessment: check action guidance ──
