@@ -1417,15 +1417,22 @@ def main():
         sys.exit(exit_code)
 
     if args.once:
-        r = asyncio.run(run_one_cycle())
-        status = r.get("status", "error")
-        if status == "ok":
-            insight = r.get("insight", "")[:80]
-            print(f"[{status}] tick {r.get('tick_duration',0):.1f}s — {insight}")
-        else:
-            print(f"[{status}] {r.get('error', 'unknown error')}")
-        # Print reliability stats
-        _print_cycle_stats()
+        # Acquire PID lock to prevent concurrent runs from overlapping cron triggers
+        if not _acquire_daemon_lock():
+            print("Daemon lock held by another process — skipping concurrent --once run")
+            sys.exit(0)
+        try:
+            r = asyncio.run(run_one_cycle())
+            status = r.get("status", "error")
+            if status == "ok":
+                insight = r.get("insight", "")[:80]
+                print(f"[{status}] tick {r.get('tick_duration',0):.1f}s — {insight}")
+            else:
+                print(f"[{status}] {r.get('error', 'unknown error')}")
+            # Print reliability stats
+            _print_cycle_stats()
+        finally:
+            _release_daemon_lock()
     else:
         asyncio.run(run_daemon(args.interval, args.cycles))
 
