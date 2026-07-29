@@ -357,15 +357,26 @@ def format_self_model_context() -> str:
 # ═════════════════════════════════════════════════════════════════
 
 def format_orientation_context() -> str:
-    """Format orientation + timeline + self-model for the system prompt.
+    """Format orientation + timeline + self-model + world model for the system prompt.
 
     Delegates to data_layer.py's consolidated version, which reads
-    from the same files and produces the same output format.
+    from the same files and produces the same output format.  Then
+    appends World Model context (prediction accuracy, action triples,
+    discrepancy patterns) from ``world_model.py``.
 
     Returns a string that gets injected into the volatile part of the
     system prompt, so the agent starts each session with:
       - Previous focus, insights, unfinished direction
       - Timeline awareness (past → present → future)
       - Self-model awareness (identity, capabilities, gaps)
+      - World Model awareness (prediction accuracy, discrepancies)
     """
-    return _format_orientation_context()
+    base = _format_orientation_context()
+    try:
+        from world_model import format_world_model_context as _fmt_wm
+        wm_str = _fmt_wm()
+        if wm_str:
+            return base + "\n\n" + wm_str
+    except Exception:
+        logger.debug("Could not append world model context", exc_info=True)
+    return base
