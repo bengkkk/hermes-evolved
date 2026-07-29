@@ -595,10 +595,25 @@ class WorldModel:
 
         parts.append("## World Model State")
         if total_preds > 0:
-            pct = round(correct / max(verified, 1) * 100)
+            # Count uncertain auto-verifications
+            uncertain = sum(
+                1 for p in self.data.get("predictions", [])
+                if p.get("verified") and p.get("actual", "").startswith("timeframe expired")
+            )
+            decided = verified - uncertain
+            if decided > 0 and correct >= 0:
+                pct = round(correct / max(decided, 1) * 100)
+                accuracy_str = f"{pct}% accuracy ({correct}/{decided} decided"
+                if uncertain > 0:
+                    accuracy_str += f", {uncertain} expired uncertain"
+                accuracy_str += ")"
+            elif uncertain > 0:
+                accuracy_str = f"all {uncertain} auto-verified as uncertain (expired)"
+            else:
+                accuracy_str = f"avg error: {avg_err:.2f} (no decided yet)"
             parts.append(
                 f"  Predictions: {total_preds} total, {verified} verified, "
-                f"{correct} correct ({pct}% accuracy, avg error: {avg_err:.2f})"
+                f"{accuracy_str}"
             )
         else:
             parts.append("  Predictions: (none yet)")
@@ -670,20 +685,46 @@ class WorldModel:
         return "\n".join(parts)
 
     def format_prediction_insight(self) -> str:
-        """A compact summary of prediction accuracy with error trend."""
+        """A compact summary of prediction accuracy with error trend.
+
+        Shows three categories:
+          - Clearly correct predictions (error ≤ 0.3)
+          - Clearly incorrect predictions (error > 0.3, not auto-verified expired)
+          - Uncertain auto-verifications (expired timeframe, error = 0.5)
+        """
         acc = self.data.get("prediction_accuracy", {})
         total = acc.get("total_predictions", 0)
         verified = acc.get("verified_predictions", 0)
         correct = acc.get("correct_predictions", 0)
+        incorrect = acc.get("incorrect_predictions", 0)
         per_type = self.get_per_type_accuracy()
         types_count = len(per_type)
+
+        # Count uncertain auto-verifications from the predictions list
+        uncertain = 0
+        for p in self.data.get("predictions", []):
+            if p.get("verified") and p.get("error") is not None:
+                if p.get("actual", "").startswith("timeframe expired"):
+                    uncertain += 1
 
         # Compute trend from rolling error history
         trend = self._compute_error_trend()
 
         if verified > 0:
-            pct = round(correct / verified * 100)
-            base = f"Prediction accuracy: {pct}% ({correct}/{verified} verified, {total} total)"
+            # Only compute accuracy percentage from clearly decided predictions
+            decided = correct + incorrect
+            if decided > 0:
+                pct = round(correct / decided * 100)
+                parts = [f"Prediction accuracy: {pct}% ({correct}/{decided} decided"]
+            else:
+                parts = [f"Prediction accuracy: (undetermined — all {verified} verified are uncertain)"]
+
+            if uncertain > 0:
+                parts.append(f"{uncertain} uncertain expired")
+            parts.append(f"{verified} verified")
+            parts.append(f"{total} total")
+
+            base = ", ".join(parts)
             if types_count > 0:
                 base += f", tracked {types_count} action types for calibration"
             if trend:
