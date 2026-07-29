@@ -123,23 +123,9 @@ def now_compact() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
-def _now_iso() -> str:
-    """Internal alias — use now_iso() externally."""
-    return now_iso()
-
-
-def _now_compact() -> str:
-    """Internal alias — use now_compact() externally."""
-    return now_compact()
-
-
-def _ensure_dir(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-
 def _atomic_write(path: Path, data: Any) -> Path:
     """Write JSON atomically: write to .tmp, then replace."""
-    _ensure_dir(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(
         json.dumps(data, indent=2, ensure_ascii=False, default=str),
@@ -189,8 +175,8 @@ class Timeline:
             impact: Why this matters / what it enables.
         """
         event: Dict[str, Any] = {
-            "id": _now_compact(),
-            "timestamp": _now_iso(),
+            "id": now_compact(),
+            "timestamp": now_iso(),
             "type": event_type,
             "summary": summary,
             "impact": impact,
@@ -240,12 +226,14 @@ class Timeline:
         return _EVOLVE_DIR / "timeline.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
-        """Persist all events as a JSON list.
+        """Persist all events as a versioned JSON dict.
 
         Uses atomic write (``.tmp`` → final) for crash safety.
+        Writes via :meth:`to_dict` so the versioned format is consistent
+        with :meth:`from_dict` and :meth:`load`.
         """
         target = path or self.storage_path()
-        _atomic_write(target, self.events)
+        _atomic_write(target, self.to_dict())
         return target
 
     @classmethod
@@ -411,7 +399,7 @@ class SelfModel:
             "what": what,
             "deadline": deadline,
             "status": "active",
-            "created_at": _now_iso(),
+            "created_at": now_iso(),
         }
         self.data.setdefault("commitments", {})
         self.data["commitments"].setdefault("active_obligations", []).append(c)
@@ -422,7 +410,7 @@ class SelfModel:
         for c in self.data.get("commitments", {}).get("active_obligations", []):
             if c.get("what") == what:
                 c["status"] = "completed"
-                c["completed_at"] = _now_iso()
+                c["completed_at"] = now_iso()
                 return True
         return False
 
