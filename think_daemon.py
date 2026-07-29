@@ -1151,6 +1151,43 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     # Reduce confidence further since we're in fallback mode
     adjusted_confidence = round(base_confidence * 0.7, 2)
 
+    # ── Auto-create goals from world model improvement suggestions ──
+    # Bridging Gap 6 → Gap 4: convert high-priority discrepancy-driven
+    # suggestions into actual goals the system can pursue.
+    new_goal = None
+    goal_action = None
+    try:
+        suggestions = wm.generate_improvement_suggestions()
+        if suggestions:
+            # Take the highest-priority suggestion (priority 1 = highest)
+            top = suggestions[0]
+            new_goal = {
+                "title": top["title"],
+                "description": top["description"],
+                "rationale": top["rationale"],
+                "gap_reference": top.get("gap_reference", "6"),
+                "priority": top["priority"],
+                "verification_criteria": (
+                    f"Prediction error for action type drops below 0.3 "
+                    f"or required data threshold is met."
+                ),
+            }
+            # If the top suggestion has already been set as a goal before,
+            # don't recreate — skip new_goal creation if the timeline
+            # already has a matching active goal.
+            existing_goals = tl.get("future", {}).get("goals", [])
+            already_present = any(
+                top["title"].lower() in g.lower()
+                for g in existing_goals
+            )
+            if already_present:
+                new_goal = None  # Skip duplicate
+            # Update insight to mention the auto-created goal
+            insight += f" | Auto-created goal: {top['title']}"
+            insight_parts.append(f"Auto-goal: {top['title']}")
+    except Exception as e:
+        logger.debug("Auto-goal creation skipped: %s", e)
+
     # ── Determine next gap based on self-model ──
     current_focus = sm.get("state", {}).get("current_gap_focus", "")
     remaining_gaps = sm.get("state", {}).get("remaining_gaps", [])
@@ -1180,6 +1217,8 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
         "action": None,
         "plan_action": None,
         "new_plan": None,
+        "new_goal": new_goal,
+        "goal_action": goal_action,
         "search_query": None,
         "episodic_record": {
             "mtype": "observation",
