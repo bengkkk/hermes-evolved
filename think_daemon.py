@@ -896,8 +896,28 @@ _RUNTIME_PROVIDER: str = ""
 _RUNTIME_MODEL: str = ""
 
 
+def _auto_detect_provider_from_env() -> Optional[tuple[str, str]]:
+    """Auto-detect provider+model from environment variables when no config.yaml exists.
+
+    Checks for known API key env vars and maps them to provider defaults.
+    Returns (provider, model) or None if no recognized key is found.
+    """
+    import os as _os
+    # Mapping: env_var -> (provider, default_model)
+    _ENV_MAP: dict[str, tuple[str, str]] = {
+        "OPENCODE_API_KEY": ("opencode-go", "glm-5"),
+        "ANTHROPIC_API_KEY": ("anthropic", "claude-sonnet-4-20250514"),
+        "OPENAI_API_KEY": ("openai", "gpt-4o"),
+        "GEMINI_API_KEY": ("gmi", "gemini-2.5-pro"),
+    }
+    for env_var, (provider, default_model) in _ENV_MAP.items():
+        if _os.environ.get(env_var):
+            return (provider, default_model)
+    return None
+
+
 def _ensure_runtime_main() -> None:
-    """Read provider/model from config.yaml and cache them for explicit use.
+    """Read provider/model from config.yaml or env vars and cache them for explicit use.
 
     The auxiliary client's auto-resolution (``_resolve_auto()``) scans
     openrouter → nous → local/custom → api-key — but if the user's
@@ -910,6 +930,10 @@ def _ensure_runtime_main() -> None:
     globals so ``_call_llm`` can pass them **explicitly** to
     ``async_call_llm()``, bypassing the broken auto-detection chain
     entirely.
+
+    Resolution order:
+      1. ``config.yaml`` at ``EVOLVE_DIR.parent / "config.yaml"``.
+      2. Env-var-based auto-detection (fallback when no config.yaml).
     """
     global _RUNTIME_INITIALIZED, _RUNTIME_PROVIDER, _RUNTIME_MODEL
     if _RUNTIME_INITIALIZED:
@@ -917,13 +941,26 @@ def _ensure_runtime_main() -> None:
     try:
         import yaml
         config_path = EVOLVE_DIR.parent / "config.yaml"
-        if not config_path.exists():
-            logger.info("No config.yaml found at %s — skipping runtime init", config_path)
-            return
-        config = yaml.safe_load(config_path.read_text())
-        model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
-        provider = model_cfg.get("provider", "") or ""
-        model = model_cfg.get("default", "") or ""
+        provider = ""
+        model = ""
+
+        # ── 1. Try config.yaml ──
+        if config_path.exists():
+            config = yaml.safe_load(config_path.read_text())
+            model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+            provider = model_cfg.get("provider", "") or ""
+            model = model_cfg.get("default", "") or ""
+
+        # ── 2. Fallback: auto-detect from env vars when no config.yaml ──
+        if not (provider and model):
+            detected = _auto_detect_provider_from_env()
+            if detected:
+                provider, model = detected
+                logger.info(
+                    "Auto-detected provider=%s model=%s from env vars",
+                    provider, model,
+                )
+
         if provider and model:
             # Propagate env var aliases: some provider env_vars may be named
             # differently in this session (e.g. OPENCODE_API_KEY vs the
@@ -941,7 +978,11 @@ def _ensure_runtime_main() -> None:
             logger.info("Runtime main set: provider=%s model=%s", provider, model)
             _RUNTIME_INITIALIZED = True
         else:
-            logger.info("Config has no model.provider or model.default — skipping runtime init")
+            logger.info(
+                "No runtime config found — checked config.yaml and env vars. "
+                "Create %s or set OPENCODE_API_KEY/anthropic API key.",
+                config_path,
+            )
     except ImportError:
         logger.debug("set_runtime_main not available — skipping runtime init")
     except Exception as e:

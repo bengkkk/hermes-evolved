@@ -921,3 +921,67 @@ class TestOrientationPersistence:
 
         td.save_orientation({"focus": "test"})
         assert orient_path.exists()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Provider auto-detection from env vars
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestAutoDetectProviderFromEnv:
+    """_auto_detect_provider_from_env maps env vars to provider/model pairs."""
+
+    def test_detects_opencode_from_env(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        result = td._auto_detect_provider_from_env()
+        # OPENCODE_API_KEY is set in CI/test environment
+        if result:
+            assert result[0] == "opencode-go"
+            assert result[1] == "glm-5"
+
+    def test_detects_anthropic(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import importlib
+        import sys
+        # Fresh import with a clean env
+        monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        for mod in ("data_layer", "think_daemon"):
+            if mod in sys.modules:
+                del sys.modules[mod]
+        import think_daemon as td  # type: ignore
+        result = td._auto_detect_provider_from_env()
+        assert result is not None
+        assert result[0] == "anthropic"
+        assert result[1] == "claude-sonnet-4-20250514"
+
+    def test_returns_none_with_no_keys(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import importlib
+        import sys
+        monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        for mod in ("data_layer", "think_daemon"):
+            if mod in sys.modules:
+                del sys.modules[mod]
+        import think_daemon as td  # type: ignore
+        result = td._auto_detect_provider_from_env()
+        assert result is None
+
+    def test_ensure_runtime_main_uses_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When config.yaml doesn't exist but OPENCODE_API_KEY is set, runtime should init."""
+        import importlib
+        import sys
+        # Clear any cached runtime state
+        monkeypatch.delenv("OPENCODE_API_KEY", raising=False)
+        monkeypatch.setenv("OPENCODE_API_KEY", "sk-test-fallback")
+        for mod in ("data_layer", "think_daemon", "agent.auxiliary_client"):
+            sys.modules.pop(mod, None)
+        import think_daemon as td  # type: ignore
+        import data_layer  # noqa: F401
+        # Reset global flag
+        td._RUNTIME_INITIALIZED = False
+        td._ensure_runtime_main()
+        assert td._RUNTIME_INITIALIZED
+        assert td._RUNTIME_PROVIDER == "opencode-go"
+        assert td._RUNTIME_MODEL == "glm-5"
