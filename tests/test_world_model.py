@@ -1217,3 +1217,83 @@ class TestEdgeCases:
     def test_error_history_initial_state(self):
         wm = WorldModel()
         assert wm.data["prediction_accuracy"]["error_history"] == []
+
+    def test_generate_improvement_suggestions_empty(self):
+        """Empty world model → no suggestions."""
+        wm = WorldModel()
+        suggestions = wm.generate_improvement_suggestions()
+        assert suggestions == []
+
+    def test_format_improvement_context_empty(self):
+        """Empty world model → empty string."""
+        wm = WorldModel()
+        ctx = wm.format_improvement_context()
+        assert ctx == ""
+
+    def test_generate_improvement_suggestions_high_error_type(self):
+        wm = WorldModel()
+        # Add high-error actions for a type
+        tid = wm.record_action("shell", "broken deploy", "should succeed")
+        wm.complete_action(tid, "exit=1: build failure")
+        tid = wm.record_action("shell", "another fail", "should pass")
+        wm.complete_action(tid, "exit=1: timeout")
+        suggestions = wm.generate_improvement_suggestions()
+        calibrate = [s for s in suggestions if s["type"] == "calibrate"]
+        assert len(calibrate) >= 1
+        assert any("shell" in c["title"] for c in calibrate)
+
+    def test_generate_improvement_suggestions_discrepancy_pattern(self):
+        wm = WorldModel()
+        # Add several high-error actions of same type to trigger pattern
+        for desc in ["read protected file", "resolve unknown host", "deploy staging"]:
+            tid = wm.record_action("shell", desc, "expected ok")
+            wm.complete_action(tid, "exit=1: permission denied")
+        # Force pattern update
+        wm._update_discrepancy_patterns(min_samples=2)
+        suggestions = wm.generate_improvement_suggestions()
+        investigate = [s for s in suggestions if s["type"] == "investigate"]
+        assert len(investigate) >= 1
+
+    def test_generate_improvement_suggestions_insufficient_data(self):
+        wm = WorldModel()
+        # Add a type with only 1 sample
+        tid = wm.record_action("new_type", "first try", "expected")
+        wm.complete_action(tid, "exit=0: ok")
+        suggestions = wm.generate_improvement_suggestions()
+        collect = [s for s in suggestions if s["type"] == "collect_data"]
+        assert any("new_type" in c["title"] for c in collect)
+
+    def test_generate_improvement_suggestions_capped_at_eight(self):
+        wm = WorldModel()
+        # Add many high-error types to fill suggestion list
+        for i in range(6):
+            atype = f"type_{i}"
+            tid = wm.record_action(atype, "fail", "expected ok")
+            wm.complete_action(tid, "exit=1: failed")
+            tid = wm.record_action(atype, "fail2", "expected ok")
+            wm.complete_action(tid, "exit=1: fail")
+        suggestions = wm.generate_improvement_suggestions()
+        assert len(suggestions) <= 8
+
+    def test_format_improvement_context_with_suggestions(self):
+        wm = WorldModel()
+        tid = wm.record_action("shell", "risky op", "should work")
+        wm.complete_action(tid, "exit=1: failed")
+        tid = wm.record_action("shell", "risky op 2", "should work")
+        wm.complete_action(tid, "exit=1: error")
+        ctx = wm.format_improvement_context()
+        assert "Improvement Suggestions" in ctx
+        assert "calibrate" in ctx.lower() or "investigate" in ctx.lower() or "shell" in ctx.lower()
+        assert "new_goal" in ctx or "gap_reference" in ctx
+
+    def test_suggestions_prioritized_correctly(self):
+        """High-error (priority 2) before medium-error (priority 3) before data-collection (priority 4)."""
+        wm = WorldModel()
+        # Create a high-error calibration suggestion
+        tid = wm.record_action("shell", "deploy prod", "expected ok")
+        wm.complete_action(tid, "exit=1: crash")
+        tid = wm.record_action("shell", "deploy test", "expected ok")
+        wm.complete_action(tid, "exit=1: timeout")
+        suggestions = wm.generate_improvement_suggestions()
+        priorities = [s["priority"] for s in suggestions]
+        assert priorities == sorted(priorities)

@@ -682,6 +682,12 @@ class WorldModel:
                     f"    ● {p['description']}{themes}"
                 )
 
+        # ── Improvement suggestions (bridges Gap 6 → Gap 4) ──
+        imp = self.format_improvement_context()
+        if imp:
+            parts.append("")
+            parts.append(imp)
+
         return "\n".join(parts)
 
     def format_prediction_insight(self) -> str:
@@ -1075,6 +1081,166 @@ class WorldModel:
             )
 
         return "\n".join(lines)
+
+    # ── Improvement suggestions (bridges Gap 6 → Gap 4) ──────────
+
+    def generate_improvement_suggestions(self) -> List[Dict[str, Any]]:
+        """Generate structured improvement suggestions from world model data.
+
+        Analyzes per-type accuracy and discrepancy patterns to produce
+        actionable goal proposals the system can pursue. Suggestions include:
+
+          - Action types with elevated prediction error that need calibration
+          - Recurring discrepancy patterns that need root-cause analysis
+          - Action types with insufficient data for reliable prediction
+          - Calibration gaps (confidence vs. accuracy mismatch)
+
+        Returns:
+            A list of suggestion dicts, each containing:
+              - ``type``: ``calibrate`` | ``investigate`` | ``collect_data`` | ``improve_prediction``
+              - ``title``: One-line suggestion title
+              - ``description``: What to do and why
+              - ``rationale``: Why this matters for self-evolution
+              - ``gap_reference``: Which gap this addresses (``"6"`` or ``"4"``)
+              - ``priority``: 1–5 (1=highest)
+        """
+        suggestions: List[Dict[str, Any]] = []
+        per_type = self.get_per_type_accuracy()
+        patterns = self.get_discrepancy_patterns()
+        acc = self.data.get("prediction_accuracy", {})
+        triples = self.data.get("action_triples", [])
+
+        # 1. High-error action types → calibrate
+        for atype, stats in sorted(per_type.items(),
+                                    key=lambda x: x[1]["avg_error"], reverse=True):
+            avg_err = stats["avg_error"]
+            count = stats["count"]
+            if avg_err >= 0.4 and count >= 2:
+                suggestions.append({
+                    "type": "calibrate",
+                    "title": f"Improve prediction calibration for {atype} actions",
+                    "description": (
+                        f"{atype} actions have avg prediction error {avg_err:.2f} "
+                        f"across {count} samples. Calibrate the prediction heuristic "
+                        f"to reduce error below 0.3."
+                    ),
+                    "rationale": (
+                        f"Lower {atype} prediction error improves world model accuracy, "
+                        f"enabling better action selection and risk assessment."
+                    ),
+                    "gap_reference": "6",
+                    "priority": 2 if avg_err >= 0.7 else 3,
+                })
+
+        # 2. Discrepancy patterns → investigate root cause
+        for pat in patterns:
+            atype = pat.get("action_type", "unknown")
+            pcount = pat.get("count", 0)
+            ptotal = pat.get("total_completed", 0)
+            pavg = pat.get("avg_error", 0)
+            themes = pat.get("common_themes", [])
+            if pcount >= 2:
+                theme_str = f" (keywords: {', '.join(themes[:3])})" if themes else ""
+                suggestions.append({
+                    "type": "investigate",
+                    "title": f"Investigate {atype} prediction failures{theme_str}",
+                    "description": (
+                        f"{pcount}/{ptotal} {atype} actions have high prediction error "
+                        f"(avg {pavg:.2f}). Investigate whether the failure is in "
+                        f"the heuristic or the action description quality.{theme_str}"
+                    ),
+                    "rationale": (
+                        "Understanding the root cause of systematic prediction "
+                        "failures enables targeted improvements to the world model."
+                    ),
+                    "gap_reference": "6",
+                    "priority": 3,
+                })
+
+        # 3. Action types with insufficient data → collect more samples
+        for atype, stats in sorted(per_type.items(),
+                                    key=lambda x: x[1]["count"]):
+            count = stats["count"]
+            if count < 3:
+                suggestions.append({
+                    "type": "collect_data",
+                    "title": f"Gather more {atype} action samples for reliable calibration",
+                    "description": (
+                        f"Only {count} {atype} action{'s' if count != 1 else ''} "
+                        f"recorded. Need at least 3 for statistically meaningful "
+                        f"per-type calibration."
+                    ),
+                    "rationale": (
+                        "More samples per action type improve confidence adjustment "
+                        "accuracy and discrepancy detection."
+                    ),
+                    "gap_reference": "6",
+                    "priority": 4,
+                })
+
+        # 4. Calibration gap check — confidence vs actual accuracy
+        buckets = acc.get("calibration_buckets", [])
+        for i, bucket in enumerate(buckets):
+            count = bucket.get("count", 0)
+            avg_err = bucket.get("avg_error", 0)
+            if count >= 3 and avg_err > 0.3:
+                bucket_low = i * 20  # 0, 20, 40, 60, 80
+                bucket_high = bucket_low + 20
+                suggestions.append({
+                    "type": "improve_prediction",
+                    "title": (
+                        f"Fix overconfidence at {bucket_low}–{bucket_high}% "
+                        f"confidence level"
+                    ),
+                    "description": (
+                        f"Predictions at {bucket_low}–{bucket_high}% confidence have "
+                        f"avg error {avg_err:.2f} (n={count}), indicating systematic "
+                        f"overconfidence. Adjust the confidence threshold or calibration curve."
+                    ),
+                    "rationale": (
+                        "Correcting systematic overconfidence improves the reliability "
+                        "of all future predictions and the system's self-awareness."
+                    ),
+                    "gap_reference": "6",
+                    "priority": 2 if avg_err >= 0.5 else 3,
+                })
+
+        # Sort by priority (lower number = higher priority)
+        suggestions.sort(key=lambda s: s["priority"])
+        return suggestions[:8]  # Cap at 8 to avoid overwhelming the LLM
+
+    def format_improvement_context(self) -> str:
+        """Format improvement suggestions as a readable context block.
+
+        Returns a string suitable for injecting into the think_daemon
+        prompt, with structured suggestions the LLM can act on via
+        ``new_goal`` actions. Returns empty string if no suggestions.
+        """
+        suggestions = self.generate_improvement_suggestions()
+        if not suggestions:
+            return ""
+
+        parts: List[str] = [
+            "## World Model Improvement Suggestions",
+            "  (Discrepancy-driven goal proposals from prediction analysis)",
+        ]
+        for s in suggestions:
+            icons = {
+                "calibrate": "⚙",
+                "investigate": "🔍",
+                "collect_data": "📊",
+                "improve_prediction": "🎯",
+            }
+            icon = icons.get(s["type"], "·")
+            priority_str = "!" * s["priority"] if s["priority"] <= 3 else "·" * (s["priority"] - 2)
+            parts.append(
+                f"  {icon} [{priority_str}] {s['title']}"
+            )
+            parts.append(f"     {s['description']}")
+        parts.append(
+            "  (Use new_goal with gap_reference='6' or '4' to pursue a suggestion)"
+        )
+        return "\n".join(parts)
 
     # ── Proactive action guidance
 
