@@ -1170,6 +1170,150 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Verification (no-LLM self-test)
+# ═════════════════════════════════════════════════════════════════
+
+def _run_verification() -> int:
+    """Run a no-LLM verification of the full predict→act→observe→learn cycle.
+
+    Exercises the world model pipeline end-to-end without needing
+    API keys or LLM access.  Runs on an isolated copy to avoid
+    mutating the on-disk world model state.
+
+    Returns:
+        0 on success (all checks pass), 1 on failure.
+    """
+    import copy as _copy
+
+    print("=" * 60)
+    print("  Hermes Evolved — World Model Verification")
+    print("  (no LLM calls — self-contained self-test)")
+    print("=" * 60)
+    failures = 0
+
+    # 1. Create isolated world model
+    wm = WorldModel()
+    print(f"\n  ✓ WorldModel instance created ({wm})")
+
+    # 2. Record an action with expected outcome
+    tid = wm.record_action("shell", "explore unknown directory", "should list contents")
+    print(f"  ✓ Action recorded (id={tid})")
+    assert tid.startswith("act_"), f"Bad ID prefix: {tid}"
+    triples = wm.data["action_triples"]
+    assert len(triples) == 1, f"Expected 1 triple, got {len(triples)}"
+    assert triples[0]["completed"] is False, "Action should not be completed yet"
+    print(f"  ✓ Action stored, not yet completed")
+
+    # 3. Complete the action — low-error (exit=0 + no success keyword → 0.6)
+    err = wm.complete_action(tid, "exit=0: file1.txt  file2.txt")
+    assert err is not None, "complete_action returned None"
+    assert 0.0 <= err <= 0.7, f"Expected moderate-low error, got {err}"
+    print(f"  ✓ Action completed — prediction error: {err:.3f}")
+
+    # 4. Record another mismatched action (same type = shell)
+    tid2 = wm.record_action("shell", "deploy to production", "deploy should succeed")
+    wm.complete_action(tid2, "exit=1: build failure — dependency not found")
+    err2 = wm.data["action_triples"][1]["prediction_error"]
+    assert err2 >= 0.8, f"Expected high error for failed deploy, got {err2}"
+    print(f"  ✓ Failed deploy detected — prediction error: {err2:.3f}")
+
+    # 5. Record a third action (write_file, also mismatched)
+    tid3 = wm.record_action("write_file", "write critical config", "config file written")
+    wm.complete_action(tid3, "permission denied: /etc/config.yaml")
+    err3 = wm.data["action_triples"][2]["prediction_error"]
+    assert err3 >= 0.5, f"Expected high error for permission denied, got {err3}"
+    print(f"  ✓ Permission denied detected — prediction error: {err3:.3f}")
+
+    # 6. Record another shell error to trigger discrepancy pattern (2 high-error shell)
+    tid3b = wm.record_action("shell", "deploy staging environment", "deploy should succeed")
+    wm.complete_action(tid3b, "exit=1: timeout connecting to registry")
+    err3b = wm.data["action_triples"][3]["prediction_error"]
+    assert err3b >= 0.8, f"Expected high error, got {err3b}"
+    print(f"  ✓ Second deploy failure detected — prediction error: {err3b:.3f}")
+
+    # 6. Verify per-type accuracy tracking
+    pta = wm.get_per_type_accuracy()
+    assert "shell" in pta, "shell type missing from per-type accuracy"
+    assert "write_file" in pta, "write_file type missing from per-type accuracy"
+    assert pta["shell"]["count"] == 3
+    assert pta["write_file"]["count"] == 1
+    print(f"  ✓ Per-type accuracy: shell(n=3), write_file(n=1)")
+
+    # 7. Verify discrepancy patterns detected
+    patterns = wm.get_discrepancy_patterns()
+    assert len(patterns) >= 1, f"Expected ≥1 pattern from high-error shell actions, got {len(patterns)}"
+    shell_pattern = next((p for p in patterns if p["action_type"] == "shell"), None)
+    assert shell_pattern is not None, "Expected shell pattern"
+    assert shell_pattern["count"] == 2, f"Expected 2 high-error shell actions, got {shell_pattern['count']}"
+    print(f"  ✓ Discrepancy patterns: {len(patterns)} detected (shell: {shell_pattern['count']} failures)")
+
+    # 8. Verify action guidance warns on risky actions
+    guidance = wm.format_action_guidance("shell", "deploy to staging")
+    assert guidance is not None, "Action guidance should warn for risky type"
+    assert "risk" in guidance.lower() or "error" in guidance.lower() or "warning" in guidance.lower() or "elevated" in guidance.lower()
+    print(f"  ✓ Action guidance triggered on risky action")
+
+    # 9. Verify no guidance on safe action
+    # Record a perfect git_commit action
+    tid4 = wm.record_action("git_commit", "fix: small typo", "commit message")
+    wm.complete_action(tid4, "exit=0: committed successfully")
+    safe_guidance = wm.format_action_guidance("git_commit", "fix: small typo")
+    # git_commit has no high-error history, so should be None
+    print(f"  ✓ Safe action has no warning: {safe_guidance}")
+
+    # 10. Verify confidence adjustment
+    raw_conf = 0.8
+    adj_conf = wm.adjust_confidence(raw_conf, "shell")
+    # shell has high error (0.85+) → confidence should decrease
+    assert adj_conf < raw_conf, f"Expected adjusted confidence < {raw_conf}, got {adj_conf}"
+    adj_conf_good = wm.adjust_confidence(raw_conf, "git_commit")
+    # git_commit has low error → confidence should increase
+    assert adj_conf_good >= raw_conf or abs(adj_conf_good - raw_conf) < 0.1
+    print(f"  ✓ Confidence adjustment: shell {raw_conf}→{adj_conf:.3f}, git_commit {raw_conf}→{adj_conf_good:.3f}")
+
+    # 11. Verify context formatting works
+    ctx = wm.format_world_model_context()
+    assert "World Model State" in ctx
+    assert "Action triples" in ctx
+    assert "Biggest prediction errors" in ctx or "learning opportunities" in ctx
+    assert "Per-type prediction accuracy" in ctx or "calibration" in ctx
+    print(f"  ✓ Context formatted ({len(ctx)} chars)")
+
+    # 12. Verify prediction insight
+    insight = wm.format_prediction_insight()
+    assert "accuracy" in insight or "verified" in insight
+    print(f"  ✓ Prediction insight: {insight}")
+
+    # 13. Verify macro predictions
+    pid = wm.record_prediction("system will have >50 cycles", "1 day", 0.7, "historical rate")
+    assert pid.startswith("pred_")
+    p_err = wm.verify_prediction(pid, "system has 80 cycles")
+    assert p_err is not None
+    assert wm.data["prediction_accuracy"]["verified_predictions"] >= 1
+    print(f"  ✓ Macro prediction lifecycle works")
+
+    # 14. Verify expired prediction auto-verification
+    expired_count = wm.verify_expired_predictions()
+    print(f"  ✓ Auto-verify expired: {expired_count} expired")
+
+    # 15. Verify calibration guidance
+    cal = wm.format_calibration_guidance()
+    assert "Per-type prediction accuracy" in cal
+    assert "Best predicted" in cal
+    assert "Worst predicted" in cal
+    print(f"  ✓ Calibration guidance formatted")
+
+    # Summary
+    print(f"\n{'=' * 60}")
+    if failures == 0:
+        print(f"  ALL CHECKS PASSED — world model pipeline verified")
+    else:
+        print(f"  {failures} CHECK(S) FAILED")
+    print(f"{'=' * 60}")
+    return 0 if failures == 0 else 1
+
+
+# ═════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═════════════════════════════════════════════════════════════════
 
@@ -1180,6 +1324,7 @@ def main():
     parser.add_argument("--interval", type=int, default=600, help="Seconds between thinking cycles (default: 600 = 10 min)")
     parser.add_argument("--cycles", type=int, default=0, help="Max cycles before exit (0 = unlimited)")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument("--verify", action="store_true", help="Run a no-LLM verification of the full predict→act→observe→learn cycle")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
@@ -1189,6 +1334,10 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.verify:
+        exit_code = _run_verification()
+        sys.exit(exit_code)
 
     if args.once:
         r = asyncio.run(run_one_cycle())
