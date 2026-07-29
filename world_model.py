@@ -142,7 +142,9 @@ def _compute_prediction_error(
 
     # ── Exit-code aware comparison ──
     # Actual output often contains "exit=N:" — check if exit code
-    # correlates with expected success/failure keywords
+    # correlates with expected success/failure keywords.
+    # The exit code IS the ground truth: exit=0 always means success,
+    # exit != 0 always means failure.
     exit_match = re.search(r'exit=(\d+)', a_lower)
     if exit_match:
         exit_code = int(exit_match.group(1))
@@ -153,17 +155,16 @@ def _compute_prediction_error(
              'read', 'done', 'build', 'fix', 'fetch', 'merge',
              'pull', 'add', 'update', 'find', 'search', 'info',
              'log', 'clean', 'set', 'get', 'patch', 'branch', 'diff'))
-        if success_expected and exit_code == 0:
-            # Expected success and got success — low error
+        if exit_code == 0:
+            # Exit code 0 = command succeeded → low error regardless
+            # of whether the expected text happened to contain keywords
             return 0.15
-        elif not success_expected and exit_code != 0:
-            # Expected failure and got failure — low error
-            return 0.2
-        elif success_expected and exit_code != 0:
-            # Expected success but got failure — high error
+        elif success_expected:
+            # Expected success but got failure → high error
             return 0.85
-        # Exit code didn't match expectations — medium-high error
-        return 0.6
+        else:
+            # Neutral expected text but command failed → moderate error
+            return 0.7
 
     # ── Character bigram similarity ──
     # For short strings, bigram overlap handles word variations better

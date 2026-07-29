@@ -57,9 +57,10 @@ class TestComputePredictionError:
         assert err <= 0.2, f"Expected ≤ 0.2 (list is success kw), got {err}"
 
     def test_exit_code_neutral_keyword(self) -> None:
-        # Expected text with no success/failure keyword + exit=0 → moderate error (0.6)
+        # Expected text with no success/failure keyword + exit=0 → low error
+        # (exit code 0 means success regardless of expected keywords)
         err = _compute_prediction_error("examine the output carefully", "exit=0: data")
-        assert err == 0.6, f"Expected 0.6, got {err}"
+        assert err <= 0.2, f"Expected ≤ 0.2 (exit=0=success), got {err}"
 
     def test_bigram_similarity_high(self) -> None:
         error = _compute_prediction_error("write configuration file", "written config file")
