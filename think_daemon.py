@@ -1230,7 +1230,13 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     if sq and isinstance(sq, str) and sq.strip():
         try:
             logger.info("Searching: %s", sq[:80])
-            from ddgs import DDGS
+            try:
+                from duckduckgo_search import DDGS
+            except ImportError:
+                try:
+                    from ddgs import DDGS
+                except ImportError:
+                    raise ImportError("No search module available (try: pip install duckduckgo_search)")
             with DDGS() as ddgs:
                 search_results = list(ddgs.text(sq, max_results=4))
             if search_results:
