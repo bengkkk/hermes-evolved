@@ -5,7 +5,7 @@ timeline, and self-model — generating context about what it's working on,
 what it knows about itself, and what needs attention.
 At session end, it can persist reflection for the next session.
 
-This module is now a thin compatibility layer over ``data_layer.py``,
+This module is a thin compatibility layer over ``data_layer.py``,
 which is the single authoritative persistence module. All file I/O
 is delegated to atomic-write-backed operations in data_layer.
 
@@ -24,33 +24,44 @@ from typing import Any, Dict, List, Optional
 
 # Delegate all persistence to the consolidated data layer
 from data_layer import (
-    Memory as _Memory,
     Goals as _Goals,
+    Memory as _Memory,
     Orientation as _Orientation,
     SelfModel as _SelfModel,
-    create_plan as _create_plan,
-    get_active_plan as _get_active_plan,
-    update_plan_step as _update_plan_step,
+    add_commitment as _add_commitment,
+    add_prediction as _add_prediction,
     complete_plan as _complete_plan,
+    create_plan as _create_plan,
+    format_orientation_context as _format_orientation_context,
     format_plan_context as _format_plan_context,
+    format_self_model_context as _format_self_model_context,
     format_timeline_context as _format_timeline_context,
+    get_active_plan as _get_active_plan,
     get_evolve_dir,
-    now_iso,
+    load_self_model as _load_self_model,
+    load_timeline_dict as _load_timeline_dict,
     now_compact,
+    now_iso,
+    record_event as _record_event,
+    record_outcome as _record_outcome,
+    record_session_completion as _record_session_completion,
     safe_read_json,
     safe_write_json,
+    save_self_model as _save_self_model,
+    save_timeline_dict as _save_timeline_dict,
+    update_commitment as _update_commitment,
+    update_goals as _update_goals,
+    update_plan_step as _update_plan_step,
+    update_present_state as _update_present_state,
+    update_self_model as _update_self_model,
 )
 
 logger = logging.getLogger(__name__)
 
-# ── Paths (delegated to data_layer for the base directory) ──
+# ── Paths (only paths unique to self_evolve; data_layer owns the canonical ones) ──
 EVOLVE_DIR = get_evolve_dir()
 ORIENTATION_FILE = EVOLVE_DIR / "orientation.json"
 HISTORY_FILE = EVOLVE_DIR / "history.jsonl"
-TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
-SELF_MODEL_FILE = EVOLVE_DIR / "self_model.json"
-MEMORY_FILE = EVOLVE_DIR / "memory.json"
-GOALS_FILE = EVOLVE_DIR / "goals.json"
 
 
 def ensure_evolve_dir():
@@ -115,178 +126,66 @@ def load_recent_history(limit: int = 5) -> list:
 
 # ═════════════════════════════════════════════════════════════════
 #  Timeline (Gap 9 — Time Sense)
+#  All functions delegate to data_layer.py
 # ═════════════════════════════════════════════════════════════════
 
-_DEFAULT_TIMELINE = {
-    "version": 1,
-    "past": {
-        "events": [],
-        "completed_sessions": [],
-        "outcomes": [],
-    },
-    "present": {
-        "active_project": None,
-        "active_tasks": [],
-        "waiting_for": [],
-        "last_session_focus": None,
-        "commitments": [],
-    },
-    "future": {
-        "goals": [],
-        "scheduled_actions": [],
-        "contingencies": [],
-        "predictions": [],
-        "plans": [],
-    },
-}
-
-
-def _merge_timeline(data: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep-merge a loaded timeline with defaults to handle schema evolution."""
-    merged = dict(_DEFAULT_TIMELINE)
-    for section in ("past", "present", "future"):
-        if section in data and isinstance(data[section], dict):
-            merged[section].update(data[section])
-    for k, v in data.items():
-        if k not in ("past", "present", "future"):
-            merged[k] = v
-    return merged
-
-
 def load_timeline() -> Dict[str, Any]:
-    """Load the timeline (past → present → future)."""
-    data = safe_read_json(TIMELINE_FILE)
-    if isinstance(data, dict):
-        return _merge_timeline(data)
-    return dict(_DEFAULT_TIMELINE)
+    """Load the timeline (past → present → future). Delegates to data_layer."""
+    return _load_timeline_dict()
 
 
 def save_timeline(timeline: Dict[str, Any]) -> None:
-    """Persist the timeline."""
-    safe_write_json(TIMELINE_FILE, timeline)
+    """Persist the timeline. Delegates to data_layer."""
+    _save_timeline_dict(timeline)
 
 
 def record_event(event_type: str, summary: str, impact: str = "") -> None:
-    """Record an event in the timeline's past."""
-    timeline = load_timeline()
-    event = {
-        "id": now_compact(),
-        "type": event_type,
-        "timestamp": now_iso(),
-        "summary": summary,
-        "impact": impact,
-    }
-    timeline["past"]["events"].append(event)
-    timeline["past"]["events"] = timeline["past"]["events"][-50:]
-    save_timeline(timeline)
+    """Record an event in the timeline's past. Delegates to data_layer."""
+    _record_event(event_type, summary, impact)
 
 
 def record_session_completion(session_id: str, focus: str,
                               outcomes: list) -> None:
-    """Record a completed session in the timeline."""
-    timeline = load_timeline()
-    entry = {
-        "session_id": session_id,
-        "timestamp": now_iso(),
-        "focus": focus,
-        "outcomes": outcomes,
-    }
-    timeline["past"]["completed_sessions"].append(entry)
-    timeline["past"]["completed_sessions"] = \
-        timeline["past"]["completed_sessions"][-20:]
-    save_timeline(timeline)
+    """Record a completed session in the timeline. Delegates to data_layer."""
+    _record_session_completion(session_id, focus, outcomes)
 
 
 def record_outcome(event_id: str, summary: str, impact: str = "") -> None:
-    """Record an outcome linked to a past event."""
-    timeline = load_timeline()
-    outcome = {
-        "id": now_compact(),
-        "event_id": event_id,
-        "timestamp": now_iso(),
-        "summary": summary,
-        "impact": impact,
-    }
-    timeline["past"]["outcomes"].append(outcome)
-    timeline["past"]["outcomes"] = timeline["past"]["outcomes"][-50:]
-    save_timeline(timeline)
+    """Record an outcome linked to a past event. Delegates to data_layer."""
+    _record_outcome(event_id, summary, impact)
 
 
 def add_commitment(what: str, deadline: Optional[str] = None,
                    status: str = "active") -> None:
-    """Track a commitment with an optional deadline."""
-    timeline = load_timeline()
-    commit = {
-        "id": now_compact(),
-        "what": what,
-        "deadline": deadline,
-        "status": status,
-        "created_at": now_iso(),
-    }
-    timeline["present"]["commitments"].append(commit)
-    timeline["present"]["commitments"] = \
-        timeline["present"]["commitments"][-30:]
-    save_timeline(timeline)
+    """Track a commitment with an optional deadline. Delegates to data_layer."""
+    _add_commitment(what, deadline, status)
 
 
 def update_commitment(commit_id: str, status: str = "done") -> None:
-    """Mark a commitment as done/expired."""
-    timeline = load_timeline()
-    for c in timeline["present"]["commitments"]:
-        if c["id"] == commit_id:
-            c["status"] = status
-            break
-    save_timeline(timeline)
+    """Mark a commitment as done/expired. Delegates to data_layer."""
+    _update_commitment(commit_id, status)
 
 
 def add_prediction(text: str, timeframe: Optional[str] = None,
                    confidence: Optional[float] = None,
                    basis: Optional[str] = None) -> None:
-    """Record a prediction about future outcomes."""
-    timeline = load_timeline()
-    pred = {
-        "id": now_compact(),
-        "text": text,
-        "timeframe": timeframe,
-        "confidence": confidence,
-        "basis": basis,
-        "created_at": now_iso(),
-    }
-    timeline["future"]["predictions"].append(pred)
-    timeline["future"]["predictions"] = \
-        timeline["future"]["predictions"][-50:]
-    save_timeline(timeline)
+    """Record a prediction about future outcomes. Delegates to data_layer."""
+    _add_prediction(text, timeframe, confidence, basis)
 
 
 def update_present_state(active_project: Optional[str] = None,
                          tasks: Optional[list] = None,
                          waiting_for: Optional[list] = None,
                          focus: Optional[str] = None) -> None:
-    """Update the present state in the timeline."""
-    timeline = load_timeline()
-    if active_project is not None:
-        timeline["present"]["active_project"] = active_project
-    if tasks is not None:
-        timeline["present"]["active_tasks"] = tasks
-    if waiting_for is not None:
-        timeline["present"]["waiting_for"] = waiting_for
-    if focus is not None:
-        timeline["present"]["last_session_focus"] = focus
-    save_timeline(timeline)
+    """Update the present state in the timeline. Delegates to data_layer."""
+    _update_present_state(active_project, tasks, waiting_for, focus)
 
 
 def update_goals(goals: Optional[list] = None,
                  scheduled: Optional[list] = None,
                  contingencies: Optional[list] = None) -> None:
-    """Update the future goals/plans in the timeline."""
-    timeline = load_timeline()
-    if goals is not None:
-        timeline["future"]["goals"] = goals
-    if scheduled is not None:
-        timeline["future"]["scheduled_actions"] = scheduled
-    if contingencies is not None:
-        timeline["future"]["contingencies"] = contingencies
-    save_timeline(timeline)
+    """Update the future goals/plans in the timeline. Delegates to data_layer."""
+    _update_goals(goals, scheduled, contingencies)
 
 
 def create_plan(goal: str,
@@ -318,15 +217,8 @@ def format_timeline_context() -> str:
 
 # ═════════════════════════════════════════════════════════════════
 #  Multi-type Memory (Gap 2 — Episodic / Semantic / Procedural)
+#  All functions delegate to data_layer.py
 # ═════════════════════════════════════════════════════════════════
-
-_DEFAULT_MEMORY = {
-    "version": 1,
-    "episodic": [],
-    "semantic": [],
-    "procedural": [],
-}
-
 
 def load_memory() -> Dict[str, Any]:
     """Load the multi-type memory store. Delegates to data_layer."""
@@ -385,13 +277,8 @@ def format_memory_context() -> str:
 
 # ═════════════════════════════════════════════════════════════════
 #  Self-generated Goals (Gap 4 — Goal Generation)
+#  All functions delegate to data_layer.py
 # ═════════════════════════════════════════════════════════════════
-
-_DEFAULT_GOALS = {
-    "version": 1,
-    "goals": [],
-}
-
 
 def load_goals() -> Dict[str, Any]:
     """Load self-generated goals. Delegates to data_layer."""
@@ -441,102 +328,32 @@ def format_goal_context() -> str:
 
 # ═════════════════════════════════════════════════════════════════
 #  Self Model (Gap 7 — Stable Self Model)
+#  All functions delegate to data_layer.py
 # ═════════════════════════════════════════════════════════════════
 
-_DEFAULT_SELF_MODEL = {
-    "version": 1,
-    "identity": {
-        "name": "Hermes (evolved)",
-        "role": "thinking entity with persistent identity",
-        "platform": "Hermes Agent",
-    },
-    "state": {
-        "evolution_version": 5,
-        "total_evolution_sessions": 0,
-        "current_gap_focus": None,
-    },
-    "capabilities": {
-        "available_tools": [],
-        "known_skills": [],
-        "weaknesses": [],
-        "unknown_areas": [],
-    },
-    "commitments": {
-        "current_project": None,
-        "promised_features": [],
-        "active_obligations": [],
-    },
-}
-
-
-def _deep_merge_self_model(data: Dict[str, Any],
-                           defaults: Dict[str, Any]) -> Dict[str, Any]:
-    """Deep-merge loaded self-model with defaults."""
-    merged = dict(defaults)
-    for section in ("identity", "state", "capabilities", "commitments"):
-        if section in data and isinstance(data[section], dict):
-            merged[section].update(data[section])
-    for k, v in data.items():
-        if k not in merged:
-            merged[k] = v
-    return merged
-
-
 def load_self_model() -> Dict[str, Any]:
-    """Load the self-model."""
-    data = safe_read_json(SELF_MODEL_FILE)
-    if isinstance(data, dict):
-        return _deep_merge_self_model(data, _DEFAULT_SELF_MODEL)
-    return dict(_DEFAULT_SELF_MODEL)
+    """Load the self-model. Delegates to data_layer."""
+    return _load_self_model()
 
 
 def save_self_model(model: Dict[str, Any]) -> None:
-    """Persist the self-model."""
-    safe_write_json(SELF_MODEL_FILE, model)
+    """Persist the self-model. Delegates to data_layer."""
+    _save_self_model(model)
 
 
 def update_self_model(**updates) -> None:
-    """Update specific fields of the self-model."""
-    model = load_self_model()
-    for section, data in updates.items():
-        if section in model and isinstance(data, dict):
-            model[section].update(data)
-    save_self_model(model)
+    """Update specific fields of the self-model. Delegates to data_layer."""
+    _update_self_model(**updates)
 
 
 def format_self_model_context() -> str:
-    """Format self-model section for the system prompt."""
-    model = load_self_model()
-    parts = ["## Self Model"]
-
-    identity = model.get("identity", {})
-    parts.append(f"Identity: {identity.get('name', '—')} — "
-                 f"{identity.get('role', '—')}")
-
-    state = model.get("state", {})
-    ev = state.get("evolution_version", 0)
-    gap = state.get("current_gap_focus")
-    gap_str = f", current gap focus: {gap}" if gap else ""
-    parts.append(f"Evolution: v{ev}{gap_str}")
-
-    caps = model.get("capabilities", {})
-    weaknesses = caps.get("weaknesses", [])
-    if weaknesses:
-        parts.append(f"Known weaknesses: {'; '.join(weaknesses[:3])}")
-    unknowns = caps.get("unknown_areas", [])
-    if unknowns:
-        parts.append(f"Areas to learn: {'; '.join(unknowns[:3])}")
-
-    commits = model.get("commitments", {})
-    project = commits.get("current_project")
-    if project:
-        parts.append(f"Committed to: {project}")
-
-    return "\n".join(parts)
+    """Format self-model section for the system prompt. Delegates to data_layer."""
+    return _format_self_model_context()
 
 
 # ═════════════════════════════════════════════════════════════════
 #  Unified context injection (called by system_prompt.py)
+#  Delegates to data_layer.py
 # ═════════════════════════════════════════════════════════════════
 
 def format_orientation_context() -> str:
@@ -551,5 +368,4 @@ def format_orientation_context() -> str:
       - Timeline awareness (past → present → future)
       - Self-model awareness (identity, capabilities, gaps)
     """
-    from data_layer import format_orientation_context as _fmt
-    return _fmt()
+    return _format_orientation_context()

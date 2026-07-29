@@ -925,6 +925,20 @@ _DEFAULT_TIMELINE_DICT: Dict[str, Any] = {
 }
 
 
+def load_timeline_dict() -> Dict[str, Any]:
+    """Load the dict-format timeline (past/present/future).
+
+    Public entry point to the structured timeline. Returns a merged
+    dict with default values for any missing sections.
+    """
+    return _load_timeline_dict()
+
+
+def save_timeline_dict(data: Dict[str, Any]) -> None:
+    """Save the dict-format timeline (public wrapper)."""
+    _save_timeline_dict(data)
+
+
 def _load_timeline_dict() -> Dict[str, Any]:
     """Load the dict-format timeline (past/present/future)."""
     path = _EVOLVE_DIR / "timeline.json"
@@ -944,6 +958,143 @@ def _load_timeline_dict() -> Dict[str, Any]:
 def _save_timeline_dict(data: Dict[str, Any]) -> None:
     """Save the dict-format timeline."""
     safe_write_json(_EVOLVE_DIR / "timeline.json", data)
+
+
+# ── Dict-format timeline event helpers ──────────────────────────────
+
+
+def record_event(
+    event_type: str, summary: str, impact: str = ""
+) -> None:
+    """Record an event in the timeline's past section."""
+    timeline = _load_timeline_dict()
+    event = {
+        "id": now_compact(),
+        "type": event_type,
+        "timestamp": now_iso(),
+        "summary": summary,
+        "impact": impact,
+    }
+    timeline["past"]["events"].append(event)
+    timeline["past"]["events"] = timeline["past"]["events"][-50:]
+    _save_timeline_dict(timeline)
+
+
+def record_session_completion(
+    session_id: str, focus: str, outcomes: list
+) -> None:
+    """Record a completed session in the timeline."""
+    timeline = _load_timeline_dict()
+    entry = {
+        "session_id": session_id,
+        "timestamp": now_iso(),
+        "focus": focus,
+        "outcomes": outcomes,
+    }
+    timeline["past"]["completed_sessions"].append(entry)
+    timeline["past"]["completed_sessions"] = \
+        timeline["past"]["completed_sessions"][-20:]
+    _save_timeline_dict(timeline)
+
+
+def record_outcome(event_id: str, summary: str, impact: str = "") -> None:
+    """Record an outcome linked to a past event."""
+    timeline = _load_timeline_dict()
+    outcome = {
+        "id": now_compact(),
+        "event_id": event_id,
+        "timestamp": now_iso(),
+        "summary": summary,
+        "impact": impact,
+    }
+    timeline["past"]["outcomes"].append(outcome)
+    timeline["past"]["outcomes"] = timeline["past"]["outcomes"][-50:]
+    _save_timeline_dict(timeline)
+
+
+def add_commitment(
+    what: str, deadline: Optional[str] = None, status: str = "active"
+) -> None:
+    """Track a commitment with an optional deadline."""
+    timeline = _load_timeline_dict()
+    commit = {
+        "id": now_compact(),
+        "what": what,
+        "deadline": deadline,
+        "status": status,
+        "created_at": now_iso(),
+    }
+    timeline["present"]["commitments"].append(commit)
+    timeline["present"]["commitments"] = \
+        timeline["present"]["commitments"][-30:]
+    _save_timeline_dict(timeline)
+
+
+def update_commitment(commit_id: str, status: str = "done") -> None:
+    """Mark a commitment as done/expired."""
+    timeline = _load_timeline_dict()
+    for c in timeline["present"]["commitments"]:
+        if c["id"] == commit_id:
+            c["status"] = status
+            break
+    _save_timeline_dict(timeline)
+
+
+def add_prediction(
+    text: str,
+    timeframe: Optional[str] = None,
+    confidence: Optional[float] = None,
+    basis: Optional[str] = None,
+) -> None:
+    """Record a prediction about future outcomes."""
+    timeline = _load_timeline_dict()
+    pred = {
+        "id": now_compact(),
+        "text": text,
+        "timeframe": timeframe,
+        "confidence": confidence,
+        "basis": basis,
+        "created_at": now_iso(),
+    }
+    timeline["future"]["predictions"].append(pred)
+    timeline["future"]["predictions"] = \
+        timeline["future"]["predictions"][-50:]
+    _save_timeline_dict(timeline)
+
+
+def update_present_state(
+    active_project: Optional[str] = None,
+    tasks: Optional[list] = None,
+    waiting_for: Optional[list] = None,
+    focus: Optional[str] = None,
+) -> None:
+    """Update the present state section of the timeline."""
+    timeline = _load_timeline_dict()
+    if active_project is not None:
+        timeline["present"]["active_project"] = active_project
+    if tasks is not None:
+        timeline["present"]["active_tasks"] = tasks
+    if waiting_for is not None:
+        timeline["present"]["waiting_for"] = waiting_for
+    if focus is not None:
+        timeline["present"]["last_session_focus"] = focus
+    _save_timeline_dict(timeline)
+
+
+def update_goals(
+    goals: Optional[list] = None,
+    scheduled: Optional[list] = None,
+    contingencies: Optional[list] = None,
+) -> None:
+    """Update the future goals/plans/scheduled actions in the timeline."""
+    timeline = _load_timeline_dict()
+    if goals is not None:
+        timeline["future"]["goals"] = goals
+    if scheduled is not None:
+        timeline["future"]["scheduled_actions"] = scheduled
+    if contingencies is not None:
+        timeline["future"]["contingencies"] = contingencies
+    _save_timeline_dict(timeline)
 
 
 def create_plan(goal: str, steps: Optional[List[Dict[str, Any]]] = None) -> str:
@@ -1023,6 +1174,53 @@ def complete_plan(plan_id: str, status: str = "complete") -> bool:
             _save_timeline_dict(timeline)
             return True
     return False
+
+
+# ── Self-model helpers (thin wrappers around SelfModel class) ──────
+
+
+def load_self_model() -> Dict[str, Any]:
+    """Load the self-model from disk."""
+    sm = SelfModel.load()
+    return sm.data
+
+
+def save_self_model(model: Dict[str, Any]) -> None:
+    """Persist the self-model to disk."""
+    sm = SelfModel(data=model)
+    sm.save()
+
+
+def update_self_model(**updates) -> None:
+    """Update specific fields of the self-model."""
+    sm = SelfModel.load()
+    for section, data in updates.items():
+        if section in sm.data and isinstance(data, dict):
+            sm.data[section].update(data)
+    sm.save()
+
+
+def format_self_model_context() -> str:
+    """Format the self-model as a natural text block for the system prompt."""
+    sm = SelfModel.load()
+    parts: List[str] = ["## Self Model"]
+    parts.append(
+        f"Identity: {sm.identity.get('name', '—')} — {sm.identity.get('role', '—')}"
+    )
+    ver = sm.state.get("evolution_version", 0)
+    gap = sm.state.get("current_gap_focus")
+    gap_str = f", current gap focus: {gap}" if gap else ""
+    parts.append(f"Evolution: v{ver}{gap_str}")
+    weaknesses = sm.capabilities.get("weaknesses", [])
+    if weaknesses:
+        parts.append(f"Known weaknesses: {'; '.join(weaknesses[:3])}")
+    unknowns = sm.capabilities.get("unknown_areas", [])
+    if unknowns:
+        parts.append(f"Areas to learn: {'; '.join(unknowns[:3])}")
+    project = sm.data.get("commitments", {}).get("current_project")
+    if project:
+        parts.append(f"Committed to: {project}")
+    return "\n".join(parts)
 
 
 def format_plan_context() -> str:
