@@ -213,6 +213,8 @@ Identity: {identity_name} — {identity_role}
 Current gap focus: {gap_focus}
 Evolution version: v{evolution_version}
 Total thinking cycles so far: {tick_count}
+Daemon PID: {daemon_pid}
+⚠ This environment has NO `ps`/`pgrep`/`systemctl`. To check a process: ``cat /proc/{daemon_pid}/status`` or ``python3 -c "import os; print(os.kill({daemon_pid}, 0))"``
 
 Strengths: {strengths}
 Weaknesses: {weaknesses}
@@ -268,8 +270,6 @@ Rules:
   - Unsure about workspace layout? Run: ls -la /
   - Want to check a file? Run: cat {workspace_root}/some_file.py
   - Need to verify PyPI? Run: python3 -c "import json; print('ok')"
-  - Need to check if a process is running? Do NOT use ps or pgrep (they are not installed).
-    Use: cat /proc/<PID>/status or: python3 -c "import os; print(os.kill(<PID>, 0))"
 
 ACTION CAPABILITIES (Gap 10):
 - Use the "action" field to take action NOW. Supported types:
@@ -461,6 +461,13 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     else:
         plan_status = "  (NO ACTIVE PLAN)"
 
+    # ── Daemon PID from lock file (enables process checks without ps/pgrep) ──
+    try:
+        lock_pid = Path(DAEMON_LOCK_FILE).read_text().strip()
+        daemon_pid = lock_pid if lock_pid.isdigit() else "(unknown)"
+    except (OSError, ValueError):
+        daemon_pid = "(unknown)"
+
     # ── Last action result (fed back from previous cycle) ──
     last_output = ds.get("last_action_output", "")
     if last_output:
@@ -504,6 +511,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         gap_focus=sm_state.get("current_gap_focus", "?"),
         evolution_version=sm_state.get("evolution_version", 1),
         tick_count=ds.get("tick_count", 0),
+        daemon_pid=daemon_pid,
         strengths="; ".join(strengths[:5]) if strengths else "(none)",
         weaknesses="; ".join(weaknesses[:3]) if weaknesses else "(none)",
         unknown="; ".join(unknown[:3]) if unknown else "(none)",
