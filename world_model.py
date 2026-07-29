@@ -36,6 +36,21 @@ logger = logging.getLogger(__name__)
 
 # ── Schema ────────────────────────────────────────────────────────
 
+# Monotonically incrementing counter for unique IDs within the same timestamp
+_id_counter: int = 0
+
+
+def _unique_id(prefix: str) -> str:
+    """Generate a unique ID with timestamp and monotonic counter.
+
+    Uses a module-level counter to guarantee uniqueness even when
+    multiple actions/predictions are recorded in the same second.
+    """
+    global _id_counter
+    _id_counter += 1
+    return f"{prefix}_{now_compact()}_{_id_counter}"
+
+
 _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
     "version": 3,
     "action_triples": [],       # List[ActionTriple]
@@ -213,7 +228,7 @@ class WorldModel:
         Returns:
             Triple ID to pass to :meth:`complete_action`.
         """
-        triple_id = f"act_{now_compact()}"
+        triple_id = _unique_id("act")
         triple: Dict[str, Any] = {
             "id": triple_id,
             "action_type": action_type,
@@ -302,7 +317,7 @@ class WorldModel:
         Returns:
             Prediction ID.
         """
-        pred_id = f"pred_{now_compact()}"
+        pred_id = _unique_id("pred")
         pred: Dict[str, Any] = {
             "id": pred_id,
             "text": text,
@@ -950,7 +965,11 @@ class WorldModel:
         """Load from disk, returning a fresh WorldModel on failure."""
         target = path or cls.storage_path()
         data = safe_read_json(target)
-        return cls(data=data) if isinstance(data, dict) else cls()
+        result = cls(data=data) if isinstance(data, dict) else cls()
+        # Recompute computed fields (per-type accuracy) after load
+        # to avoid stale cache until the next action is completed.
+        result._update_per_type_accuracy()
+        return result
 
     # ── Convenience ───────────────────────────────────────────────
 
