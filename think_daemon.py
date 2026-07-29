@@ -255,7 +255,7 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     "steps": [
       {{"description": "Step description", "verification": "How to verify"}},
       {{"description": "Step 2", "verification": "..."}}
-    ]]
+    ]
   }} or null,
   "search_query": "A question or topic to search (or null). Use when uncertain about facts, APIs, or approaches.",
   "episodic_record": {{
