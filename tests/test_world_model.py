@@ -265,6 +265,47 @@ class TestComputePredictionError:
         err = _compute_prediction_error("something", "")
         assert err == 1.0
 
+    # ── Exit code vs keyword precedence ──
+
+    def test_exit_0_overrides_failure_keywords(self):
+        """exit=0 always gives low error (0.15), even if output
+        contains failure keywords like 'not found' or 'Traceback'.
+        The exit code is the ground truth — the command succeeded."""
+        err = _compute_prediction_error(
+            "resolve hostname",
+            "exit=0: (no output — host not found)",
+        )
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    def test_exit_1_still_high_with_success_keywords(self):
+        """exit=1 still gives high error (0.85) when expected text
+        contains success keywords — the command really did fail."""
+        err = _compute_prediction_error(
+            "deploy should succeed",
+            "exit=1: Crash: permission denied",
+        )
+        assert err == pytest.approx(0.85, abs=0.01)
+
+    def test_exit_0_with_traceback_keyword(self):
+        """exit=0 with 'Traceback' in output — still low error
+        because the shell exit code says the command succeeded."""
+        err = _compute_prediction_error(
+            "run script",
+            "exit=0: Traceback printed but exit was 0",
+        )
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    # ── Pathological exit code edge cases ──
+
+    def test_no_exit_code_uses_keyword_heuristic(self):
+        """Without an exit= marker, the keyword heuristic still
+        fires correctly for clearly failed commands."""
+        err = _compute_prediction_error(
+            "do something",
+            "Permission denied: /etc/config.yaml",
+        )
+        assert err >= 0.5
+
     def test_exit_0_always_low(self):
         """exit=0 overrides everything else — always returns 0.15."""
         err = _compute_prediction_error("this will definitely fail", "exit=0: it worked")

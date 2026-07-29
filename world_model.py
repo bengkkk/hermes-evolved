@@ -124,10 +124,50 @@ def _compute_prediction_error(
             return 0.15
         # File was written but expected didn't name it — partial match
         return 0.25
+    # ── Informational non-error messages ──
+    # Some commands signal "no work to do" with non-zero exit codes
+    # (e.g. "exit=1: nothing to commit, working tree clean").
+    # These are semantically successful even though the exit code is
+    # non-zero.  Check this BEFORE the exit-code check below so that
+    # benign informational patterns are still scored low.
+    informational_nonerror = bool(re.search(
+        r"(nothing to commit|working tree clean|already up.to.date|"
+        r"no changes|nothing changed|nothing to do|"
+        r"0 files changed|0 insertions|0 deletions)",
+        a_lower,
+    ))
+    if informational_nonerror:
+        return 0.15
 
-    # ── Shell/Tool success indicators ──
-    # Many Hermes shell outputs start with "exit=N:" or contain outcome
-    # language like "N passed", "N failed", "Traceback" etc.
+    # ── Exit-code aware comparison (ground truth) ──
+    # The exit code IS the ground truth: exit=0 always means success,
+    # exit != 0 always means failure.  This check MUST come BEFORE the
+    # tool-keyword heuristic below but AFTER the informational pattern
+    # check above, because content like "host not found" or "Traceback"
+    # can appear in an otherwise successful command (exit=0).
+    exit_match = re.search(r'exit=(\d+)', a_lower)
+    if exit_match:
+        exit_code = int(exit_match.group(1))
+        if exit_code == 0:
+            # Exit code 0 = command succeeded → low error regardless
+            return 0.15
+        # exit != 0 — check if the expected text suggests success
+        success_expected = any(kw in e_lower for kw in
+            ('success', 'complete', 'create', 'write', 'deploy', 'install',
+             'commit', 'push', 'run', 'list', 'show', 'print',
+             'pass', 'test', 'status', 'check', 'git', 'file',
+             'read', 'done', 'build', 'fix', 'fetch', 'merge',
+             'pull', 'add', 'update', 'find', 'search', 'info',
+             'log', 'clean', 'set', 'get', 'patch', 'branch', 'diff'))
+        if success_expected:
+            return 0.85  # Expected success but got failure
+        else:
+            return 0.7   # Neutral expected but command failed
+
+    # ── Shell/Tool success/failure keywords ──
+    # Content-based heuristics for outputs that lack an explicit exit=
+    # marker.  These are less reliable than exit code but better than
+    # pure string similarity.
     tool_failure = bool(re.search(
         r'\b(traceback|error|failed|permission denied|not found|no such)\b',
         a_lower,
@@ -140,46 +180,6 @@ def _compute_prediction_error(
         return 0.85  # Tool reported failure
     if tool_success and not tool_failure:
         return 0.15  # Tool reported success
-
-    # ── Informational non-error messages ──
-    # Some commands exit with non-zero code to signal "no work to do"
-    # rather than an actual error. Detect these patterns and treat
-    # them as low-error informational outcomes.
-    informational_nonerror = bool(re.search(
-        r"(nothing to commit|working tree clean|already up.to.date|"
-        r"no changes|nothing changed|nothing to do|"
-        r"0 files changed|0 insertions|0 deletions)",
-        a_lower,
-    ))
-    if informational_nonerror:
-        # The command ran fine but had nothing to do — low error
-        return 0.15
-
-    # ── Exit-code aware comparison ──
-    # Actual output often contains "exit=N:" — check if exit code
-    # correlates with expected success/failure keywords.
-    # The exit code IS the ground truth: exit=0 always means success,
-    # exit != 0 always means failure.
-    exit_match = re.search(r'exit=(\d+)', a_lower)
-    if exit_match:
-        exit_code = int(exit_match.group(1))
-        success_expected = any(kw in e_lower for kw in
-            ('success', 'complete', 'create', 'write', 'deploy', 'install',
-             'commit', 'push', 'run', 'list', 'show', 'print',
-             'pass', 'test', 'status', 'check', 'git', 'file',
-             'read', 'done', 'build', 'fix', 'fetch', 'merge',
-             'pull', 'add', 'update', 'find', 'search', 'info',
-             'log', 'clean', 'set', 'get', 'patch', 'branch', 'diff'))
-        if exit_code == 0:
-            # Exit code 0 = command succeeded → low error regardless
-            # of whether the expected text happened to contain keywords
-            return 0.15
-        elif success_expected:
-            # Expected success but got failure → high error
-            return 0.85
-        else:
-            # Neutral expected text but command failed → moderate error
-            return 0.7
 
     # ── Character bigram similarity ──
     # For short strings, bigram overlap handles word variations better
