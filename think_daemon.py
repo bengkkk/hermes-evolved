@@ -1056,7 +1056,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     provider=_RUNTIME_PROVIDER or None,
                     model=_RUNTIME_MODEL or None,
                 ),
-                timeout=90.0,
+                timeout=25.0,
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
