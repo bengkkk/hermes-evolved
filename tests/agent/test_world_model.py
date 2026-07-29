@@ -359,6 +359,128 @@ class TestPerTypeAccuracy:
         assert len(pta) == 0
 
 
+class TestDiscrepancyPatterns:
+    """_update_discrepancy_patterns detects recurring failure patterns."""
+
+    def test_empty_when_no_data(self) -> None:
+        wm = WorldModel()
+        wm._update_discrepancy_patterns()
+        assert wm.get_discrepancy_patterns() == []
+
+    def test_no_pattern_with_low_error(self) -> None:
+        wm = WorldModel()
+        # Two perfect predictions → no high-error triples → no patterns
+        tid1 = wm.record_action("shell", "exact", "same text")
+        wm.complete_action(tid1, "same text")
+        tid2 = wm.record_action("shell", "exact2", "same exact text")
+        wm.complete_action(tid2, "same exact text")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) == 0, f"Expected 0 patterns, got {len(patterns)}"
+
+    def test_detects_type_level_pattern(self) -> None:
+        wm = WorldModel()
+        # Three mispredicted shell actions → should create a pattern
+        # Use "deploy succeed" which contains the success keyword "deploy"
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy version {i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: build failure")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) >= 1
+        shell_pattern = next((p for p in patterns if p["action_type"] == "shell"), None)
+        assert shell_pattern is not None
+        assert shell_pattern["count"] == 3
+        assert shell_pattern["avg_error"] >= 0.4
+
+    def test_multiple_action_types_separate(self) -> None:
+        wm = WorldModel()
+        # Bad shell predictions and bad write_file predictions
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy {i}", "deploy successfully")
+            wm.complete_action(tid, "exit=1: failure")
+        for i in range(2):
+            tid = wm.record_action("write_file", f"config {i}", "write config file")
+            wm.complete_action(tid, "permission denied")
+        patterns = wm.get_discrepancy_patterns()
+        types_found = {p["action_type"] for p in patterns}
+        assert "shell" in types_found
+        assert "write_file" in types_found
+
+    def test_common_themes_extracted(self) -> None:
+        wm = WorldModel()
+        # All descriptions share "deploy" theme
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy application v{i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: crash")
+        patterns = wm.get_discrepancy_patterns()
+        shell_pattern = next((p for p in patterns if p["action_type"] == "shell"), None)
+        assert shell_pattern is not None
+        themes = shell_pattern.get("common_themes", [])
+        assert "deploy" in themes, f"Expected 'deploy' in themes, got {themes}"
+
+    def test_patterns_sorted_by_frequency(self) -> None:
+        wm = WorldModel()
+        # 3 bad shell, 2 bad git_commit
+        for i in range(3):
+            tid = wm.record_action("shell", f"build {i}", "build should succeed")
+            wm.complete_action(tid, "exit=2: fail")
+        for i in range(2):
+            tid = wm.record_action("git_commit", f"commit {i}", "commit should succeed")
+            wm.complete_action(tid, "merge conflict")
+        patterns = wm.get_discrepancy_patterns()
+        if len(patterns) >= 2:
+            # First pattern should have higher count
+            assert patterns[0]["count"] >= patterns[1]["count"]
+
+    def test_excluded_by_low_samples(self) -> None:
+        wm = WorldModel()
+        # Only 1 high-error triple — below min_samples=2 default
+        tid = wm.record_action("shell", "deploy", "should work")
+        wm.complete_action(tid, "exit=1: crash")
+        patterns = wm.get_discrepancy_patterns()
+        # Either no patterns or at least data is tracked correctly
+        assert len(patterns) == 0
+
+    def test_context_includes_patterns_section(self) -> None:
+        wm = WorldModel()
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy {i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: build failure")
+        ctx = wm.format_world_model_context()
+        assert "Recurring discrepancy patterns" in ctx
+        assert "deploy" in ctx
+
+    def test_updated_via_complete_action(self) -> None:
+        """Patterns should be updated automatically when complete_action is called."""
+        wm = WorldModel()
+        # CompleteAction triggers _update_accuracy_stats which triggers _update_discrepancy_patterns
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy v{i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: build failure")
+        patterns = wm.get_discrepancy_patterns()
+        assert any(p["action_type"] == "shell" for p in patterns)
+
+    def test_persistence_round_trip(self) -> None:
+        """Discrepancy patterns survive save/load cycle."""
+        import tempfile
+        from pathlib import Path
+
+        wm = WorldModel()
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy {i}", "deploy successfully")
+            wm.complete_action(tid, "exit=1: fail")
+
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = Path(f.name)
+        try:
+            wm.save(path)
+            loaded = WorldModel.load(path)
+            loaded_patterns = loaded.get_discrepancy_patterns()
+            assert len(loaded_patterns) >= 1
+            assert loaded_patterns[0]["action_type"] == "shell"
+        finally:
+            path.unlink(missing_ok=True)
+
+
 class TestConfidenceAdjustment:
     """adjust_confidence uses historical accuracy to calibrate estimates."""
 

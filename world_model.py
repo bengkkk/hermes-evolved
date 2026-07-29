@@ -471,6 +471,19 @@ class WorldModel:
             parts.append("")
             parts.append(cal)
 
+        # ── Discrepancy patterns ──
+        patterns = self.get_discrepancy_patterns()
+        if patterns:
+            parts.append("")
+            parts.append("  Recurring discrepancy patterns:")
+            for p in patterns:
+                themes = ""
+                if p.get("common_themes"):
+                    themes = f" [themes: {', '.join(p['common_themes'][:3])}]"
+                parts.append(
+                    f"    ● {p['description']}{themes}"
+                )
+
         return "\n".join(parts)
 
     def format_prediction_insight(self) -> str:
@@ -505,8 +518,9 @@ class WorldModel:
             errors = [t["prediction_error"] for t in completed]
             acc["avg_triple_error"] = round(sum(errors) / len(errors), 4)
 
-        # Also refresh per-type accuracy whenever stats are recalculated
+        # Also refresh per-type accuracy and discrepancy patterns whenever stats are recalculated
         self._update_per_type_accuracy()
+        self._update_discrepancy_patterns()
 
     def _update_calibration(self, confidence: float, error: float) -> None:
         """Track confidence vs accuracy for calibration curve."""
@@ -568,6 +582,104 @@ class WorldModel:
                 "max_error": round(stats["max_error"], 4),
             }
         self.data["per_type_accuracy"] = result
+
+    # ── Discrepancy pattern detection (Gap 6) ────────────────────
+
+    def _update_discrepancy_patterns(self, min_samples: int = 2) -> None:
+        """Analyze completed triples with high prediction error for recurring patterns.
+
+        Groups high-error triples (prediction_error >= 0.4) by action type and
+        identifies common themes in action descriptions. Updates
+        ``data["discrepancy_patterns"]`` for use in context formatting and
+        LLM calibration guidance.
+
+        Only runs when there are at least *min_samples* completed triples
+        (default 2) to avoid noise from single outliers.
+
+        Patterns include:
+          - Action type with chronic high error (systematic prediction bias)
+          - Frequent keywords in mispredicted actions (topic-level bias)
+          - Number of affected triples and avg error for prioritization
+
+        Called automatically from :meth:`_update_accuracy_stats`.
+        """
+        patterns: List[Dict[str, Any]] = []
+        completed = [
+            t for t in self.data.get("action_triples", [])
+            if t.get("completed") and t.get("prediction_error") is not None
+        ]
+        if len(completed) < min_samples:
+            self.data["discrepancy_patterns"] = patterns
+            return
+
+        # ─ Group high-error triples (>= 0.4) by action type ──
+        high_error = [t for t in completed if t["prediction_error"] >= 0.4]
+        by_type: Dict[str, List[Dict[str, Any]]] = {}
+        for t in high_error:
+            atype = t.get("action_type", "unknown")
+            by_type.setdefault(atype, []).append(t)
+
+        for atype, triples in by_type.items():
+            if len(triples) < min_samples:
+                continue
+            avg_err = sum(t["prediction_error"] for t in triples) / len(triples)
+            timestamps = [t.get("timestamp", "") for t in triples if t.get("timestamp")]
+            last_obs = max(timestamps) if timestamps else ""
+
+            # Extract common keywords from action descriptions (words that
+            # appear in >30% of the high-error triples of this type)
+            all_words: List[str] = []
+            for t in triples:
+                desc = (t.get("action_description", "") or "").lower()
+                all_words.extend(
+                    w for w in desc.split()
+                    if len(w) > 3 and w not in ("with", "from", "that", "this", "into")
+                )
+
+            word_counts: Dict[str, int] = {}
+            for w in all_words:
+                word_counts[w] = word_counts.get(w, 0) + 1
+            threshold = max(1, len(triples) * 0.3)
+            common_themes = sorted(
+                [w for w, c in word_counts.items() if c >= threshold],
+                key=lambda w: word_counts[w],
+                reverse=True,
+            )
+
+            patterns.append({
+                "action_type": atype,
+                "count": len(triples),
+                "total_completed": sum(1 for t in completed if t.get("action_type") == atype),
+                "avg_error": round(avg_err, 4),
+                "common_themes": common_themes[:5],
+                "description": (
+                    f"{len(triples)}/{sum(1 for t in completed if t.get('action_type') == atype)} "
+                    f"{atype} actions with high prediction error "
+                    f"(avg {avg_err:.2f})"
+                ),
+                "last_observed": last_obs,
+            })
+
+        # Sort by count descending (most frequent failure patterns first)
+        patterns.sort(key=lambda p: p["count"], reverse=True)
+        self.data["discrepancy_patterns"] = patterns
+
+    def get_discrepancy_patterns(self) -> List[Dict[str, Any]]:
+        """Return detected discrepancy patterns.
+
+        Each pattern dict contains:
+          - action_type: The action type (shell, write_file, etc.)
+          - count: How many high-error triples of this type
+          - total_completed: Total completed triples of this type
+          - avg_error: Average prediction error for this pattern
+          - common_themes: Top keywords in mispredicted descriptions
+          - description: Human-readable summary
+          - last_observed: ISO timestamp of most recent occurrence
+
+        Returns:
+            List of pattern dicts, sorted by frequency (most frequent first).
+        """
+        return list(self.data.get("discrepancy_patterns", []))
 
     def get_per_type_accuracy(self) -> Dict[str, Dict[str, Any]]:
         """Return per-action-type prediction error statistics.
