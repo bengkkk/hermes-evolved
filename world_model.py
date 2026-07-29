@@ -447,6 +447,9 @@ class WorldModel:
           - ``"1 week"`` / ``"2 weeks"`` → 7.0 / 14.0
           - ``"1 month"`` / ``"2 months"`` → 30.0 / 60.0
           - ``"1 year"`` / ``"2 years"`` → 365.0 / 730.0
+          - ``"1 hour"`` / ``"2 hours"`` → 0.042 / 0.083
+          - ``"1 cycle"`` / ``"2 cycles"`` → 0.01 / 0.02 (≈15 min per cycle)
+          - ``"this cycle"`` → 0.0 (effectively immediate)
           - ``"completed"`` → 0.0 (already past)
           - ``None`` / empty → None (can't determine)
 
@@ -460,16 +463,20 @@ class WorldModel:
             return None
 
         tf = timeframe.strip().lower()
-        if tf == "completed":
+
+        # Special cases that mean "immediately" / "already"
+        if tf in ("completed", "this cycle", "this turn", "same cycle", "now"):
             return 0.0
 
         # Try "N <unit>" pattern
         import re as _re
-        m = _re.match(r"(\d+\.?\d*)\s*(day|days|week|weeks|month|months|year|years)", tf)
+        m = _re.match(r"(\d+\.?\d*)\s*(hour|hours|cycle|cycles|day|days|week|weeks|month|months|year|years)", tf)
         if m:
             value = float(m.group(1))
             unit = m.group(2)
             multipliers = {
+                "hour": 1 / 24, "hours": 1 / 24,
+                "cycle": 0.01, "cycles": 0.01,  # ~15 min per cycle
                 "day": 1, "days": 1,
                 "week": 7, "weeks": 7,
                 "month": 30, "months": 30,
@@ -477,10 +484,12 @@ class WorldModel:
             }
             return value * multipliers.get(unit, 1)
 
-        # Handle singular forms without digits: "a day", "a week"
+        # Handle singular forms without digits
         singular_map = {
             "a day": 1, "a week": 7, "a month": 30, "a year": 365,
             "one day": 1, "one week": 7, "one month": 30, "one year": 365,
+            "an hour": 1 / 24, "one hour": 1 / 24,
+            "a cycle": 0.01, "one cycle": 0.01,
         }
         if tf in singular_map:
             return float(singular_map[tf])
@@ -530,8 +539,11 @@ class WorldModel:
             # Calculate elapsed days
             elapsed_days = (now - pred_time).total_seconds() / 86400.0
 
-            # Allow a grace period of 10% of the timeframe or 1 day, whichever is larger
-            grace = max(days * 0.1, 1.0)
+            # Allow a grace period: 10% of the timeframe or 1 hour, whichever is larger.
+            # For sub-day timeframes like "this cycle" or "1 hour", the 1-hour floor
+            # ensures at least one daemon cycle worth of tolerance, while keeping the
+            # verification prompt enough that cycle-based predictions don't linger forever.
+            grace = max(days * 0.1, 1.0 / 24.0)  # at least ~1 hour
             if elapsed_days >= days + grace:
                 # Timeframe has expired — auto-verify as uncertain
                 pred["verified"] = True
