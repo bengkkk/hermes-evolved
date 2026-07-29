@@ -1539,6 +1539,10 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
 
     # 6. Save updated state
     save_timeline(updates["timeline"])
+    # Auto-increment total_cycles in self-model (tracks cumulative cycle count
+    # across all daemon runs, unlike daemon_state.tick_count which resets on restart)
+    sm_state = updates["self_model"].setdefault("state", {})
+    sm_state["total_cycles"] = sm_state.get("total_cycles", 0) + 1
     save_self_model(updates["self_model"])
     if updates["orientation"]:
         save_orientation(updates["orientation"])
