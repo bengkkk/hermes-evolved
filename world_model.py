@@ -366,6 +366,132 @@ class WorldModel:
                 return error
         return None
 
+    # ── Auto-verification of expired predictions ──────────────────
+
+    @staticmethod
+    def _parse_timeframe_days(timeframe: Optional[str]) -> Optional[float]:
+        """Parse a human-readable timeframe string into days.
+
+        Supported formats:
+          - ``"3 days"`` / ``"3 day"`` → 3.0
+          - ``"1 week"`` / ``"2 weeks"`` → 7.0 / 14.0
+          - ``"1 month"`` / ``"2 months"`` → 30.0 / 60.0
+          - ``"1 year"`` / ``"2 years"`` → 365.0 / 730.0
+          - ``"completed"`` → 0.0 (already past)
+          - ``None`` / empty → None (can't determine)
+
+        Args:
+            timeframe: Human-readable duration string.
+
+        Returns:
+            Number of days as float, or None if unparseable.
+        """
+        if not timeframe:
+            return None
+
+        tf = timeframe.strip().lower()
+        if tf == "completed":
+            return 0.0
+
+        # Try "N <unit>" pattern
+        import re as _re
+        m = _re.match(r"(\d+\.?\d*)\s*(day|days|week|weeks|month|months|year|years)", tf)
+        if m:
+            value = float(m.group(1))
+            unit = m.group(2)
+            multipliers = {
+                "day": 1, "days": 1,
+                "week": 7, "weeks": 7,
+                "month": 30, "months": 30,
+                "year": 365, "years": 365,
+            }
+            return value * multipliers.get(unit, 1)
+
+        # Handle singular forms without digits: "a day", "a week"
+        singular_map = {
+            "a day": 1, "a week": 7, "a month": 30, "a year": 365,
+            "one day": 1, "one week": 7, "one month": 30, "one year": 365,
+        }
+        if tf in singular_map:
+            return float(singular_map[tf])
+
+        return None
+
+    def verify_expired_predictions(self) -> int:
+        """Auto-verify predictions whose timeframe has expired.
+
+        Checks all unverified predictions against the current time.
+        If a prediction has a timeframe that has passed, it is
+        auto-verified with outcome ``"timeframe expired — no confirmation"``
+        and error 0.5 (uncertain — could be right or wrong).
+
+        Predictions without a parseable timeframe are left alone.
+
+        Returns:
+            Number of predictions auto-verified.
+        """
+        from datetime import timezone as _tz
+
+        now = datetime.now(_tz.utc)
+        verified_count = 0
+
+        for pred in self.data.get("predictions", []):
+            if pred.get("verified"):
+                continue
+
+            tf = pred.get("timeframe")
+            days = self._parse_timeframe_days(tf)
+            if days is None:
+                continue  # Can't determine expiry — leave it
+
+            # Parse prediction timestamp
+            ts_str = pred.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                pred_time = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+
+            # If prediction was made in the future (clock skew), skip
+            if pred_time > now:
+                continue
+
+            # Calculate elapsed days
+            elapsed_days = (now - pred_time).total_seconds() / 86400.0
+
+            # Allow a grace period of 10% of the timeframe or 1 day, whichever is larger
+            grace = max(days * 0.1, 1.0)
+            if elapsed_days >= days + grace:
+                # Timeframe has expired — auto-verify as uncertain
+                pred["verified"] = True
+                pred["actual"] = "timeframe expired — no confirmation"
+                pred["error"] = 0.5
+                pred["verification_note"] = (
+                    f"Auto-verified: timeframe '{tf}' ({days} days) "
+                    f"expired {elapsed_days - days:.1f} days ago"
+                )
+                pred["verified_at"] = now_iso()
+
+                # Update accuracy stats
+                acc = self.data.setdefault("prediction_accuracy", {})
+                acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
+                # error=0.5 is neither clearly correct nor incorrect
+                # Neither correct_predictions nor incorrect_predictions gets
+                # incremented — it's truly uncertain.
+
+                # Update running average error
+                total_verified = acc.get("verified_predictions", 1)
+                prev_avg = acc.get("avg_prediction_error", 0.0)
+                acc["avg_prediction_error"] = round(
+                    (prev_avg * (total_verified - 1) + 0.5) / total_verified, 4
+                )
+
+                self._update_calibration(pred.get("confidence", 0.5), 0.5)
+                verified_count += 1
+
+        return verified_count
+
     # ── Discrepancy analysis ──────────────────────────────────────
 
     def analyze_recent_discrepancies(self, count: int = 10) -> List[Dict[str, Any]]:

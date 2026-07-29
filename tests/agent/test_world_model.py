@@ -572,6 +572,144 @@ class TestCalibrationGuidance:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Auto-verification of expired predictions
+# ═══════════════════════════════════════════════════════════════════
+
+class TestParseTimeframeDays:
+    """_parse_timeframe_days converts human-readable timeframes to days."""
+
+    def test_none_returns_none(self) -> None:
+        assert WorldModel._parse_timeframe_days(None) is None
+
+    def test_empty_returns_none(self) -> None:
+        assert WorldModel._parse_timeframe_days("") is None
+
+    def test_completed_returns_zero(self) -> None:
+        assert WorldModel._parse_timeframe_days("completed") == 0.0
+
+    def test_days(self) -> None:
+        assert WorldModel._parse_timeframe_days("3 days") == 3.0
+        assert WorldModel._parse_timeframe_days("1 day") == 1.0
+
+    def test_weeks(self) -> None:
+        assert WorldModel._parse_timeframe_days("2 weeks") == 14.0
+        assert WorldModel._parse_timeframe_days("1 week") == 7.0
+
+    def test_months(self) -> None:
+        assert WorldModel._parse_timeframe_days("1 month") == 30.0
+        assert WorldModel._parse_timeframe_days("6 months") == 180.0
+
+    def test_years(self) -> None:
+        assert WorldModel._parse_timeframe_days("1 year") == 365.0
+        assert WorldModel._parse_timeframe_days("2 years") == 730.0
+
+    def test_unparseable_returns_none(self) -> None:
+        assert WorldModel._parse_timeframe_days("soon") is None
+        assert WorldModel._parse_timeframe_days("whenever") is None
+        assert WorldModel._parse_timeframe_days("next tuesday") is None
+
+
+class TestVerifyExpiredPredictions:
+    """verify_expired_predictions auto-verifies predictions past their timeframe."""
+
+    def test_no_predictions(self) -> None:
+        wm = WorldModel()
+        count = wm.verify_expired_predictions()
+        assert count == 0
+
+    def test_all_already_verified(self) -> None:
+        wm = WorldModel()
+        pid = wm.record_prediction("test", "1 day", 0.5, "test")
+        wm.verify_prediction(pid, "done", "manually verified")
+        count = wm.verify_expired_predictions()
+        assert count == 0  # Already verified
+
+    def test_expired_prediction_gets_verified(self) -> None:
+        wm = WorldModel()
+        # Manually set timestamp to 10 days ago
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        pid = wm.record_prediction("will happen", "3 days", 0.7, "test")
+        # Override timestamp
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = old_ts
+        count = wm.verify_expired_predictions()
+        assert count == 1
+
+    def test_recent_prediction_not_expired(self) -> None:
+        wm = WorldModel()
+        wm.record_prediction("will happen soon", "1 month", 0.6, "test")
+        count = wm.verify_expired_predictions()
+        assert count == 0  # Not expired yet
+
+    def test_no_timeframe_skipped(self) -> None:
+        wm = WorldModel()
+        # Manually set timestamp to 10 days ago but no timeframe
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        pid = wm.record_prediction("no timeframe", None, 0.5, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = old_ts
+        count = wm.verify_expired_predictions()
+        assert count == 0  # Without timeframe, can't determine expiry
+
+    def test_expired_with_grace_period(self) -> None:
+        wm = WorldModel()
+        from datetime import datetime, timezone, timedelta
+        # 2 days prediction, made 2.1 days ago — within grace (1 day grace for 2-day pred)
+        almost_expired = (datetime.now(timezone.utc) - timedelta(days=2, hours=2)).isoformat()
+        pid = wm.record_prediction("2 day pred", "2 days", 0.6, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = almost_expired
+        count = wm.verify_expired_predictions()
+        # 2 days elapsed, pred is 2 day, grace = max(2*0.1, 1) = 1.0 day
+        # 2.08 > 2 + 1? No, 2.08 < 3.0, so NOT expired
+        assert count == 0, f"Expected 0 (within grace period), got {count}"
+
+    def test_well_beyond_timeframe(self) -> None:
+        wm = WorldModel()
+        from datetime import datetime, timezone, timedelta
+        # 1 day prediction, made 5 days ago — well past timeframe
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        pid = wm.record_prediction("short pred", "1 day", 0.9, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = old_ts
+        count = wm.verify_expired_predictions()
+        assert count == 1, f"Expected 1 (well beyond timeframe), got {count}"
+
+    def test_stats_updated_on_auto_verify(self) -> None:
+        wm = WorldModel()
+        from datetime import datetime, timezone, timedelta
+        old_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        pid = wm.record_prediction("long expired", "1 week", 0.8, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = old_ts
+        wm.verify_expired_predictions()
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["avg_prediction_error"] == 0.5  # error=0.5 for expired
+
+    def test_mixed_verified_and_unverified(self) -> None:
+        wm = WorldModel()
+        from datetime import datetime, timezone, timedelta
+        # One manually verified
+        pid1 = wm.record_prediction("verified one", "1 day", 0.9, "test")
+        wm.verify_prediction(pid1, "done")
+        # One expired (30 days ago, 3-day timeframe)
+        pid2 = wm.record_prediction("expired one", "3 days", 0.6, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid2:
+                p["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        count = wm.verify_expired_predictions()
+        assert count == 1  # Only the expired one
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═══════════════════════════════════════════════════════════════════
 

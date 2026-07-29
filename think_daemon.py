@@ -843,6 +843,14 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "world_model": wm,
     }
 
+    # 1.75 Auto-verify expired predictions before the thinking cycle
+    try:
+        expired_count = wm.verify_expired_predictions()
+        if expired_count > 0:
+            logger.info("Auto-verified %d expired predictions", expired_count)
+    except Exception as e:
+        logger.warning("Auto-verification failed (non-blocking): %s", e)
+
     # 1.5 Auto-create initial plan if none exists
     try:
         from agent.self_evolve import get_active_plan, create_plan, record_event
