@@ -1080,6 +1080,122 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     return None
 
 
+def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate a useful thinking-cycle result from local data only, no LLM call.
+
+    Called when the LLM is unavailable (timeout/error) so the cycle still
+    produces a valid result and advances the daemon's state machine.
+
+    Produces:
+      - An insight summarising world-model health, data volume, and trends.
+      - A basic self-model update noting the LLM outage.
+      - A suggested focus for the next cycle (re-attempt LLM reflection).
+      - No predictions (we can't predict without an LLM).
+      - No actions (we can't decide what to do without an LLM).
+    """
+    wm: WorldModel = state.get("world_model", load_world_model())
+    sm: dict = state.get("self_model", load_self_model())
+    tl: dict = state.get("timeline", load_timeline())
+
+    # ── Gather statistics ──
+    triples = wm.data.get("action_triples", [])
+    completed = [t for t in triples if t.get("prediction_error") is not None]
+    total_triples = len(triples)
+    total_completed = len(completed)
+
+    per_type = wm.get_per_type_accuracy()
+    type_summaries = []
+    for atype, astats in sorted(per_type.items()):
+        type_summaries.append(
+            f"{atype}: {astats['count']} samples, avg_error={astats.get('avg_error', 0):.2f}"
+        )
+
+    predictions = wm.data.get("predictions", [])
+    active_preds = [p for p in predictions if not p.get("verified")]
+    patterns = wm.get_discrepancy_patterns()
+    error_history = wm.data.get("prediction_accuracy", {}).get("error_history", [])
+
+    # ── Compute trend ──
+    trend_str = "stable"
+    if len(error_history) >= 4:
+        recent_avg = sum(error_history[-3:]) / 3
+        older_avg = sum(error_history[:3]) / 3
+        if recent_avg < older_avg * 0.8:
+            trend_str = "improving"
+        elif recent_avg > older_avg * 1.2:
+            trend_str = "degrading"
+
+    # ── Cycle count from daemon state ──
+    ds = state.get("daemon_state", {})
+    tick_count = ds.get("tick_count", 0) + 1  # +1 because this IS the next tick
+
+    # ── Build insight ──
+    insight_parts = [
+        f"[local-analysis] Cycle {tick_count}: LLM unavailable, using local fallback.",
+        f"World model: {total_completed}/{total_triples} action triples across {len(per_type)} types.",
+    ]
+    if type_summaries:
+        insight_parts.append("Per-type: " + "; ".join(type_summaries))
+    insight_parts.append(f"Trend: {trend_str} (last {len(error_history)} errors: {error_history})")
+    if active_preds:
+        insight_parts.append(f"Active predictions: {len(active_preds)} pending verification.")
+    if patterns:
+        insight_parts.append(f"Known discrepancy patterns: {len(patterns)} (run LLM cycle to review).")
+
+    insight = " | ".join(insight_parts)
+
+    # ── Compute confidence (lower when LLM unavailable) ──
+    base_confidence = max(0.2, 1.0 - (total_completed and (sum(
+        t.get("prediction_error", 0) for t in completed
+    ) / total_completed) or 0.5))
+    # Reduce confidence further since we're in fallback mode
+    adjusted_confidence = round(base_confidence * 0.7, 2)
+
+    # ── Determine next gap based on self-model ──
+    current_focus = sm.get("state", {}).get("current_gap_focus", "")
+    remaining_gaps = sm.get("state", {}).get("remaining_gaps", [])
+    next_gap = remaining_gaps[0] if remaining_gaps else None
+
+    return {
+        "insight": insight,
+        "focus_next": f"Complete LLM-backed thinking cycle; {'continue: ' + current_focus if current_focus else 're-evaluate priorities'}",
+        "confidence": adjusted_confidence,
+        "reasoning": "Local fallback activated because LLM API was unreachable. Data-driven stats generated from world model without external call.",
+        "event_to_record": {
+            "type": "observation",
+            "summary": f"LLM unavailable, local analysis used for cycle {tick_count}",
+            "impact": "World model stats updated but no new predictions or actions generated. LLM API may need attention.",
+        },
+        "outcome_to_record": None,
+        "commitment": None,
+        "prediction": None,
+        "session_record": {
+            "focus": f"Local analysis cycle {tick_count}",
+            "outcomes_list": [
+                f"Computed stats from {total_completed} completed action triples",
+                f"Prediction error trend: {trend_str}",
+                f"LLM API was unavailable; will retry next cycle",
+            ],
+        },
+        "action": None,
+        "plan_action": None,
+        "new_plan": None,
+        "search_query": None,
+        "episodic_record": {
+            "mtype": "observation",
+            "summary": f"LLM call failed; used local fallback for cycle {tick_count}",
+            "details": f"Local analysis: {insight}",
+            "salience": 0.3,
+        },
+        "self_model_update": {
+            "weakness": "LLM API unreliable (timeout during thinking cycle); local fallback used. Consider alternative provider or retry.",
+            "unknown": None,
+            "new_commitment": None,
+        },
+        "next_gap": next_gap,
+    }
+
+
 # ═════════════════════════════════════════════════════════════════
 #  Main thinking cycle
 # ═════════════════════════════════════════════════════════════════
@@ -1212,18 +1328,19 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     logger.info("Thinking cycle %d starting...", ds.get("tick_count", 0) + 1)
     raw = await _call_llm(messages)
     if raw is None:
-        result["status"] = "error"
-        result["error"] = "LLM returned no response"
-        logger.warning("Thinking cycle produced no response")
-        return result
-
-    # 4. Parse response
-    parsed = _try_parse_json(raw)
-    if parsed is None:
-        result["status"] = "parse_error"
-        result["error"] = f"Could not parse JSON from: {raw[:200]}"
-        logger.warning("Parse error: %s", result["error"])
-        return result
+        logger.warning("LLM unavailable — falling back to local analysis")
+        parsed = _local_analysis(state)
+        result["status"] = "ok"
+        result["llm_fallback"] = True
+    else:
+        result["llm_fallback"] = False
+        # 4. Parse response
+        parsed = _try_parse_json(raw)
+        if parsed is None:
+            result["status"] = "parse_error"
+            result["error"] = f"Could not parse JSON from: {raw[:200]}"
+            logger.warning("Parse error: %s", result["error"])
+            return result
 
     # 4.5 Search phase — resolve uncertainties via web search
     sq = parsed.get("search_query")
@@ -1298,6 +1415,11 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "next_gap": parsed.get("next_gap"),
         "reasoning": parsed.get("reasoning"),
     }
+    if result.get("llm_fallback"):
+        ds["last_output"]["fallback"] = True
+        cycle_label = "local-analysis fallback"
+    else:
+        cycle_label = "llm-backed"
     if ds.get("first_tick") is None:
         ds["first_tick"] = now_ts
     save_daemon_state(ds)
@@ -1310,8 +1432,8 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     result["confidence"] = parsed.get("confidence", 0)
 
     logger.info(
-        "Cycle %d done in %.1fs — insight: %.60s",
-        ds["tick_count"], elapsed, parsed.get("insight", "(none)")
+        "Cycle %d done in %.1fs [%s] — insight: %.60s",
+        ds["tick_count"], elapsed, cycle_label, parsed.get("insight", "(none)")
     )
     return result
 
