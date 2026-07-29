@@ -947,6 +947,10 @@ async def run_one_cycle() -> Dict[str, Any]:
     cs["avg_duration"] = round((cs.get("avg_duration", 0) * max(n - 1, 0) + dur) / max(n, 1), 1)
     cs["max_duration"] = max(cs.get("max_duration", 0), dur)
 
+    # Ensure first_tick is set even on the first error cycle
+    if ds.get("first_tick") is None:
+        ds["first_tick"] = datetime.now(timezone.utc).isoformat()
+
     ds["cycle_stats"] = cs
     save_daemon_state(ds)
     return result
