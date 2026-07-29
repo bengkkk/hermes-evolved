@@ -287,7 +287,7 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
     "new_status": "active|in_progress|completed|abandoned",
     "note": "Why this change"
   }} or null,
-  "next_gap": "4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.", — which gap to tackle next (or null). Based on system state analysis.",
+  "next_gap": "4, 6, 8, or 10 — which gap to tackle next (or null). Based on system state analysis.",
   "reasoning": "Why this gap should be tackled next — systems architecture perspective (or null).",
   "confidence": 0.0 to 1.0
 }}"""

@@ -808,9 +808,14 @@ class Goals:
     def update_status(self, goal_id: str, new_status: str, note: str = "") -> bool:
         """Update a goal's lifecycle status.
 
-        Valid statuses: ``active``, ``in_progress``, ``completed``, ``abandoned``.
-        Returns True if the goal was found.
+        Valid statuses: ``proposed``, ``active``, ``in_progress``, ``completed``,
+        ``abandoned``.
+        Returns True if the goal was found and status was valid.
         """
+        VALID_STATUSES = frozenset({"proposed", "active", "in_progress", "completed", "abandoned"})
+        if new_status not in VALID_STATUSES:
+            logger.warning("Invalid goal status %r — must be one of %s", new_status, sorted(VALID_STATUSES))
+            return False
         for g in self.data.get("goals", []):
             if g.get("id") == goal_id:
                 g["status"] = new_status
