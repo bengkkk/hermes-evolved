@@ -1242,6 +1242,81 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ═════════════════════════════════════════════════════════════════
+#  World Model → Self-Model bridge (Gap 6 integration)
+# ═════════════════════════════════════════════════════════════════
+
+
+def _bridge_world_model_to_self_model(
+    wm: WorldModel,
+    sm: Dict[str, Any],
+) -> int:
+    """Sync world model discrepancy patterns into self-model weaknesses.
+
+    The think_daemon prompts the LLM with world model context and relies on
+    the LLM to output ``self_model_update.weakness`` entries for systematic
+    prediction biases.  When the LLM misses this cue, the self-model stays
+    blind to patterns the world model has already detected (e.g. ``shell``
+    actions averaging 0.85 prediction error over 10 samples).
+
+    This bridge automatically translates high-error discrepancy patterns
+    into self-model weaknesses, and removes stale auto-generated weaknesses
+    that no longer match current patterns (e.g. a type's error dropped below
+    the threshold).
+
+    Returns the number of weaknesses added (or 0 if unchanged).
+
+    Rules:
+      - Only creates weaknesses for patterns with ``count >= 2`` AND
+        ``avg_error >= 0.4`` (systematic, non-spurious signals).
+      - Auto-generated weaknesses are tagged with the prefix
+        ``"Systematic prediction bias:"`` so they can be distinguished
+        from LLM-generated weaknesses and cleaned up when resolved.
+      - If a type's pattern falls below threshold (error drops or count
+        is too small), its auto-generated weakness is removed.
+      - Weaknesses from other sources (LLM-generated, manual) are preserved.
+    """
+    patterns = wm.get_discrepancy_patterns()
+    caps = sm.setdefault("capabilities", {})
+    weaknesses: list = caps.setdefault("weaknesses", [])
+
+    # Separate auto-generated vs human/LLM weaknesses
+    auto_prefix = "Systematic prediction bias:"
+    manual = [w for w in weaknesses if not w.startswith(auto_prefix)]
+
+    # Build new auto-weaknesses from current high-error patterns
+    new_auto: list[str] = []
+    for p in patterns:
+        atype = p.get("action_type", "?")
+        count = p.get("count", 0)
+        avg_err = p.get("avg_error", 0.0)
+        if count >= 2 and avg_err >= 0.4:
+            weakness_text = (
+                f"{auto_prefix} {atype} actions have {avg_err:.2f} avg "
+                f"prediction error across {count} samples"
+            )
+            if weakness_text not in new_auto:
+                new_auto.append(weakness_text)
+
+    # Merge: manual weaknesses first, then new auto weaknesses
+    merged = list(manual)
+    added = 0
+    for w in new_auto:
+        if w not in merged:
+            merged.append(w)
+            added += 1
+
+    # Cap at 10
+    sm["capabilities"]["weaknesses"] = merged[-10:]
+
+    if added > 0:
+        logger.info(
+            "Synced %d world model pattern(s) → self-model weaknesses",
+            added,
+        )
+    return added
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Main thinking cycle
 # ═════════════════════════════════════════════════════════════════
 
@@ -1430,6 +1505,15 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
 
     # 5. Apply insights to state
     updates = _apply_insights(parsed, state)
+
+    # 5.25 Bridge: sync world model discrepancy patterns into self-model weaknesses
+    # This runs AFTER _apply_insights so the LLM's own weakness updates are applied
+    # first, then we complement with auto-detected patterns the LLM may have missed.
+    try:
+        sm = updates.get("self_model", state.get("self_model", {}))
+        _bridge_world_model_to_self_model(wm, sm)
+    except Exception as e:
+        logger.warning("World model bridge failed (non-blocking): %s", e)
 
     # 5.5 World Model: record prediction if LLM made one
     pred = parsed.get("prediction")
