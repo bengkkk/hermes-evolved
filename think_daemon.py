@@ -850,18 +850,26 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 
 # ── Runtime main context cache ──
 _RUNTIME_INITIALIZED: bool = False
+_RUNTIME_PROVIDER: str = ""
+_RUNTIME_MODEL: str = ""
 
 
 def _ensure_runtime_main() -> None:
-    """Read provider/model from config.yaml and set the Hermes runtime main context.
+    """Read provider/model from config.yaml and cache them for explicit use.
 
-    The auxiliary client relies on ``set_runtime_main`` being called at least
-    once per process so that ``_resolve_auto()`` can find the user's configured
-    provider. Without this, every LLM call falls through the fallback chain
-    (openrouter → nous → custom → api-key), which all fail when credentials
-    are only configured for the main provider.
+    The auxiliary client's auto-resolution (``_resolve_auto()``) scans
+    openrouter → nous → local/custom → api-key — but if the user's
+    API key lives under a non-default provider like ``opencode-go``,
+    the auto chain never reaches it and every LLM call falls through
+    the fallbacks and fails (the root cause of the daemon's ~60%
+    error rate).
+
+    This function caches the configured provider+model as module
+    globals so ``_call_llm`` can pass them **explicitly** to
+    ``async_call_llm()``, bypassing the broken auto-detection chain
+    entirely.
     """
-    global _RUNTIME_INITIALIZED
+    global _RUNTIME_INITIALIZED, _RUNTIME_PROVIDER, _RUNTIME_MODEL
     if _RUNTIME_INITIALIZED:
         return
     try:
@@ -881,6 +889,11 @@ def _ensure_runtime_main() -> None:
             # profile's expected env_vars and bridge any gap.
             _ensure_provider_env(provider)
 
+            # Cache for explicit passing to async_call_llm
+            _RUNTIME_PROVIDER = provider
+            _RUNTIME_MODEL = model
+
+            # Also set runtime main context for any code that uses it
             from agent.auxiliary_client import set_runtime_main
             set_runtime_main(provider=provider, model=model)
             logger.info("Runtime main set: provider=%s model=%s", provider, model)
@@ -924,10 +937,13 @@ def _ensure_provider_env(provider: str) -> None:
 async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     """Call LLM via Hermes auxiliary_client, return response text or None.
 
-    Uses the same provider chain as the main Hermes session.
+    Passes the configured provider/model explicitly (cached by
+    ``_ensure_runtime_main``) to bypass the auto-detection chain
+    which only scans openrouter → nous → custom → api-key and
+    misses non-default providers like ``opencode-go``.
     """
-    # Ensure the Hermes runtime main context is set so auxiliary_client
-    # can resolve the user's configured provider.
+    # Ensure the Hermes runtime context is known — this populates
+    # _RUNTIME_PROVIDER and _RUNTIME_MODEL.
     _ensure_runtime_main()
 
     try:
@@ -946,6 +962,8 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     messages=messages,
                     temperature=0.3,
                     max_tokens=2048,
+                    provider=_RUNTIME_PROVIDER or None,
+                    model=_RUNTIME_MODEL or None,
                 ),
                 timeout=90.0,
             )
