@@ -1335,6 +1335,138 @@ class WorldModel:
             return None  # No concerns
         return "Action risk assessment:\n" + "\n".join(parts)
 
+    # ── Proactive outcome prediction (completes the predict→act→observe→learn loop) ──
+
+    def predict_action_outcome(
+        self,
+        action_type: str,
+        description: str = "",
+    ) -> Dict[str, Any]:
+        """Predict the outcome of a proposed action using historical data.
+
+        Generates a data-driven prediction based on per-type accuracy statistics,
+        similar past actions (keyword-matched), and recent trends.  This is the
+        world model's own predictive capability, independent of the LLM's
+        ``expected_outcome`` field.
+
+        Args:
+            action_type: The action type (``\"shell\"``, ``\"write_file\"``, etc.).
+            description: Action description for similarity matching.
+
+        Returns:
+            A dict with:
+              - ``predicted_outcome``: Best-guess outcome string (or None if no data).
+              - ``confidence``: Calibrated confidence (0.0–1.0).
+              - ``success_probability``: Estimated probability of success (0.0–1.0).
+              - ``avg_error``: Historical average prediction error for this type.
+              - ``sample_count``: Number of historical samples used.
+              - ``similar_actions``: Up to 3 descriptions of similar past actions.
+              - ``risk_level``: ``\"low\"``, ``\"medium\"``, or ``\"high\"``.
+        """
+        result: Dict[str, Any] = {
+            "predicted_outcome": None,
+            "confidence": 0.0,
+            "success_probability": 0.5,
+            "avg_error": None,
+            "sample_count": 0,
+            "similar_actions": [],
+            "risk_level": "unknown",
+        }
+
+        per_type = self.get_per_type_accuracy()
+        if action_type not in per_type:
+            # No data for this type — can't make a statistical prediction
+            return result
+
+        stats = per_type[action_type]
+        count = stats["count"]
+        avg_err = stats["avg_error"]
+        result["avg_error"] = avg_err
+        result["sample_count"] = count
+
+        # ── Success probability: inverse of avg_error, adjusted for sample count ──
+        # With few samples, regress toward neutral (0.5)
+        raw_success = 1.0 - avg_err
+        if count < 3:
+            # Blend with neutral for low sample counts
+            blend = count / 3.0
+            raw_success = raw_success * blend + 0.5 * (1.0 - blend)
+        success_prob = max(0.0, min(1.0, round(raw_success, 4)))
+        result["success_probability"] = success_prob
+
+        # ── Confidence in the prediction itself ──
+        # High confidence when we have many samples and consistent error
+        # Low confidence when samples are few or error is near 0.5
+        confidence_base = 1.0 - abs(avg_err - 0.5) * 2.0  # 0.0 at error=0.5, 1.0 at error=0.0 or 1.0
+        sample_factor = min(count / 10.0, 1.0)  # More samples = more confidence
+        confidence = round(max(0.1, min(1.0, confidence_base * 0.6 + sample_factor * 0.4)), 4)
+        result["confidence"] = confidence
+
+        # ── Risk level ──
+        if success_prob >= 0.7:
+            result["risk_level"] = "low"
+        elif success_prob >= 0.4:
+            result["risk_level"] = "medium"
+        else:
+            result["risk_level"] = "high"
+
+        # ── Similar past actions (keyword-matched) ──
+        if description:
+            desc_lower = description.lower()
+            desc_tokens = set(re.findall(r"[a-z0-9]+", desc_lower))
+            scored: List[tuple[float, str]] = []
+            for t in self.data.get("action_triples", []):
+                if t.get("action_type") != action_type or not t.get("completed"):
+                    continue
+                past_desc = (t.get("action_description", "") or "").lower()
+                past_tokens = set(re.findall(r"[a-z0-9]+", past_desc))
+                if desc_tokens and past_tokens:
+                    overlap = len(desc_tokens & past_tokens)
+                    union = len(desc_tokens | past_tokens)
+                    similarity = overlap / max(union, 1)
+                    if similarity > 0.2:
+                        err = t.get("prediction_error", 0.5)
+                        actual = (t.get("actual_outcome", "") or "")[:80]
+                        scored.append((similarity, past_desc[:60], err, actual))
+
+            # Sort by similarity, take top 3
+            scored.sort(key=lambda x: x[0], reverse=True)
+            for sim, desc_text, err_val, actual_text in scored[:3]:
+                result["similar_actions"].append({
+                    "description": desc_text,
+                    "similarity": round(sim, 3),
+                    "error": err_val,
+                    "outcome": actual_text,
+                })
+
+        # ── Generate predicted outcome string ──
+        if result["sample_count"] >= 1:
+            # Build a summary prediction from historical pattern
+            if success_prob >= 0.7:
+                label = "likely to succeed"
+            elif success_prob >= 0.4:
+                label = "uncertain outcome"
+            else:
+                label = "likely to fail"
+
+            pred_parts = [
+                f"[data-driven] {action_type} action: {label} ",
+                f"(success probability {success_prob:.0%}, "
+                f"n={count}, avg_err={avg_err:.2f})",
+            ]
+
+            # Add evidence from most similar past action if found
+            if result["similar_actions"]:
+                best = result["similar_actions"][0]
+                pred_parts.append(
+                    f" | Most similar: \"{best['description'][:50]}\" "
+                    f"→ \"{best['outcome'][:50]}\" [err={best['error']:.2f}]"
+                )
+
+            result["predicted_outcome"] = "".join(pred_parts)
+
+        return result
+
     # ── Persistence ───────────────────────────────────────────────
 
     @staticmethod
