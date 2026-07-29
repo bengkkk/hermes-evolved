@@ -264,10 +264,12 @@ CRITICAL RULE: Your JSON output MUST include a non-null "action" field this cycl
 Rules:
 - You MUST set a non-null "action" field every cycle. Setting it to null counts as failure.
 - If you have been deliberating about the same thing for 2+ cycles without executing, STOP and just run: ls {workspace_root}/
-- Prefer small concrete steps over perfect planning. A tiny real result beats a perfect plan.
+|- Prefer small concrete steps over perfect planning. A tiny real result beats a perfect plan.
   - Unsure about workspace layout? Run: ls -la /
   - Want to check a file? Run: cat {workspace_root}/some_file.py
   - Need to verify PyPI? Run: python3 -c "import json; print('ok')"
+  - Need to check if a process is running? Do NOT use ps or pgrep (they are not installed).
+    Use: cat /proc/<PID>/status or: python3 -c "import os; print(os.kill(<PID>, 0))"
 
 ACTION CAPABILITIES (Gap 10):
 - Use the "action" field to take action NOW. Supported types:
@@ -1056,7 +1058,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     provider=_RUNTIME_PROVIDER or None,
                     model=_RUNTIME_MODEL or None,
                 ),
-                timeout=25.0,
+                timeout=18.0,  # Per-call timeout: lower = faster retries when API is slow
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
@@ -1261,15 +1263,21 @@ async def run_one_cycle() -> Dict[str, Any]:
     cs["total"] += 1
 
     # ── Main cycle with timeout ──
+    # Timeout must be generous enough for 3 LLM retries (each with Hermes's
+    # internal fallback chain which can take ~30s despite the inner timeout)
+    # plus the local analysis fallback that runs after all retries fail.
+    # 200s gives ~160s for retries + 40s for local analysis vs the old 120s
+    # which was cutting off retries before they could complete.
+    _CYCLE_HARD_TIMEOUT = 200.0
     try:
         result = await asyncio.wait_for(
             _run_cycle_body(result, ds),
-            timeout=120.0,
+            timeout=_CYCLE_HARD_TIMEOUT,
         )
     except asyncio.TimeoutError:
         result["status"] = "timeout"
-        result["error"] = "Cycle exceeded 120s hard limit"
-        logger.warning("Cycle timed out after 120s")
+        result["error"] = f"Cycle exceeded {_CYCLE_HARD_TIMEOUT}s hard limit"
+        logger.warning("Cycle timed out after %gs", _CYCLE_HARD_TIMEOUT)
     except Exception as e:
         result["status"] = "crash"
         result["error"] = f"Cycle crashed: {e}"
