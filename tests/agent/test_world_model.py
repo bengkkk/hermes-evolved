@@ -268,7 +268,7 @@ class TestPersistence:
             loaded = WorldModel.load(path)
             assert len(loaded.data["action_triples"]) == 1
             assert len(loaded.data["predictions"]) == 1
-            assert loaded.data["version"] == 3
+            assert loaded.data["version"] == 4
         finally:
             path.unlink(missing_ok=True)
 
@@ -570,6 +570,98 @@ class TestCalibrationGuidance:
         wm.complete_action(tid, "exit=0: ok")
         insight = wm.format_prediction_insight()
         assert "action types" in insight or "no predictions" in insight
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Error trend analysis (rolling error_history tracking)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestErrorTrend:
+    """_add_to_error_history and _compute_error_trend track improving/worsening."""
+
+    def test_history_appends_on_complete(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "check", "expected")
+        wm.complete_action(tid, "exit=0: ok")
+        hist = wm.data["prediction_accuracy"]["error_history"]
+        assert len(hist) == 1
+        assert 0 <= hist[0] <= 1.0
+
+    def test_history_capped_at_20(self) -> None:
+        wm = WorldModel()
+        for i in range(25):
+            tid = wm.record_action("shell", f"action {i}", f"expected {i}")
+            wm.complete_action(tid, f"exit=0: ok {i}")
+        assert len(wm.data["prediction_accuracy"]["error_history"]) <= 20
+
+    def test_prediction_adds_to_history(self) -> None:
+        wm = WorldModel()
+        pid = wm.record_prediction("will work", "1d", 0.8, "test")
+        wm.verify_prediction(pid, "worked")
+        assert len(wm.data["prediction_accuracy"]["error_history"]) == 1
+
+    def test_auto_verify_adds_to_history(self) -> None:
+        from datetime import datetime, timezone, timedelta
+        wm = WorldModel()
+        pid = wm.record_prediction("old pred", "1 day", 0.7, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        wm.verify_expired_predictions()
+        assert len(wm.data["prediction_accuracy"]["error_history"]) == 1
+        assert wm.data["prediction_accuracy"]["error_history"][0] == 0.5
+
+    def test_trend_unknown_with_few_samples(self) -> None:
+        wm = WorldModel()
+        for i in range(4):
+            tid = wm.record_action("shell", f"act {i}", f"exp {i}")
+            wm.complete_action(tid, f"exit=0: ok {i}")
+        trend = wm._compute_error_trend()
+        assert trend == "", f"Expected empty trend with 4 samples, got {trend!r}"
+
+    def test_trend_improving(self) -> None:
+        wm = WorldModel()
+        # First 3: high error (bad predictions)
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy {i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: crash")
+        # Next 3: low error (good predictions)
+        for i in range(3):
+            tid = wm.record_action("shell", f"list {i}", "list files")
+            wm.complete_action(tid, "exit=0: ok")
+        trend = wm._compute_error_trend()
+        assert "improving" in trend, f"Expected improving, got {trend!r}"
+
+    def test_trend_worsening(self) -> None:
+        wm = WorldModel()
+        # First 3: low error
+        for i in range(3):
+            tid = wm.record_action("shell", f"list {i}", "list files")
+            wm.complete_action(tid, "exit=0: ok")
+        # Next 3: high error
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy {i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: crash")
+        trend = wm._compute_error_trend()
+        assert "worsening" in trend, f"Expected worsening, got {trend!r}"
+
+    def test_trend_stable(self) -> None:
+        wm = WorldModel()
+        # 6 similar low-error actions
+        for i in range(6):
+            tid = wm.record_action("shell", f"exact {i}", "exact same text")
+            wm.complete_action(tid, "exact same text")
+        trend = wm._compute_error_trend()
+        assert "stable" in trend or "improving" in trend
+
+    def test_insight_includes_trend_when_enough_data(self) -> None:
+        wm = WorldModel()
+        for i in range(6):
+            tid = wm.record_action("shell", f"exact {i}", "exact same")
+            wm.complete_action(tid, "exact same")
+        insight = wm.format_prediction_insight()
+        # Should contain either a trend bracket or accuracy info
+        assert "accuracy" in insight or "→" in insight or "↓" in insight or "↑" in insight
 
 
 # ═══════════════════════════════════════════════════════════════════

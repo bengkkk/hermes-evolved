@@ -52,7 +52,7 @@ def _unique_id(prefix: str) -> str:
 
 
 _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
-    "version": 3,
+    "version": 4,
     "action_triples": [],       # List[ActionTriple]
     "predictions": [],          # List[Prediction]
     "prediction_accuracy": {    # Running statistics
@@ -64,6 +64,7 @@ _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
         "total_triples": 0,
         "avg_triple_error": 0.0,
         "calibration_buckets": [],  # confidence vs accuracy per bucket
+        "error_history": [],        # Rolling list of last 20 prediction errors for trend
     },
     "discrepancy_patterns": [],  # Recurring categories of prediction failure
     "per_type_accuracy": {},     # Action-type → stats for calibration
@@ -308,6 +309,7 @@ class WorldModel:
                 triple["prediction_error"] = error
                 triple["completed_at"] = now_iso()
 
+                self._add_to_error_history(error)
                 self._update_accuracy_stats()
                 return error
         return None
@@ -416,6 +418,7 @@ class WorldModel:
                 )
 
                 self._update_calibration(pred.get("confidence", 0.5), error)
+                self._add_to_error_history(error)
                 return error
         return None
 
@@ -541,6 +544,7 @@ class WorldModel:
                 )
 
                 self._update_calibration(pred.get("confidence", 0.5), 0.5)
+                self._add_to_error_history(0.5)
                 verified_count += 1
 
         return verified_count
@@ -666,22 +670,56 @@ class WorldModel:
         return "\n".join(parts)
 
     def format_prediction_insight(self) -> str:
-        """A one-line summary of prediction accuracy for the prompt header."""
+        """A compact summary of prediction accuracy with error trend."""
         acc = self.data.get("prediction_accuracy", {})
         total = acc.get("total_predictions", 0)
         verified = acc.get("verified_predictions", 0)
         correct = acc.get("correct_predictions", 0)
         per_type = self.get_per_type_accuracy()
         types_count = len(per_type)
+
+        # Compute trend from rolling error history
+        trend = self._compute_error_trend()
+
         if verified > 0:
             pct = round(correct / verified * 100)
             base = f"Prediction accuracy: {pct}% ({correct}/{verified} verified, {total} total)"
             if types_count > 0:
                 base += f", tracked {types_count} action types for calibration"
+            if trend:
+                base += f" [{trend}]"
             return base
         if total > 0:
             return f"Prediction accuracy: {total} predictions made, none verified yet"
         return "Prediction accuracy: no predictions made yet"
+
+    def _compute_error_trend(self) -> str:
+        """Compare recent prediction errors vs earlier ones to detect trend.
+
+        Uses the rolling ``error_history`` list: splits the available history
+        in half and compares the average of the more recent half vs. the
+        earlier half. Requires at least 6 data points for a meaningful signal.
+
+        Returns:
+            A short string like ``\"↓ improving\"``, ``\"↑ worsening\"``,
+            ``\"→ stable\"``, or empty string if insufficient data.
+        """
+        acc = self.data.get("prediction_accuracy", {})
+        history = acc.get("error_history", [])
+        if len(history) < 6:
+            return ""
+        mid = len(history) // 2
+        earlier = history[:mid]
+        recent = history[mid:]
+        avg_earlier = sum(earlier) / len(earlier)
+        avg_recent = sum(recent) / len(recent)
+        delta = avg_recent - avg_earlier  # positive = getting worse
+        if delta > 0.08:
+            return "↑ worsening"
+        elif delta < -0.08:
+            return "↓ improving"
+        else:
+            return "→ stable"
 
     # ── Internal helpers ──────────────────────────────────────────
 
@@ -700,6 +738,21 @@ class WorldModel:
         # Also refresh per-type accuracy and discrepancy patterns whenever stats are recalculated
         self._update_per_type_accuracy()
         self._update_discrepancy_patterns()
+
+    def _add_to_error_history(self, error: float) -> None:
+        """Append a prediction error to the rolling history for trend analysis.
+
+        Keeps the last 20 errors. The ``error_history`` list lives inside
+        ``prediction_accuracy.error_history`` and is persisted with the rest
+        of the world model data.
+
+        Called automatically from :meth:`complete_action`,
+        :meth:`verify_prediction`, and expired-prediction auto-verification.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        history = acc.setdefault("error_history", [])
+        history.append(error)
+        acc["error_history"] = history[-20:]
 
     def _update_calibration(self, confidence: float, error: float) -> None:
         """Track confidence vs accuracy for calibration curve."""
