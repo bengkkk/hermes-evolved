@@ -848,11 +848,88 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 #  LLM call
 # ═════════════════════════════════════════════════════════════════
 
+# ── Runtime main context cache ──
+_RUNTIME_INITIALIZED: bool = False
+
+
+def _ensure_runtime_main() -> None:
+    """Read provider/model from config.yaml and set the Hermes runtime main context.
+
+    The auxiliary client relies on ``set_runtime_main`` being called at least
+    once per process so that ``_resolve_auto()`` can find the user's configured
+    provider. Without this, every LLM call falls through the fallback chain
+    (openrouter → nous → custom → api-key), which all fail when credentials
+    are only configured for the main provider.
+    """
+    global _RUNTIME_INITIALIZED
+    if _RUNTIME_INITIALIZED:
+        return
+    try:
+        import yaml
+        config_path = EVOLVE_DIR.parent / "config.yaml"
+        if not config_path.exists():
+            logger.info("No config.yaml found at %s — skipping runtime init", config_path)
+            return
+        config = yaml.safe_load(config_path.read_text())
+        model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
+        provider = model_cfg.get("provider", "") or ""
+        model = model_cfg.get("default", "") or ""
+        if provider and model:
+            # Propagate env var aliases: some provider env_vars may be named
+            # differently in this session (e.g. OPENCODE_API_KEY vs the
+            # provider's expected OPENCODE_GO_API_KEY).  Check the provider
+            # profile's expected env_vars and bridge any gap.
+            _ensure_provider_env(provider)
+
+            from agent.auxiliary_client import set_runtime_main
+            set_runtime_main(provider=provider, model=model)
+            logger.info("Runtime main set: provider=%s model=%s", provider, model)
+            _RUNTIME_INITIALIZED = True
+        else:
+            logger.info("Config has no model.provider or model.default — skipping runtime init")
+    except ImportError:
+        logger.debug("set_runtime_main not available — skipping runtime init")
+    except Exception as e:
+        logger.warning("Failed to set runtime main: %s", e)
+
+
+def _ensure_provider_env(provider: str) -> None:
+    """Propagate env var aliases for the given provider.
+
+    Some providers expect specific env var names (e.g. ``OPENCODE_GO_API_KEY``)
+    but the runtime may have them under a different name (e.g. ``OPENCODE_API_KEY``).
+    This function bridges common aliases so the credential pool finds the key.
+    """
+    import os as _os
+    # ── Known env var aliases ──
+    # Format: provider_name -> [(expected_var, [alias_var, ...]), ...]
+    _ALIASES: dict = {
+        "opencode-go": [
+            ("OPENCODE_GO_API_KEY", ["OPENCODE_API_KEY"]),
+        ],
+    }
+    if provider not in _ALIASES:
+        return
+    for expected_var, aliases in _ALIASES.get(provider, []):
+        if _os.environ.get(expected_var):
+            continue  # Already set
+        for alias in aliases:
+            val = _os.environ.get(alias)
+            if val:
+                _os.environ[expected_var] = val
+                logger.info("Propagated %s → %s for provider %s", alias, expected_var, provider)
+                break
+
+
 async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     """Call LLM via Hermes auxiliary_client, return response text or None.
 
     Uses the same provider chain as the main Hermes session.
     """
+    # Ensure the Hermes runtime main context is set so auxiliary_client
+    # can resolve the user's configured provider.
+    _ensure_runtime_main()
+
     try:
         from agent.auxiliary_client import async_call_llm
     except ImportError:
