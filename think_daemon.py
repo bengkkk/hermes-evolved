@@ -1172,19 +1172,23 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
                     f"or required data threshold is met."
                 ),
             }
-            # If the top suggestion has already been set as a goal before,
-            # don't recreate — skip new_goal creation if the timeline
-            # already has a matching active goal.
-            existing_goals = tl.get("future", {}).get("goals", [])
-            already_present = any(
-                top["title"].lower() in g.lower()
-                for g in existing_goals
-            )
-            if already_present:
-                new_goal = None  # Skip duplicate
-            # Update insight to mention the auto-created goal
-            insight += f" | Auto-created goal: {top['title']}"
-            insight_parts.append(f"Auto-goal: {top['title']}")
+            # Deduplicate: skip if an identical goal already exists
+            # in the Goals store (evolve/goals.json)
+            try:
+                from data_layer import Goals as _Goals
+                existing = _Goals.load().get_active()
+                already_present = any(
+                    top["title"].lower() in g.get("title", "").lower()
+                    for g in existing
+                )
+                if already_present:
+                    new_goal = None
+            except ImportError:
+                pass
+            if new_goal:
+                # Update insight to mention the auto-created goal
+                insight += f" | Auto-created goal: {top['title']}"
+                insight_parts.append(f"Auto-goal: {top['title']}")
     except Exception as e:
         logger.debug("Auto-goal creation skipped: %s", e)
 
