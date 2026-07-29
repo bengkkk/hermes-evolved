@@ -944,6 +944,72 @@ class WorldModel:
 
         return "\n".join(lines)
 
+    # ── Proactive action guidance
+
+    def format_action_guidance(
+        self,
+        action_type: str,
+        description: str = "",
+    ) -> Optional[str]:
+        """Check if a proposed action is risky based on discrepancy patterns.
+
+        Args:
+            action_type: The type of action being considered (e.g. ``"shell"``,
+                ``"write_file"``, ``"git_commit"``).
+            description: The action description for keyword matching.
+
+        Returns:
+            A warning string if the action is risky, or None if no concerns.
+        """
+        per_type = self.get_per_type_accuracy()
+        patterns = self.get_discrepancy_patterns()
+        parts: List[str] = []
+
+        # 1. Per-type accuracy check
+        if action_type in per_type:
+            stats = per_type[action_type]
+            avg_err = stats["avg_error"]
+            count = stats["count"]
+            if avg_err >= 0.4 and count >= 2:
+                parts.append(
+                    f"  ⚠ Type '{action_type}' has elevated prediction error "
+                    f"({avg_err:.2f} avg across {count} actions)."
+                )
+
+        # 2. Discrepancy pattern check — match action type + description keywords
+        if description:
+            desc_lower = description.lower()
+            for pat in patterns:
+                if pat.get("action_type") != action_type:
+                    continue
+                themes = pat.get("common_themes", [])
+                matched_keywords = [kw for kw in themes if kw in desc_lower]
+                if matched_keywords:
+                    parts.append(
+                        f"  ⚠ Keyword match in discrepancy pattern: "
+                        f"{', '.join(matched_keywords)} "
+                        f"({pat['count']} failures, avg err {pat['avg_error']:.2f})"
+                    )
+
+        # 3. Recent action trend — last 3 actions of this type
+        recent = [
+            t for t in self.data.get("action_triples", [])[-10:]
+            if t.get("action_type") == action_type
+            and t.get("completed") and t.get("prediction_error") is not None
+        ]
+        if len(recent) >= 2:
+            recent_errors = [t["prediction_error"] for t in recent[-3:]]
+            recent_avg = sum(recent_errors) / len(recent_errors)
+            if recent_avg >= 0.4:
+                parts.append(
+                    f"  ⚠ Last {len(recent_errors)} '{action_type}' actions averaged "
+                    f"{recent_avg:.2f} prediction error."
+                )
+
+        if not parts:
+            return None  # No concerns
+        return "Action risk assessment:\n" + "\n".join(parts)
+
     # ── Persistence ───────────────────────────────────────────────
 
     @staticmethod

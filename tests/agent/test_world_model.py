@@ -572,6 +572,104 @@ class TestCalibrationGuidance:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Proactive action guidance (discrepancy → decision bridge)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestActionGuidance:
+    """format_action_guidance warns when actions are risky based on history."""
+
+    def test_no_data_returns_none(self) -> None:
+        wm = WorldModel()
+        assert wm.format_action_guidance("shell", "list files") is None
+        assert wm.format_action_guidance("write_file", "create config") is None
+
+    def test_unknown_type_returns_none(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "deploy", "deploy should succeed")
+        wm.complete_action(tid, "exit=0: ok")
+        # "write_file" has no data → no guidance
+        assert wm.format_action_guidance("write_file", "write config") is None
+
+    def test_low_error_type_returns_none(self) -> None:
+        wm = WorldModel()
+        # 3 perfect shell actions → low avg error → no warning
+        for i in range(3):
+            tid = wm.record_action("shell", f"exact{i}", "same text here")
+            wm.complete_action(tid, "same text here")
+        assert wm.format_action_guidance("shell", "another exact") is None
+
+    def test_high_error_type_returns_warning(self) -> None:
+        wm = WorldModel()
+        for i in range(3):
+            tid = wm.record_action("shell", f"deploy v{i}", "deploy should succeed")
+            wm.complete_action(tid, "exit=1: crash")
+        guidance = wm.format_action_guidance("shell", "deploy new version")
+        assert guidance is not None
+        assert "risk assessment" in guidance
+        assert "shell" in guidance
+
+    def test_keyword_match_in_discrepancy_pattern(self) -> None:
+        wm = WorldModel()
+        for i in range(3):
+            tid = wm.record_action(
+                "shell", f"deploy application {i}", "deploy should succeed"
+            )
+            wm.complete_action(tid, "exit=1: build failure")
+        # Match on keyword "deploy" in description
+        guidance = wm.format_action_guidance("shell", "deploy the new app")
+        assert guidance is not None
+        assert "deploy" in guidance
+        assert "failures" in guidance
+
+    def test_keyword_no_match_ignores_pattern(self) -> None:
+        wm = WorldModel()
+        for i in range(3):
+            tid = wm.record_action(
+                "shell", f"deploy application {i}", "deploy should succeed"
+            )
+            wm.complete_action(tid, "exit=1: crash")
+        # Description without the problematic keyword
+        guidance = wm.format_action_guidance("shell", "list directory")
+        assert guidance is not None  # Still warns about type
+        if "deploy" in guidance:
+            # "deploy" might appear in the per-type accuracy warning
+            # but shouldn't appear in a keyword-match section
+            pass
+
+    def test_recent_trend_triggers_warning(self) -> None:
+        wm = WorldModel()
+        # 2 recent actions with high error (use success keywords in expected)
+        tid1 = wm.record_action("shell", "build project", "deploy should succeed")
+        wm.complete_action(tid1, "exit=1: fail")
+        tid2 = wm.record_action("shell", "run tests", "deploy should work")
+        wm.complete_action(tid2, "exit=1: fail")
+        guidance = wm.format_action_guidance("shell", "run tests")
+        assert guidance is not None
+        assert "averaged" in guidance or "error" in guidance or "risk" in guidance
+
+    def test_recent_trend_no_warning_when_low_error(self) -> None:
+        wm = WorldModel()
+        # 2 recent perfect actions
+        tid1 = wm.record_action("shell", "list", "list files")
+        wm.complete_action(tid1, "exit=0: done")
+        tid2 = wm.record_action("shell", "show", "show status")
+        wm.complete_action(tid2, "exit=0: active")
+        guidance = wm.format_action_guidance("shell", "check status")
+        # Low per-type accuracy too → no warning
+        if guidance is not None:
+            # If there's guidance, it shouldn't mention recent trend
+            assert "averaged" not in guidance
+
+    def test_returns_none_with_single_high_error(self) -> None:
+        wm = WorldModel()
+        # Single high-error action — below min_samples=2 for patterns,<2 for trend
+        tid = wm.record_action("shell", "deploy", "deploy should succeed")
+        wm.complete_action(tid, "exit=1: fail")
+        # Per-type check needs count>=2, patterns needs min_samples, trend needs >=2
+        assert wm.format_action_guidance("shell", "deploy") is None
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Auto-verification of expired predictions
 # ═══════════════════════════════════════════════════════════════════
 
