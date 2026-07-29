@@ -62,30 +62,39 @@ def get_evolve_dir() -> Path:
 
 
 def safe_read_json(path: Path, default: Any = None) -> Any:
-    """Read and parse a JSON file with version validation and resilience.
+    """Read and parse a JSON file with resilience.
 
     Args:
         path: Path to the JSON file.
-        default: Value returned on failure. If dict with a ``"version"`` key,
-                 used for schema version validation (rejects versions more
-                 than 1 ahead of the default).
+        default: Value returned on failure (NOT used for version gating).
 
     Returns:
         Parsed data on success, *default* on failure or version mismatch.
+
+    .. note::
+
+       The version check previously reset data here, but that was removed
+       because the threshold was too aggressive (data loss on normal schema
+       version bumps).  Version gating should live in the consuming class
+       (e.g. ``WorldModel.load()``), where the code knows what versions it
+       can handle.
     """
     try:
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
-            # Schema version check — guard against downgrade corruption
+            # Schema version check — log a warning but return data anyway.
+            # The old code silently reset data when the file version was
+            # more than 1 ahead of the default's version, causing data loss
+            # on normal version bumps (e.g. v4 file read with {} default).
             if isinstance(data, dict) and isinstance(default, dict):
                 dv = data.get("version", 1)
                 dd = default.get("version", 1)
-                if dv > dd + 1:
+                if dv > dd + 5:  # generous tolerance — only flag extreme gaps
                     logger.warning(
-                        "%s has version %d, expected <= %d — resetting",
+                        "%s has version %d, expected <= %d — caller may "
+                        "not understand this schema version",
                         path.name, dv, dd,
                     )
-                    return default
             return data
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("Could not read %s: %s — returning default", path.name, e)
