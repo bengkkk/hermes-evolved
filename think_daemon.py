@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -707,17 +708,55 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     su = result.get("self_model_update", {})
     if isinstance(su, dict):
         caps = sm.setdefault("capabilities", {})
+
+        def _is_near_duplicate(candidate: str, existing: list) -> bool:
+            """Check if candidate is a near-duplicate of any existing entry.
+
+            Three criteria (any match = duplicate):
+              1. Exact match (ignoring case)
+              2. One is a substring of the other (longer >= 4 common chars)
+              3. Word overlap > 50% after removing common stop words
+            """
+            if not candidate or not existing:
+                return False
+            c_lower = candidate.lower().strip()
+            # ── Exact (case-insensitive) ──
+            for e in existing:
+                if e.lower().strip() == c_lower:
+                    return True
+            # ── Substring ──
+            for e in existing:
+                e_lower = e.lower().strip()
+                if len(c_lower) >= 4 and len(e_lower) >= 4:
+                    if c_lower in e_lower or e_lower in c_lower:
+                        return True
+            # ── Word overlap ──
+            _STOP = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
+                               "at", "to", "for", "of", "with", "by", "from", "is",
+                               "it", "as", "be", "this", "that", "not", "no", "how"})
+            c_words = {w for w in re.findall(r"[a-z0-9]+", c_lower) if w not in _STOP}
+            if not c_words:
+                return False
+            for e in existing:
+                e_words = {w for w in re.findall(r"[a-z0-9]+", e.lower()) if w not in _STOP}
+                if not e_words:
+                    continue
+                overlap = len(c_words & e_words)
+                if overlap / max(len(c_words), len(e_words)) > 0.5:
+                    return True
+            return False
+
         weakness = su.get("weakness")
         if weakness and isinstance(weakness, str):
             caps.setdefault("weaknesses", [])
-            if weakness not in caps["weaknesses"]:
+            if not _is_near_duplicate(weakness, caps["weaknesses"]):
                 caps["weaknesses"].append(weakness)
                 caps["weaknesses"] = caps["weaknesses"][-10:]
 
         unknown = su.get("unknown")
         if unknown and isinstance(unknown, str):
             caps.setdefault("unknown_areas", [])
-            if unknown not in caps["unknown_areas"]:
+            if not _is_near_duplicate(unknown, caps["unknown_areas"]):
                 caps["unknown_areas"].append(unknown)
                 caps["unknown_areas"] = caps["unknown_areas"][-10:]
 
@@ -725,7 +764,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         if new_commit and isinstance(new_commit, str):
             commits = sm.setdefault("commitments", {})
             commits.setdefault("promised_features", [])
-            if new_commit not in commits["promised_features"]:
+            if not _is_near_duplicate(new_commit, commits["promised_features"]):
                 commits["promised_features"].append(new_commit)
 
     # ── Multi-type Memory (Gap 2) ──

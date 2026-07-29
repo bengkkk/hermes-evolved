@@ -299,19 +299,24 @@ def propose_goal(title: str, description: str, rationale: str = "",
                  dependencies: Optional[List[str]] = None) -> str:
     """Propose a new self-generated goal. Delegates to data_layer."""
     goals = _Goals.load()
-    return goals.propose(
+    gid = goals.propose(
         title=title, description=description, rationale=rationale,
         gap_reference=gap_reference,
         verification_criteria=verification_criteria,
         priority=priority, dependencies=dependencies,
     )
+    goals.save()
+    return gid
 
 
 def update_goal_status(goal_id: str, new_status: str,
                        note: str = "") -> bool:
     """Update a goal's lifecycle. Delegates to data_layer."""
     goals = _Goals.load()
-    return goals.update_status(goal_id, new_status, note)
+    result = goals.update_status(goal_id, new_status, note)
+    if result:
+        goals.save()
+    return result
 
 
 def get_active_goals(status_filter: Optional[List[str]] = None) -> List[Dict]:
