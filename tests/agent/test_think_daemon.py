@@ -474,7 +474,7 @@ class TestBuildThinkingPrompt:
                 "version": 1,
                 "identity": {"name": "Hermes", "role": "Self-evolving AI"},
                 "state": {"current_gap_focus": "Gap 6", "evolution_version": 5},
-                "capabilities": {"available_tools": ["shell", "write_file"], "weaknesses": [], "unknown_areas": []},
+                "capabilities": {"strengths": ["shell", "write_file"], "weaknesses": [], "unknown_areas": []},
                 "commitments": {},
             },
             "orientation": None,

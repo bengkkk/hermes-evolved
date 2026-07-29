@@ -400,7 +400,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     caps = sm.get("capabilities", {})
     commits = sm.get("commitments", {})
 
-    strengths = caps.get("available_tools", [])
+    strengths = caps.get("strengths", [])
     weaknesses = caps.get("weaknesses", [])
     unknown = caps.get("unknown_areas", [])
 
