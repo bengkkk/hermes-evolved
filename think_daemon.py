@@ -39,6 +39,9 @@ from data_layer import get_evolve_dir, safe_read_json, safe_write_json
 
 logger = logging.getLogger("think_daemon")
 
+# ── World Model integration (Gap 6) ──
+from world_model import WorldModel, load_world_model, save_world_model
+
 # ── Paths (delegated to data_layer for the base directory) ──
 EVOLVE_DIR = get_evolve_dir()
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
@@ -149,6 +152,9 @@ Active plan:
 
 Last action result:
 {last_action_result}
+
+World Model (prediction accuracy and discrepancy feedback):
+{world_model_context}
 
 Future goals:
 {goals_text}
@@ -373,6 +379,16 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     else:
         last_action_result = "(no previous action recorded)"
 
+    # ── World Model context (Gap 6) ──
+    try:
+        wm = state.get("world_model")
+        if wm is None:
+            wm = load_world_model()
+        world_model_context = wm.format_world_model_context()
+    except Exception as e:
+        logger.warning("Failed to load world model context: %s", e)
+        world_model_context = "  (world model unavailable — will be initialized on first action)"
+
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
         identity_role=identity.get("role", "?"),
@@ -388,6 +404,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         tasks_text=tasks_text,
         plan_status=plan_status,
         last_action_result=last_action_result,
+        world_model_context=world_model_context,
         goals_text=goals_text,
     )
 
@@ -599,6 +616,20 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         atype = act["type"]
         desc = act.get("description", "")
         logger.info("Executing action: %s — %s", atype, desc[:60])
+
+        # ── World Model: record action BEFORE execution ──
+        try:
+            wm = state.get("world_model")
+            if wm is None:
+                wm = load_world_model()
+            # Estimate expected outcome from description + type
+            expected = f"{atype}: {desc[:100]}" if desc else atype
+            triple_id = wm.record_action(atype, desc or atype, expected)
+        except Exception as e:
+            logger.warning("World model record failed (non-blocking): %s", e)
+            triple_id = None
+            wm = None
+
         try:
             from agent.self_evolve import add_episodic as _add_ep
             import subprocess, pathlib as _pl
@@ -636,18 +667,39 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     _add_ep("action", "Installed: " + apkg, action_output)
             else:
                 logger.warning("Unknown action type: %s", atype)
+
+            # ── World Model: complete action with actual outcome ──
+            if action_output and triple_id and wm is not None:
+                wm.complete_action(triple_id, action_output)
+            elif triple_id and wm is not None:
+                # Action produced no output — record that as the outcome
+                wm.complete_action(triple_id, "(no output)")
+
             # Save action output for next cycle's prompt
             if action_output:
                 ds["last_action_output"] = action_output
+
         except subprocess.TimeoutExpired:
             logger.warning("Action %s timed out", atype)
             _add_ep("action", "Action timed out: " + atype, desc)
+            # Record timeout as outcome
+            if triple_id and wm is not None:
+                wm.complete_action(triple_id, f"TIMEOUT: {atype}")
         except Exception as e:
             logger.warning("Action %s failed: %s", atype, e)
             _add_ep("action", "Action failed: " + atype, str(e)[:200])
+            # Record failure as outcome
+            if triple_id and wm is not None:
+                wm.complete_action(triple_id, f"FAILED: {e!s}")
         finally:
             from agent.self_evolve import save_memory, load_memory
             save_memory(load_memory())
+            # Save world model changes
+            if wm is not None:
+                try:
+                    wm.save()
+                except Exception as e:
+                    logger.warning("Failed to save world model: %s", e)
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")
     focus_next = result.get("focus_next", "")
@@ -781,12 +833,14 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     tl = load_timeline()
     sm = load_self_model()
     orient = load_orientation()
+    wm = load_world_model()
 
     state = {
         "daemon_state": ds,
         "timeline": tl,
         "self_model": sm,
         "orientation": orient,
+        "world_model": wm,
     }
 
     # 1.5 Auto-create initial plan if none exists
@@ -868,11 +922,25 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # 5. Apply insights to state
     updates = _apply_insights(parsed, state)
 
+    # 5.5 World Model: record prediction if LLM made one
+    pred = parsed.get("prediction")
+    if pred and isinstance(pred, dict) and pred.get("text"):
+        wm.record_prediction(
+            text=pred["text"],
+            timeframe=pred.get("timeframe"),
+            confidence=pred.get("confidence", 0.5),
+            basis=pred.get("basis", ""),
+        )
+        wm.save()
+
     # 6. Save updated state
     save_timeline(updates["timeline"])
     save_self_model(updates["self_model"])
     if updates["orientation"]:
         save_orientation(updates["orientation"])
+    # World model is saved inline during action execution and prediction recording
+    # but ensure latest state is persisted
+    wm.save()
 
     # 7. Update daemon state
     now_ts = datetime.now(timezone.utc).isoformat()
