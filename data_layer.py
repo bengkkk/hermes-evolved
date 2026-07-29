@@ -307,8 +307,13 @@ class SelfModel:
 
     @staticmethod
     def _merge_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
-        """Deep-merge loaded data with defaults so new keys appear."""
-        merged = dict(SelfModel._DEFAULT_DATA)
+        """Deep-merge loaded data with defaults so new keys appear.
+
+        Uses *deep* copy so class-level ``_DEFAULT_DATA`` is never mutated
+        when loading saved state — without this, every ``SelfModel(data=…)``
+        call would leak saved keys into the shared defaults dict.
+        """
+        merged = copy.deepcopy(SelfModel._DEFAULT_DATA)
         for section in ("identity", "state", "capabilities", "commitments"):
             if section in data:
                 merged[section].update(data[section])
@@ -1364,26 +1369,10 @@ def format_orientation_context() -> str:
     if goals_str:
         parts.append(goals_str)
 
-    # Section 5: Self Model
-    sm = SelfModel.load()
-    sm_parts: List[str] = ["## Self Model"]
-    sm_parts.append(
-        f"Identity: {sm.identity.get('name', '—')} — {sm.identity.get('role', '—')}"
-    )
-    ver = sm.state.get("evolution_version", 0)
-    gap = sm.state.get("current_gap_focus")
-    gap_str = f", current gap focus: {gap}" if gap else ""
-    sm_parts.append(f"Evolution: v{ver}{gap_str}")
-    weaknesses = sm.capabilities.get("weaknesses", [])
-    if weaknesses:
-        sm_parts.append(f"Known weaknesses: {'; '.join(weaknesses[:3])}")
-    unknowns = sm.capabilities.get("unknown_areas", [])
-    if unknowns:
-        sm_parts.append(f"Areas to learn: {'; '.join(unknowns[:3])}")
-    project = sm.data.get("commitments", {}).get("current_project")
-    if project:
-        sm_parts.append(f"Committed to: {project}")
-    parts.append("\n".join(sm_parts))
+    # Section 5: Self Model (reuses dedicated formatter)
+    self_model_str = format_self_model_context()
+    if self_model_str:
+        parts.append(self_model_str)
 
     if not parts:
         return ""
