@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from data_layer import _EVOLVE_DIR, _atomic_write, _read_json, now_compact, now_iso
+from data_layer import get_evolve_dir, safe_write_json, safe_read_json, now_compact, now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -514,12 +514,12 @@ class WorldModel:
 
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "world_model.json"
+        return get_evolve_dir() / "world_model.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         """Persist to disk as JSON (atomic write)."""
         target = path or self.storage_path()
-        _atomic_write(target, self.data)
+        safe_write_json(target, self.data)
         return target
 
     def _save(self) -> None:
@@ -530,7 +530,7 @@ class WorldModel:
     def load(cls, path: Optional[Path] = None) -> WorldModel:
         """Load from disk, returning a fresh WorldModel on failure."""
         target = path or cls.storage_path()
-        data = _read_json(target)
+        data = safe_read_json(target)
         return cls(data=data) if isinstance(data, dict) else cls()
 
     # ── Convenience ───────────────────────────────────────────────
