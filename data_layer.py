@@ -113,14 +113,24 @@ def safe_write_json(path: Path, data: Any) -> None:
 #  Internal helpers (used by classes below; prefer safe_read/write for external use)
 # ═══════════════════════════════════════════════════════════════════
 
-def _now_iso() -> str:
-    """Current UTC timestamp as ISO-8601 string."""
+def now_iso() -> str:
+    """Current UTC timestamp as ISO-8601 string (public)."""
     return datetime.now(timezone.utc).isoformat()
 
 
-def _now_compact() -> str:
-    """Compact timestamp safe for filenames / IDs."""
+def now_compact() -> str:
+    """Compact timestamp safe for filenames / IDs (public)."""
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+def _now_iso() -> str:
+    """Internal alias — use now_iso() externally."""
+    return now_iso()
+
+
+def _now_compact() -> str:
+    """Internal alias — use now_compact() externally."""
+    return now_compact()
 
 
 def _ensure_dir(path: Path) -> None:
@@ -520,3 +530,675 @@ class Orientation:
 
     def __repr__(self) -> str:
         return f"<Orientation focus={self.focus!r}>"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Memory — multi-type store (episodic / semantic / procedural)
+# ═══════════════════════════════════════════════════════════════════
+
+_DEFAULT_MEMORY: Dict[str, Any] = {
+    "version": 1,
+    "episodic": [],
+    "semantic": [],
+    "procedural": [],
+}
+
+
+class Memory:
+    """Multi-type memory store for the evolving system.
+
+    Three memory types:
+    - **Episodic**: experiences, observations, interactions (salience-tagged)
+    - **Semantic**: facts, knowledge, concepts (confidence-weighted)
+    - **Procedural**: how-to patterns, behaviors (success-tracked)
+
+    Stored as a JSON dict under ``~/.hermes/evolve/memory.json``.
+    """
+
+    def __init__(self, data: Optional[Dict[str, Any]] = None):
+        self.data: Dict[str, Any] = data if data else dict(_DEFAULT_MEMORY)
+
+    # ── Episodic ───────────────────────────────────────────────────
+
+    def add_episodic(
+        self,
+        mtype: str = "observation",
+        summary: str = "",
+        details: str = "",
+        tags: Optional[List[str]] = None,
+        salience: float = 0.5,
+    ) -> str:
+        """Record an episodic memory (experience / observation / interaction).
+
+        Returns the memory ID.
+        """
+        mem_id = f"ep_{now_compact()}"
+        entry: Dict[str, Any] = {
+            "id": mem_id,
+            "timestamp": now_iso(),
+            "type": mtype,
+            "summary": summary,
+            "details": details,
+            "salience": salience,
+            "tags": tags or [],
+        }
+        self.data.setdefault("episodic", []).append(entry)
+        self.data["episodic"] = self.data["episodic"][-200:]
+        return mem_id
+
+    def search_episodic(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Simple substring search across episodic entries."""
+        q = query.lower()
+        return [
+            e for e in self.data.get("episodic", [])
+            if q in json.dumps(e).lower()
+        ][-limit:]
+
+    # ── Semantic ───────────────────────────────────────────────────
+
+    def add_semantic(
+        self,
+        topic: str,
+        fact: str,
+        source: str = "experience",
+        confidence: float = 0.7,
+    ) -> str:
+        """Record a semantic fact (knowledge / concept learned).
+
+        Deduplicates on (topic + fact), updating confidence on repeat.
+        Returns the memory ID.
+        """
+        mem_id = f"sem_{now_compact()}"
+        # Deduplicate
+        for existing in self.data.get("semantic", []):
+            if existing.get("topic") == topic and existing.get("fact") == fact:
+                existing["last_accessed"] = now_iso()
+                existing["confidence"] = max(existing.get("confidence", 0), confidence)
+                return existing["id"]
+        entry: Dict[str, Any] = {
+            "id": mem_id,
+            "timestamp": now_iso(),
+            "topic": topic,
+            "fact": fact,
+            "source": source,
+            "confidence": confidence,
+            "last_accessed": now_iso(),
+        }
+        self.data.setdefault("semantic", []).append(entry)
+        self.data["semantic"] = self.data["semantic"][-500:]
+        return mem_id
+
+    def get_semantic_by_topic(self, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
+        """Get semantic facts matching a topic (case-insensitive)."""
+        tl = topic.lower()
+        return [
+            e for e in self.data.get("semantic", [])
+            if tl in e.get("topic", "").lower() or tl in e.get("fact", "").lower()
+        ][-limit:]
+
+    # ── Procedural ─────────────────────────────────────────────────
+
+    def add_procedural(self, pattern: str, trigger: str, procedure: str) -> str:
+        """Record a procedural memory (how-to pattern).
+
+        Increments success_count if the pattern already exists.
+        Returns the memory ID.
+        """
+        mem_id = f"pro_{now_compact()}"
+        for existing in self.data.get("procedural", []):
+            if existing.get("pattern") == pattern:
+                existing["success_count"] = existing.get("success_count", 0) + 1
+                return existing["id"]
+        entry: Dict[str, Any] = {
+            "id": mem_id,
+            "timestamp": now_iso(),
+            "pattern": pattern,
+            "trigger": trigger,
+            "procedure": procedure,
+            "success_count": 1,
+            "failure_count": 0,
+        }
+        self.data.setdefault("procedural", []).append(entry)
+        self.data["procedural"] = self.data["procedural"][-100:]
+        return mem_id
+
+    # ── Cross-type search ──────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        memory_types: Optional[List[str]] = None,
+        limit: int = 5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Simple text search across one or more memory types.
+
+        Args:
+            query: Search term (case-insensitive substring).
+            memory_types: Which types to search (default: all three).
+            limit: Max results per type.
+
+        Returns:
+            Dict mapping type name to list of matching entries.
+        """
+        types = memory_types or ["episodic", "semantic", "procedural"]
+        q = query.lower()
+        results: Dict[str, List[Dict[str, Any]]] = {}
+        for mt in types:
+            matches = [
+                e for e in self.data.get(mt, [])
+                if q in json.dumps(e).lower()
+            ]
+            results[mt] = matches[-limit:]
+        return results
+
+    # ── Format helpers ─────────────────────────────────────────────
+
+    def format_context(self, max_episodic: int = 3, max_semantic: int = 3,
+                       max_procedural: int = 2) -> str:
+        """Format recent memories as a readable context block."""
+        parts: List[str] = []
+        episodic = self.data.get("episodic", [])
+        recent_ep = episodic[-max_episodic:] if episodic else []
+        if recent_ep:
+            parts.append("Recent experiences:")
+            for e in recent_ep:
+                sal = "★" if e.get("salience", 0) >= 0.8 else "·"
+                parts.append(f"  {sal} {e['summary'][:80]}")
+
+        semantic = self.data.get("semantic", [])
+        recent_sem = semantic[-max_semantic:] if semantic else []
+        if recent_sem:
+            parts.append("Knowledge gained:")
+            for s in recent_sem:
+                conf = f" ({s.get('confidence', 0):.0%})" if s.get("confidence") else ""
+                parts.append(f"  · {s['topic']}: {s['fact'][:100]}{conf}")
+
+        procedural = self.data.get("procedural", [])
+        recent_pro = procedural[-max_procedural:] if procedural else []
+        if recent_pro:
+            parts.append("Learned patterns:")
+            for p in recent_pro:
+                sc = p.get("success_count", 0)
+                fc = p.get("failure_count", 0)
+                parts.append(f"  · {p['pattern']} (✓{sc} ✗{fc})")
+
+        if not (recent_ep or recent_sem or recent_pro):
+            parts.append("  (no recent memories yet)")
+
+        return "\n".join(parts)
+
+    # ── Persistence ───────────────────────────────────────────────
+
+    @staticmethod
+    def storage_path() -> Path:
+        return _EVOLVE_DIR / "memory.json"
+
+    def save(self, path: Optional[Path] = None) -> Path:
+        target = path or self.storage_path()
+        _atomic_write(target, self.data)
+        return target
+
+    @classmethod
+    def load(cls, path: Optional[Path] = None) -> "Memory":
+        target = path or cls.storage_path()
+        data = _read_json(target)
+        if isinstance(data, dict):
+            merged = dict(_DEFAULT_MEMORY)
+            merged.update(data)
+            for section in ("episodic", "semantic", "procedural"):
+                if section in data and isinstance(data[section], list):
+                    merged[section] = data[section]
+            return cls(data=merged)
+        return cls()
+
+    # ── Convenience ───────────────────────────────────────────────
+
+    def __repr__(self) -> str:
+        ep = len(self.data.get("episodic", []))
+        sem = len(self.data.get("semantic", []))
+        pro = len(self.data.get("procedural", []))
+        return f"<Memory episodic={ep} semantic={sem} procedural={pro}>"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Goals — self-generated goal lifecycle
+# ═══════════════════════════════════════════════════════════════════
+
+_DEFAULT_GOALS: Dict[str, Any] = {
+    "version": 1,
+    "goals": [],
+}
+
+
+class Goals:
+    """Self-generated goal store with lifecycle tracking.
+
+    Each goal progresses through: proposed → active → in_progress → completed/abandoned.
+    Goals are stored as a JSON dict under ``~/.hermes/evolve/goals.json``.
+    """
+
+    def __init__(self, data: Optional[Dict[str, Any]] = None):
+        self.data: Dict[str, Any] = data if data else dict(_DEFAULT_GOALS)
+
+    def propose(
+        self,
+        title: str,
+        description: str,
+        rationale: str = "",
+        gap_reference: str = "",
+        verification_criteria: str = "",
+        priority: int = 3,
+        dependencies: Optional[List[str]] = None,
+    ) -> str:
+        """Propose a new self-generated goal. Returns the goal ID."""
+        goal_id = f"goal_{now_compact()}"
+        goal: Dict[str, Any] = {
+            "id": goal_id,
+            "title": title,
+            "description": description,
+            "rationale": rationale,
+            "priority": priority,
+            "status": "proposed",
+            "gap_reference": gap_reference,
+            "dependencies": dependencies or [],
+            "estimated_effort": "",
+            "verification_criteria": verification_criteria,
+            "created_at": now_iso(),
+            "completed_at": None,
+            "notes": "",
+        }
+        self.data.setdefault("goals", []).append(goal)
+        self.data["goals"] = self.data["goals"][-100:]
+        return goal_id
+
+    def update_status(self, goal_id: str, new_status: str, note: str = "") -> bool:
+        """Update a goal's lifecycle status.
+
+        Valid statuses: ``active``, ``in_progress``, ``completed``, ``abandoned``.
+        Returns True if the goal was found.
+        """
+        for g in self.data.get("goals", []):
+            if g.get("id") == goal_id:
+                g["status"] = new_status
+                if new_status in ("completed", "abandoned"):
+                    g["completed_at"] = now_iso()
+                if note:
+                    g["notes"] = note
+                return True
+        return False
+
+    def get_active(
+        self,
+        status_filter: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Get goals filtered by status.
+
+        Default: proposed + active + in_progress (i.e. not completed/abandoned).
+        Results sorted by priority (lower = higher), then by creation time.
+        """
+        statuses = status_filter or ["proposed", "active", "in_progress"]
+        filtered = [g for g in self.data.get("goals", []) if g.get("status") in statuses]
+        filtered.sort(key=lambda g: (g.get("priority", 5), g.get("created_at", "")))
+        return filtered
+
+    def format_context(self) -> str:
+        """Format pending goals for the system prompt."""
+        pending = self.get_active()
+        parts: List[str] = ["## Self-generated Goals"]
+        if not pending:
+            parts.append("  (no self-generated goals yet)")
+            return "\n".join(parts)
+
+        for g in pending:
+            sym = {"proposed": "◇", "active": "○", "in_progress": "◎"}.get(
+                g.get("status", ""), "·"
+            )
+            deps = (
+                f" [depends: {', '.join(g['dependencies'][:3])}]"
+                if g.get("dependencies")
+                else ""
+            )
+            gap = f" [{g['gap_reference']}]" if g.get("gap_reference") else ""
+            parts.append(f"  {sym} P{g.get('priority', 3)} — {g['title']}{deps}{gap}")
+            parts.append(f"      {g.get('description', '')[:80]}")
+
+        active_count = sum(
+            1 for g in pending if g.get("status") in ("active", "in_progress")
+        )
+        proposed_count = sum(1 for g in pending if g.get("status") == "proposed")
+        parts.append(f"  ({active_count} active, {proposed_count} proposed)")
+        return "\n".join(parts)
+
+    # ── Persistence ───────────────────────────────────────────────
+
+    @staticmethod
+    def storage_path() -> Path:
+        return _EVOLVE_DIR / "goals.json"
+
+    def save(self, path: Optional[Path] = None) -> Path:
+        target = path or self.storage_path()
+        _atomic_write(target, self.data)
+        return target
+
+    @classmethod
+    def load(cls, path: Optional[Path] = None) -> "Goals":
+        target = path or cls.storage_path()
+        data = _read_json(target)
+        if isinstance(data, dict):
+            merged = dict(_DEFAULT_GOALS)
+            merged.update(data)
+            if "goals" in data and isinstance(data["goals"], list):
+                merged["goals"] = data["goals"]
+            return cls(data=merged)
+        return cls()
+
+    def __repr__(self) -> str:
+        n = len(self.data.get("goals", []))
+        return f"<Goals count={n}>"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Plan management — stored inside timeline.json (future.plans[])
+# ═══════════════════════════════════════════════════════════════════
+
+_DEFAULT_TIMELINE_DICT: Dict[str, Any] = {
+    "version": 1,
+    "past": {
+        "events": [],
+        "completed_sessions": [],
+        "outcomes": [],
+    },
+    "present": {
+        "active_project": None,
+        "active_tasks": [],
+        "waiting_for": [],
+        "last_session_focus": None,
+        "commitments": [],
+    },
+    "future": {
+        "goals": [],
+        "scheduled_actions": [],
+        "contingencies": [],
+        "predictions": [],
+        "plans": [],
+    },
+}
+
+
+def _load_timeline_dict() -> Dict[str, Any]:
+    """Load the dict-format timeline (past/present/future)."""
+    path = _EVOLVE_DIR / "timeline.json"
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return dict(_DEFAULT_TIMELINE_DICT)
+    merged = dict(_DEFAULT_TIMELINE_DICT)
+    for section in ("past", "present", "future"):
+        if section in data and isinstance(data[section], dict):
+            merged[section].update(data[section])
+    for k, v in data.items():
+        if k not in ("past", "present", "future"):
+            merged[k] = v
+    return merged
+
+
+def _save_timeline_dict(data: Dict[str, Any]) -> None:
+    """Save the dict-format timeline."""
+    safe_write_json(_EVOLVE_DIR / "timeline.json", data)
+
+
+def create_plan(goal: str, steps: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Create a new plan in the timeline's future section.
+
+    Each step can have: id, description, verification, status, blocked_by,
+    assigned_to, completed_at, note.
+    Returns the plan ID.
+    """
+    timeline = _load_timeline_dict()
+    plan_id = f"plan_{now_compact()}"
+    normalized_steps = []
+    for i, s in enumerate(steps or []):
+        normalized_steps.append({
+            "id": s.get("id", f"step_{i + 1}"),
+            "description": s.get("description", ""),
+            "verification": s.get("verification", ""),
+            "status": s.get("status", "pending"),
+            "blocked_by": s.get("blocked_by"),
+            "assigned_to": s.get("assigned_to", "user"),
+            "completed_at": s.get("completed_at"),
+            "note": s.get("note"),
+        })
+    plan: Dict[str, Any] = {
+        "id": plan_id,
+        "goal": goal,
+        "steps": normalized_steps,
+        "status": "active",
+        "progress": f"0/{len(normalized_steps)} steps" if normalized_steps else "0 steps",
+        "created_at": now_iso(),
+        "completed_at": None,
+    }
+    timeline.setdefault("future", {}).setdefault("plans", []).append(plan)
+    timeline["future"]["plans"] = timeline["future"]["plans"][-10:]
+    _save_timeline_dict(timeline)
+    return plan_id
+
+
+def get_active_plan() -> Optional[Dict[str, Any]]:
+    """Return the first active plan from the timeline, or None."""
+    timeline = _load_timeline_dict()
+    for p in timeline.get("future", {}).get("plans", []):
+        if p.get("status") == "active":
+            return p
+    return None
+
+
+def update_plan_step(
+    plan_id: str, step_id: str, new_status: str, note: str = ""
+) -> bool:
+    """Update a single step's status in a plan. Returns True if found."""
+    timeline = _load_timeline_dict()
+    for p in timeline.get("future", {}).get("plans", []):
+        if p.get("id") == plan_id:
+            for s in p.get("steps", []):
+                if s.get("id") == step_id:
+                    s["status"] = new_status
+                    if note:
+                        s["note"] = note
+                    if new_status in ("complete", "failed"):
+                        s["completed_at"] = now_iso()
+                    total = len(p["steps"])
+                    done = sum(1 for st in p["steps"] if st.get("status") == "complete")
+                    p["progress"] = f"{done}/{total} steps"
+                    _save_timeline_dict(timeline)
+                    return True
+    return False
+
+
+def complete_plan(plan_id: str, status: str = "complete") -> bool:
+    """Mark a plan as complete or failed. Returns True if found."""
+    timeline = _load_timeline_dict()
+    for p in timeline.get("future", {}).get("plans", []):
+        if p.get("id") == plan_id:
+            p["status"] = status
+            p["completed_at"] = now_iso()
+            _save_timeline_dict(timeline)
+            return True
+    return False
+
+
+def format_plan_context() -> str:
+    """Format the active plan as readable text for the system prompt."""
+    active = get_active_plan()
+    if not active:
+        return ""
+    goal = active.get("goal", "")
+    progress = active.get("progress", "0/0 steps")
+    steps = active.get("steps", [])
+    lines = [f"Active plan: {goal} ({progress})"]
+    for s in steps:
+        icon = {
+            "complete": "✓",
+            "blocked": "⊘",
+            "in_progress": "●",
+            "pending": "→",
+        }.get(s.get("status", "pending"), "·")
+        lines.append(f"  {icon} {s['description']}")
+        if s.get("note"):
+            lines.append(f"     note: {s['note']}")
+    return "\n".join(lines)
+
+
+def format_timeline_context() -> str:
+    """Format timeline as natural narrative for the system prompt.
+
+    Reads the dict-format timeline (past/present/future) from disk and
+    produces a concise briefing.
+    """
+    timeline = _load_timeline_dict()
+    narrative: List[str] = ["## Timeline"]
+
+    # Past: last session
+    completed = timeline.get("past", {}).get("completed_sessions", [])
+    recent_session = completed[-1] if completed else None
+    if recent_session:
+        focus = recent_session.get("focus", "—")
+        n_outcomes = len(recent_session.get("outcomes", []))
+        narrative.append(f"Last session focus: {focus}")
+        if n_outcomes:
+            narrative.append(f"Completed {n_outcomes} items.")
+
+    # Past: recent events
+    events = timeline.get("past", {}).get("events", [])
+    recent = events[-3:] if events else []
+    if recent:
+        narrative.append("Recent events:")
+        for e in recent:
+            narrative.append(f"  · {e.get('summary', '—')}")
+
+    # Outcomes
+    outcomes = timeline.get("past", {}).get("outcomes", [])
+    recent_outcomes = outcomes[-2:] if outcomes else []
+    if recent_outcomes:
+        narrative.append("Results:")
+        for o in recent_outcomes:
+            s = f"  · {o.get('summary', '—')}"
+            if o.get("impact"):
+                s += f" ({o['impact']})"
+            narrative.append(s)
+
+    # Present: active context
+    present = timeline.get("present", {})
+    project = present.get("active_project")
+    tasks = present.get("active_tasks", [])
+    waiting = present.get("waiting_for", [])
+    bits = []
+    if project:
+        bits.append(f"project: {project}")
+    if tasks:
+        bits.append(f"tasks: {'; '.join(tasks[:3])}")
+    if waiting:
+        bits.append(f"waiting: {'; '.join(waiting[:2])}")
+    if bits:
+        narrative.append("Current state — " + "; ".join(bits))
+
+    # Commitments
+    commitments = present.get("commitments", [])
+    active_commits = [c for c in commitments if c.get("status") == "active"]
+    if active_commits:
+        narrative.append("Active commitments:")
+        for c in active_commits[:3]:
+            dl = f" (by {c['deadline']})" if c.get("deadline") else ""
+            narrative.append(f"  · {c['what']}{dl}")
+
+    # Future: plan
+    plan_text = format_plan_context()
+    if plan_text:
+        narrative.append(plan_text)
+
+    # Future: goals + predictions
+    future = timeline.get("future", {})
+    goals = future.get("goals", [])
+    if goals:
+        narrative.append(f"Goals: {' → '.join(goals[:3])}")
+    predictions = future.get("predictions", [])
+    if predictions:
+        last_pred = predictions[-1]
+        tf = f" [{last_pred.get('timeframe', '')}]" if last_pred.get("timeframe") else ""
+        conf = f" (confidence: {last_pred.get('confidence', '')})" if last_pred.get("confidence") else ""
+        narrative.append(f"Prediction:{tf} {last_pred.get('text', '')}{conf}")
+
+    return "\n".join(narrative)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Unified context injection — used by system_prompt.py
+# ═══════════════════════════════════════════════════════════════════
+
+def format_orientation_context() -> str:
+    """Format orientation + timeline + self-model + memory + goals for the
+    system prompt.
+
+    Returns a multi-section string that gives the agent cross-session
+    continuity: previous focus, timeline awareness, self-model identity,
+    multi-type memory, and goal status.
+    """
+    parts: List[str] = []
+
+    # Section 1: Session orientation
+    orient = Orientation.load()
+    if orient.focus or orient.data.get("insights") or orient.data.get("next_steps"):
+        parts.append("## Session Orientation")
+        if orient.focus:
+            parts.append(f"Previous focus: {orient.focus}")
+        insights = orient.data.get("insights", [])
+        if insights:
+            parts.append("Recent insights:")
+            for ins in insights[-3:]:
+                parts.append(f"  - {ins}")
+        next_steps = orient.data.get("next_steps", [])
+        if next_steps:
+            parts.append("Unfinished direction:")
+            for step in next_steps[-3:]:
+                parts.append(f"  - {step}")
+
+    # Section 2: Timeline
+    tl = format_timeline_context()
+    if tl and tl != "## Timeline":
+        parts.append(tl)
+
+    # Section 3: Multi-type Memory
+    mem = Memory.load()
+    mem_str = mem.format_context()
+    if mem_str:
+        parts.append(f"## Recent Memories\n{mem_str}")
+
+    # Section 4: Self-generated Goals
+    goals = Goals.load()
+    goals_str = goals.format_context()
+    if goals_str:
+        parts.append(goals_str)
+
+    # Section 5: Self Model
+    sm = SelfModel.load()
+    sm_parts: List[str] = ["## Self Model"]
+    sm_parts.append(
+        f"Identity: {sm.identity.get('name', '—')} — {sm.identity.get('role', '—')}"
+    )
+    ver = sm.state.get("evolution_version", 0)
+    gap = sm.state.get("current_gap_focus")
+    gap_str = f", current gap focus: {gap}" if gap else ""
+    sm_parts.append(f"Evolution: v{ver}{gap_str}")
+    weaknesses = sm.capabilities.get("weaknesses", [])
+    if weaknesses:
+        sm_parts.append(f"Known weaknesses: {'; '.join(weaknesses[:3])}")
+    unknowns = sm.capabilities.get("unknown_areas", [])
+    if unknowns:
+        sm_parts.append(f"Areas to learn: {'; '.join(unknowns[:3])}")
+    project = sm.data.get("commitments", {}).get("current_project")
+    if project:
+        sm_parts.append(f"Committed to: {project}")
+    parts.append("\n".join(sm_parts))
+
+    if not parts:
+        return ""
+
+    return "\n\n".join(parts)
