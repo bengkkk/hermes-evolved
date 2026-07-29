@@ -600,6 +600,114 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _prune_self_model(sm: Dict[str, Any]) -> int:
+    """Remove stale/duplicate entries from self-model to keep prompts clean.
+
+    The daemon accumulates noise over many cycles: old weaknesses that refer
+    to already-fixed bugs, near-duplicate entries, and stale commitments.
+    This function prunes them automatically after each cycle.
+
+    Pruning rules:
+      1. **Weaknesses**: Remove near-duplicates (keep first occurrence of each
+         semantic duplicate), and cap at 8 entries (not 10) to leave room
+         for new LLM-generated weaknesses.
+      2. **Promised features**: Only keep the 8 most recent commitments.
+      3. **Unknown areas**: Remove near-duplicates and cap at 8 entries.
+
+    Returns:
+        Number of entries removed across all categories.
+    """
+    caps = sm.setdefault("capabilities", {})
+    removed = 0
+
+    # ── 1. Deduplicate weaknesses ──
+    weaknesses: list = caps.get("weaknesses", [])
+    if weaknesses:
+        # Use re-import of _is_near_duplicate logic inline to avoid
+        # coupling on the nested function's scope.  Simplified version:
+        cleaned: list[str] = []
+        for w in weaknesses:
+            is_dup = False
+            w_lower = w.lower().strip()
+            for existing in cleaned:
+                e_lower = existing.lower().strip()
+                # Exact or substring match
+                if w_lower == e_lower:
+                    is_dup = True
+                    break
+                if len(w_lower) >= 4 and len(e_lower) >= 4:
+                    if w_lower in e_lower or e_lower in w_lower:
+                        is_dup = True
+                        break
+                # Word overlap > 50%
+                _STOP = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
+                                   "at", "to", "for", "of", "with", "by", "from", "is",
+                                   "it", "as", "be", "this", "that", "not", "no", "how"})
+                w_words = {x for x in w_lower.split() if x not in _STOP}
+                e_words = {x for x in e_lower.split() if x not in _STOP}
+                if w_words and e_words:
+                    overlap = len(w_words & e_words)
+                    if overlap / max(len(w_words), len(e_words)) > 0.5:
+                        is_dup = True
+                        break
+            if not is_dup:
+                cleaned.append(w)
+            else:
+                removed += 1
+        caps["weaknesses"] = cleaned[-8:]  # cap at 8
+
+    # ── 2. Cap promised_features ──
+    commits = sm.setdefault("commitments", {})
+    pf: list = commits.get("promised_features", [])
+    if len(pf) > 8:
+        removed += len(pf) - 8
+        commits["promised_features"] = pf[-8:]
+
+    # ── 3. Deduplicate unknown_areas (exact + substring + word-overlap, same as weaknesses) ──
+    unknowns: list = caps.get("unknown_areas", [])
+    if unknowns:
+        cleaned_u: list[str] = []
+        for u in unknowns:
+            is_dup = False
+            u_lower = u.lower().strip()
+            for existing in cleaned_u:
+                e_lower = existing.lower().strip()
+                if u_lower == e_lower:
+                    is_dup = True
+                    break
+                if len(u_lower) >= 4 and len(e_lower) >= 4:
+                    if u_lower in e_lower or e_lower in u_lower:
+                        is_dup = True
+                        break
+                # Word overlap > 50%
+                _STOP_U = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
+                                     "at", "to", "for", "of", "with", "by", "from", "is",
+                                     "it", "as", "be", "this", "that", "not", "no", "how"})
+                u_words = {x for x in u_lower.split() if x not in _STOP_U}
+                e_words = {x for x in e_lower.split() if x not in _STOP_U}
+                if u_words and e_words:
+                    overlap = len(u_words & e_words)
+                    if overlap / max(len(u_words), len(e_words)) > 0.5:
+                        is_dup = True
+                        break
+            if not is_dup:
+                cleaned_u.append(u)
+            else:
+                removed += 1
+        caps["unknown_areas"] = cleaned_u[-8:]  # cap at 8
+
+    if removed > 0:
+        logger.info(
+            "Pruned %d stale/duplicate entries from self-model "
+            "(weaknesses=%d, commitments=%d, unknowns=%d)",
+            removed,
+            len(caps.get("weaknesses", [])),
+            len(commits.get("promised_features", [])),
+            len(caps.get("unknown_areas", [])),
+        )
+    return removed
+
+
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
     tl = state.get("timeline", load_timeline())
@@ -939,6 +1047,12 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     wm.save()
                 except Exception as e:
                     logger.warning("Failed to save world model: %s", e)
+    # ── Self-model pruning: remove stale/duplicate entries ──
+    try:
+        _prune_self_model(sm)
+    except Exception as e:
+        logger.warning("Self-model pruning failed (non-blocking): %s", e)
+
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")
     focus_next = result.get("focus_next", "")

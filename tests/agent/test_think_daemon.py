@@ -985,3 +985,122 @@ class TestAutoDetectProviderFromEnv:
         assert td._RUNTIME_INITIALIZED
         assert td._RUNTIME_PROVIDER == "opencode-go"
         assert td._RUNTIME_MODEL == "glm-5"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Self-model pruning (_prune_self_model)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPruneSelfModel:
+    """_prune_self_model removes stale/duplicate entries from self-model."""
+
+    def test_empty_sm_no_changes(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {"capabilities": {}, "commitments": {}}
+        removed = td._prune_self_model(sm)
+        assert removed == 0
+
+    def test_no_duplicates_keeps_all_within_cap(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "widget prediction has high error (avg 0.85)",
+                    "shell actions timeout on large outputs",
+                    "git push fails on auth",
+                ],
+                "unknown_areas": [
+                    "How to deploy to production",
+                ],
+            },
+            "commitments": {
+                "promised_features": [
+                    "Fix widget prediction",
+                    "Add retry for shell timeout",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        assert removed == 0
+        assert len(sm["capabilities"]["weaknesses"]) == 3
+        assert len(sm["capabilities"]["unknown_areas"]) == 1
+        assert len(sm["commitments"]["promised_features"]) == 2
+
+    def test_deduplicates_near_duplicate_weaknesses(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Prediction calibration needs more shell samples",
+                    "Prediction calibration needs more samples for shell",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        assert removed == 1, "Expected 1 weakness removed as duplicate"
+        assert len(sm["capabilities"]["weaknesses"]) == 1
+
+    def test_caps_commitments_to_eight(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {"weaknesses": []},
+            "commitments": {
+                "promised_features": [f"Commitment {i}" for i in range(15)],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        assert removed == 7, "Expected 7 commitments removed (15→8)"
+        assert len(sm["commitments"]["promised_features"]) == 8
+        assert sm["commitments"]["promised_features"] == [
+            "Commitment 7", "Commitment 8", "Commitment 9",
+            "Commitment 10", "Commitment 11", "Commitment 12",
+            "Commitment 13", "Commitment 14",
+        ]
+
+    def test_deduplicates_unknown_areas(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [],
+                "unknown_areas": [
+                    "How to inject orientation into system prompt here",
+                    "inject orientation into the system prompt here",
+                    "A completely different unknown area",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        # First and second share >50% word overlap → 1 removed
+        assert removed == 1
+        assert len(sm["capabilities"]["unknown_areas"]) == 2
+
+    def test_exact_match_deduplication(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Same exact text multiple",
+                    "Same exact text multiple",
+                    "A third unique weakness",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        assert removed == 1
+        assert len(sm["capabilities"]["weaknesses"]) == 2
+        assert sm["capabilities"]["weaknesses"][0] == "Same exact text multiple"
+
+    def test_substring_deduplication(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Insufficient install_package samples (n=2) for reliable calibration",
+                    "Insufficient install_package samples",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm)
+        assert removed == 1
+        assert len(sm["capabilities"]["weaknesses"]) == 1
