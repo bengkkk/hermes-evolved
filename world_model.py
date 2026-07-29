@@ -133,7 +133,8 @@ def _compute_prediction_error(
     informational_nonerror = bool(re.search(
         r"(nothing to commit|working tree clean|already up.to.date|"
         r"no changes|nothing changed|nothing to do|"
-        r"0 files changed|0 insertions|0 deletions)",
+        r"0 files changed|0 insertions|0 deletions|"
+        r"requirement already satisfied|already installed)",
         a_lower,
     ))
     if informational_nonerror:

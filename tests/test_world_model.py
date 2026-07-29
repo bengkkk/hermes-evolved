@@ -221,14 +221,12 @@ class TestComputePredictionError:
 
     def test_install_package_already_installed(self):
         """pip install with already-satisfied output.
-        This output has NO success keywords in the list (satisfied ≠ succeeded)
-        and NO exit= marker — falls through to bigram/token → high error.
-        A known limitation: 'Requirement already satisfied' isn't recognized
-        as success by current heuristics. The fix is to ensure the actual
-        output from subprocess.run includes 'exit=0:' prefix.
+        'Requirement already satisfied' is now recognized as an
+        informational non-error (0.15), matching the semantic success
+        of the install command.
         """
         err = _compute_prediction_error("install pytest", "Requirement already satisfied: pytest")
-        assert 0.5 <= err <= 1.0
+        assert err == pytest.approx(0.15, abs=0.01)
 
     def test_shell_list_dir(self):
         """Shell directory listing."""
