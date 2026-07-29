@@ -825,7 +825,8 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 if amsg:
                     subprocess.run(["git", "add", "-A"], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
                     r = subprocess.run(["git", "commit", "-m", amsg], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
-                    action_output = r.stdout[:200]
+                    rv = (r.stdout[:200] + "\n" + r.stderr[:100])[:250]
+                    action_output = f"exit={r.returncode}: {rv}"
                     _add_ep("action", "Commit: " + amsg[:60], action_output)
             elif atype == "install_package":
                 apkg = act.get("package", "")
