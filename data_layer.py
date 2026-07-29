@@ -233,7 +233,19 @@ class Timeline:
 
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "timeline.json"
+        """Path to the events list file.
+
+        NOTE: This is a SEPARATE file (``timeline_events.json``) from the
+        dict-format timeline (``timeline.json``) used by
+        :func:`load_timeline_dict` / :func:`_load_timeline_dict`.  The two
+        APIs share the same base name but are incompatible formats — the
+        Timeline class stores a simple event list ``{"version": 2,
+        "events": [...]}`` while the dict format stores ``{"version": 1,
+        "past": {...}, "present": {...}, "future": {...}}``.  Using
+        separate filenames prevents accidental corruption when both APIs
+        are active in the same data directory.
+        """
+        return _EVOLVE_DIR / "timeline_events.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         """Persist all events as a versioned JSON dict.
@@ -241,6 +253,9 @@ class Timeline:
         Uses atomic write (``.tmp`` → final) for crash safety.
         Writes via :meth:`to_dict` so the versioned format is consistent
         with :meth:`from_dict` and :meth:`load`.
+
+        Writes to ``timeline_events.json`` (separate from the dict-format
+        ``timeline.json`` used by the structured timeline functions).
         """
         target = path or self.storage_path()
         _atomic_write(target, self.to_dict())
