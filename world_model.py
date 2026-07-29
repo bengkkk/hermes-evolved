@@ -107,15 +107,52 @@ def _compute_prediction_error(
     if e_lower in a_lower or a_lower in e_lower:
         return 0.25
 
+    # ── Write-file outcome heuristic ──
+    # Hermes's write_file tool output: "Wrote <path> (<N> bytes)" or
+    # "Created <path>", "Written <N> bytes to <path>"
+    # If actual says the file was written and expected mentions the filename,
+    # treat as a successful write (low error).
+    file_write_match = re.match(
+        r'(wrote|created|written|appended|overwrote)\s+(.+?)(?:\s*\(|$)',
+        a_lower,
+    )
+    if file_write_match:
+        file_path = file_write_match.group(2).strip().rstrip(".")
+        # If expected mentions the file path, it's a successful write
+        if file_path and file_path in e_lower:
+            return 0.15
+        # File was written but expected didn't name it — partial match
+        return 0.25
+
+    # ── Shell/Tool success indicators ──
+    # Many Hermes shell outputs start with "exit=N:" or contain outcome
+    # language like "N passed", "N failed", "Traceback" etc.
+    tool_failure = bool(re.search(
+        r'\b(traceback|error|failed|permission denied|not found|no such)\b',
+        a_lower,
+    ))
+    tool_success = bool(re.search(
+        r'\b(passed|succeeded|ok|complete|done)\b',
+        a_lower,
+    ))
+    if tool_failure and not tool_success:
+        return 0.85  # Tool reported failure
+    if tool_success and not tool_failure:
+        return 0.15  # Tool reported success
+
     # ── Exit-code aware comparison ──
-    # Actual output often starts with "exit=N:" — check if exit code
+    # Actual output often contains "exit=N:" — check if exit code
     # correlates with expected success/failure keywords
     exit_match = re.search(r'exit=(\d+)', a_lower)
     if exit_match:
         exit_code = int(exit_match.group(1))
         success_expected = any(kw in e_lower for kw in
             ('success', 'complete', 'create', 'write', 'deploy', 'install',
-             'commit', 'push', 'run', 'list', 'show', 'print'))
+             'commit', 'push', 'run', 'list', 'show', 'print',
+             'pass', 'test', 'status', 'check', 'git', 'file',
+             'read', 'done', 'build', 'fix', 'fetch', 'merge',
+             'pull', 'add', 'update', 'find', 'search', 'info',
+             'log', 'clean', 'set', 'get', 'patch', 'branch', 'diff'))
         if success_expected and exit_code == 0:
             # Expected success and got success — low error
             return 0.15
