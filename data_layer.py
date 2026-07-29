@@ -31,6 +31,7 @@ override via HERMES_EVOLVE_DIR env var.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -299,7 +300,7 @@ class SelfModel:
 
     def __init__(self, data: Optional[Dict[str, Any]] = None):
         self.data: Dict[str, Any] = (
-            self._merge_defaults(data) if data else dict(SelfModel._DEFAULT_DATA)
+            self._merge_defaults(data) if data else copy.deepcopy(SelfModel._DEFAULT_DATA)
         )
 
     # ── Internal ──────────────────────────────────────────────────
@@ -544,7 +545,7 @@ class Memory:
     """
 
     def __init__(self, data: Optional[Dict[str, Any]] = None):
-        self.data: Dict[str, Any] = data if data else dict(_DEFAULT_MEMORY)
+        self.data: Dict[str, Any] = data if data else copy.deepcopy(_DEFAULT_MEMORY)
 
     # ── Episodic ───────────────────────────────────────────────────
 
@@ -766,7 +767,7 @@ class Goals:
     """
 
     def __init__(self, data: Optional[Dict[str, Any]] = None):
-        self.data: Dict[str, Any] = data if data else dict(_DEFAULT_GOALS)
+        self.data: Dict[str, Any] = data if data else copy.deepcopy(_DEFAULT_GOALS)
 
     def propose(
         self,
