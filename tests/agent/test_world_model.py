@@ -267,7 +267,7 @@ class TestPersistence:
             loaded = WorldModel.load(path)
             assert len(loaded.data["action_triples"]) == 1
             assert len(loaded.data["predictions"]) == 1
-            assert loaded.data["version"] == 2
+            assert loaded.data["version"] == 3
         finally:
             path.unlink(missing_ok=True)
 
@@ -303,6 +303,150 @@ class TestPersistence:
             assert len(loaded.data["action_triples"]) == 1
         finally:
             path.unlink(missing_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Per-type accuracy and confidence calibration
+# ═══════════════════════════════════════════════════════════════════
+
+class TestPerTypeAccuracy:
+    """Per-action-type prediction error tracking."""
+
+    def test_updates_on_action_complete(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "ls", "list files")
+        wm.complete_action(tid, "exit=0: ok")
+        pta = wm.get_per_type_accuracy()
+        assert "shell" in pta
+        assert pta["shell"]["count"] == 1
+        assert 0 <= pta["shell"]["avg_error"] <= 1.0
+
+    def test_multiple_types_tracked_separately(self) -> None:
+        wm = WorldModel()
+        tid1 = wm.record_action("shell", "build", "should build")
+        wm.complete_action(tid1, "exit=0: built")
+        tid2 = wm.record_action("write_file", "create config", "write config")
+        wm.complete_action(tid2, "wrote config")
+        pta = wm.get_per_type_accuracy()
+        assert "shell" in pta
+        assert "write_file" in pta
+
+    def test_avg_error_aggregates_correctly(self) -> None:
+        wm = WorldModel()
+        # Two shell actions: one perfect (0.0), one bad (1.0) → avg 0.5
+        tid1 = wm.record_action("shell", "exact", "same text")
+        wm.complete_action(tid1, "same text")
+        tid2 = wm.record_action("shell", "mismatch", "one thing")
+        wm.complete_action(tid2, "completely different")
+        pta = wm.get_per_type_accuracy()
+        assert pta["shell"]["count"] == 2
+        assert 0.45 <= pta["shell"]["avg_error"] <= 0.55
+
+    def test_min_max_range(self) -> None:
+        wm = WorldModel()
+        tid1 = wm.record_action("shell", "exact", "same")
+        wm.complete_action(tid1, "same")  # error = 0.0
+        tid2 = wm.record_action("shell", "mismatch", "aaa")
+        wm.complete_action(tid2, "bbb")   # error ~ 1.0
+        pta = wm.get_per_type_accuracy()
+        assert pta["shell"]["min_error"] <= 0.01
+        assert pta["shell"]["max_error"] >= 0.9
+
+    def test_unknown_type_returns_empty(self) -> None:
+        wm = WorldModel()
+        pta = wm.get_per_type_accuracy()
+        assert "nonexistent" not in pta
+        assert len(pta) == 0
+
+
+class TestConfidenceAdjustment:
+    """adjust_confidence uses historical accuracy to calibrate estimates."""
+
+    def test_no_data_returns_raw(self) -> None:
+        wm = WorldModel()
+        # No actions recorded → no per-type data → should return close to raw
+        adjusted = wm.adjust_confidence(0.8, "shell")
+        assert 0.6 <= adjusted <= 0.9
+
+    def test_low_error_type_increases_confidence(self) -> None:
+        wm = WorldModel()
+        # Record 2 shell actions with perfect predictions
+        tid1 = wm.record_action("shell", "exact", "same text")
+        wm.complete_action(tid1, "same text")
+        tid2 = wm.record_action("shell", "exact2", "exact2 data")
+        wm.complete_action(tid2, "exact2 data")
+        # Low error type → adjustment should increase confidence
+        adjusted = wm.adjust_confidence(0.5, "shell")
+        assert adjusted >= 0.5, f"Expected ≥ 0.5, got {adjusted}"
+
+    def test_high_error_type_decreases_confidence(self) -> None:
+        wm = WorldModel()
+        # Record 3 shell actions with bad predictions
+        for i in range(3):
+            tid = wm.record_action("shell", f"mismatch{i}", "completely wrong expected")
+            wm.complete_action(tid, "totally different actual")
+        adjusted = wm.adjust_confidence(0.9, "shell")
+        assert adjusted <= 0.8, f"Expected ≤ 0.8, got {adjusted}"
+
+    def test_adjustment_without_type_uses_global(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "test", "expected result")
+        wm.complete_action(tid, "exit=0: ok")
+        adjusted = wm.adjust_confidence(0.7)
+        assert 0 <= adjusted <= 1.0
+
+    def test_confidence_clamped(self) -> None:
+        wm = WorldModel()
+        assert 0.0 <= wm.adjust_confidence(-0.5) <= 1.0
+        assert 0.0 <= wm.adjust_confidence(1.5) <= 1.0
+
+
+class TestCalibrationGuidance:
+    """format_calibration_guidance shows per-type accuracy for the LLM."""
+
+    def test_empty_when_no_data(self) -> None:
+        wm = WorldModel()
+        cal = wm.format_calibration_guidance()
+        assert "No per-type calibration" in cal
+
+    def test_shows_multiple_types(self) -> None:
+        wm = WorldModel()
+        tid1 = wm.record_action("shell", "build", "should build")
+        wm.complete_action(tid1, "exit=0: built")
+        tid2 = wm.record_action("write_file", "create", "write file")
+        wm.complete_action(tid2, "wrote file")
+        cal = wm.format_calibration_guidance()
+        assert "shell" in cal
+        assert "write_file" in cal
+        assert "Best predicted" in cal or "Worst predicted" in cal
+
+    def test_identifies_best_and_worst(self) -> None:
+        wm = WorldModel()
+        # shell = good predictions
+        for i in range(3):
+            tid = wm.record_action("shell", f"exact{i}", "same text")
+            wm.complete_action(tid, "same text")
+        # git_commit = bad predictions
+        for i in range(3):
+            tid = wm.record_action("git_commit", f"mismatch{i}", "x")
+            wm.complete_action(tid, "y")
+        cal = wm.format_calibration_guidance()
+        assert "Best predicted" in cal
+        assert "shell" in cal or "git_commit" in cal  # one is best, one worst
+
+    def test_context_format_includes_calibration(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "test action", "expected")
+        wm.complete_action(tid, "exit=0: done")
+        ctx = wm.format_world_model_context()
+        assert "Per-type prediction" in ctx or "prediction accuracy" in ctx
+
+    def test_prediction_insight_shows_type_count(self) -> None:
+        wm = WorldModel()
+        tid = wm.record_action("shell", "test", "expected")
+        wm.complete_action(tid, "exit=0: ok")
+        insight = wm.format_prediction_insight()
+        assert "action types" in insight or "no predictions" in insight
 
 
 # ═══════════════════════════════════════════════════════════════════

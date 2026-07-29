@@ -925,10 +925,13 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # 5.5 World Model: record prediction if LLM made one
     pred = parsed.get("prediction")
     if pred and isinstance(pred, dict) and pred.get("text"):
+        raw_conf = pred.get("confidence", 0.5)
+        # Adjust confidence based on historical per-type calibration
+        adjusted_conf = wm.adjust_confidence(raw_conf)
         wm.record_prediction(
             text=pred["text"],
             timeframe=pred.get("timeframe"),
-            confidence=pred.get("confidence", 0.5),
+            confidence=adjusted_conf,
             basis=pred.get("basis", ""),
         )
         wm.save()

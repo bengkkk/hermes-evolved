@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ── Schema ────────────────────────────────────────────────────────
 
 _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
-    "version": 2,
+    "version": 3,
     "action_triples": [],       # List[ActionTriple]
     "predictions": [],          # List[Prediction]
     "prediction_accuracy": {    # Running statistics
@@ -51,6 +51,7 @@ _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
         "calibration_buckets": [],  # confidence vs accuracy per bucket
     },
     "discrepancy_patterns": [],  # Recurring categories of prediction failure
+    "per_type_accuracy": {},     # Action-type → stats for calibration
 }
 
 
@@ -464,6 +465,12 @@ class WorldModel:
         if not any([total_preds, total_trips, recent, discrepancies, unverified]):
             parts.append("  (world model is empty — start by taking actions and making predictions)")
 
+        # ── Calibration guidance (per-type accuracy) ──
+        cal = self.format_calibration_guidance()
+        if cal and "No per-type" not in cal:
+            parts.append("")
+            parts.append(cal)
+
         return "\n".join(parts)
 
     def format_prediction_insight(self) -> str:
@@ -472,9 +479,14 @@ class WorldModel:
         total = acc.get("total_predictions", 0)
         verified = acc.get("verified_predictions", 0)
         correct = acc.get("correct_predictions", 0)
+        per_type = self.get_per_type_accuracy()
+        types_count = len(per_type)
         if verified > 0:
             pct = round(correct / verified * 100)
-            return f"Prediction accuracy: {pct}% ({correct}/{verified} verified, {total} total)"
+            base = f"Prediction accuracy: {pct}% ({correct}/{verified} verified, {total} total)"
+            if types_count > 0:
+                base += f", tracked {types_count} action types for calibration"
+            return base
         if total > 0:
             return f"Prediction accuracy: {total} predictions made, none verified yet"
         return "Prediction accuracy: no predictions made yet"
@@ -493,6 +505,9 @@ class WorldModel:
             errors = [t["prediction_error"] for t in completed]
             acc["avg_triple_error"] = round(sum(errors) / len(errors), 4)
 
+        # Also refresh per-type accuracy whenever stats are recalculated
+        self._update_per_type_accuracy()
+
     def _update_calibration(self, confidence: float, error: float) -> None:
         """Track confidence vs accuracy for calibration curve."""
         acc = self.data.setdefault("prediction_accuracy", {})
@@ -509,6 +524,172 @@ class WorldModel:
         bucket["avg_error"] = round(
             bucket["total_error"] / bucket["count"], 4
         )
+
+    # ── Per-type accuracy (for adaptive confidence calibration) ─────
+
+    def _update_per_type_accuracy(self) -> None:
+        """Recalculate per-action-type prediction error statistics.
+
+        Called automatically after every :meth:`complete_action` and
+        :meth:`verify_prediction`. Groups completed action triples by
+        ``action_type`` and computes count, avg_error, min, max for each.
+        Stores results in ``data["per_type_accuracy"]``.
+        """
+        triples = [
+            t for t in self.data.get("action_triples", [])
+            if t.get("completed") and t.get("prediction_error") is not None
+        ]
+        by_type: Dict[str, Dict[str, Any]] = {}
+        for t in triples:
+            atype = t.get("action_type", "unknown")
+            err = t["prediction_error"]
+            if atype not in by_type:
+                by_type[atype] = {
+                    "count": 0,
+                    "sum_error": 0.0,
+                    "min_error": 1.0,
+                    "max_error": 0.0,
+                }
+            s = by_type[atype]
+            s["count"] += 1
+            s["sum_error"] += err
+            if err < s["min_error"]:
+                s["min_error"] = err
+            if err > s["max_error"]:
+                s["max_error"] = err
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for atype, stats in by_type.items():
+            c = stats["count"]
+            result[atype] = {
+                "count": c,
+                "avg_error": round(stats["sum_error"] / c, 4),
+                "min_error": round(stats["min_error"], 4),
+                "max_error": round(stats["max_error"], 4),
+            }
+        self.data["per_type_accuracy"] = result
+
+    def get_per_type_accuracy(self) -> Dict[str, Dict[str, Any]]:
+        """Return per-action-type prediction error statistics.
+
+        Returns a dict mapping action_type → {
+            "count": int,          # How many triples of this type
+            "avg_error": float,    # Average prediction error (0.0–1.0)
+            "min_error": float,    # Best prediction error
+            "max_error": float,    # Worst prediction error
+        }
+
+        Useful for calibrating confidence: types with low ``avg_error``
+        are well-modelled; types with high ``avg_error`` need
+        conservative confidence estimates.
+        """
+        return dict(self.data.get("per_type_accuracy", {}))
+
+    def adjust_confidence(
+        self,
+        raw_confidence: float,
+        action_type: Optional[str] = None,
+    ) -> float:
+        """Adjust a raw confidence estimate using historical accuracy.
+
+        When *action_type* is provided, uses per-type historical error
+        rates to adjust confidence. Falls back to global avg triple
+        error when the type is unknown or not provided.
+
+        The adjustment follows a simple rule:
+          - If the type's avg_error is low (<0.25), confidence is
+            *increased* toward 1.0 by a proportional amount.
+          - If the type's avg_error is high (>0.4), confidence is
+            *decreased* toward 0.0.
+          - Otherwise, confidence is left largely unchanged.
+
+        When there is no historical data for the type and no global
+        data either, returns the raw confidence unchanged (no basis
+        for adjustment).
+
+        Args:
+            raw_confidence: The raw LLM confidence (0.0–1.0).
+            action_type: The action type (e.g. ``"shell"``, ``"write_file"``).
+
+        Returns:
+            Adjusted confidence (0.0–1.0), clamped to valid range.
+        """
+        if not (0.0 <= raw_confidence <= 1.0):
+            raw_confidence = max(0.0, min(1.0, raw_confidence))
+
+        # Determine the error to use for adjustment
+        per_type = self.get_per_type_accuracy()
+        total_triples = self.data.get("prediction_accuracy", {}).get("total_triples", 0)
+
+        if action_type and action_type in per_type:
+            avg_err = per_type[action_type]["avg_error"]
+            count = per_type[action_type]["count"]
+            # Low sample count → conservative adjustment (blend with global)
+            if count < 3:
+                blend = count / 3.0  # 0 → 1 as samples grow
+                global_avg = self.data.get("prediction_accuracy", {}).get(
+                    "avg_triple_error", 0.5
+                )
+                avg_err = avg_err * blend + global_avg * (1.0 - blend)
+        elif total_triples > 0:
+            # Have global data but no per-type — use global average
+            acc = self.data.get("prediction_accuracy", {})
+            avg_err = acc.get("avg_triple_error", 0.5)
+        else:
+            # No data at all — nothing to calibrate with
+            return raw_confidence
+
+        # Adjustment factor: scale from error space to confidence space
+        # When avg_err is 0.0 → adjustment pulls confidence toward 1.0
+        # When avg_err is 1.0 → adjustment pulls confidence toward 0.0
+        # The strength of adjustment is proportional to error distance from 0.5
+        adjustment_strength = abs(avg_err - 0.5) * 2.0  # 0.0 → 1.0
+
+        # Target confidence: 1.0 for low-error types, 0.0 for high-error
+        target = 1.0 - avg_err
+
+        # Blend raw and adjusted
+        adjusted = raw_confidence * (1.0 - adjustment_strength) + target * adjustment_strength
+
+        return max(0.0, min(1.0, round(adjusted, 4)))
+
+    def format_calibration_guidance(self) -> str:
+        """Generate a calibration context block for the LLM prompt.
+
+        Shows which action types are well-predicted vs poorly-predicted,
+        and suggests how to adjust confidence estimates.
+        """
+        per_type = self.get_per_type_accuracy()
+        if not per_type:
+            return "  No per-type calibration data yet."
+
+        lines: List[str] = ["  Per-type prediction accuracy:"]
+        # Sort by avg_error descending (worst first)
+        sorted_types = sorted(per_type.items(), key=lambda x: x[1]["avg_error"], reverse=True)
+
+        for atype, stats in sorted_types:
+            err = stats["avg_error"]
+            count = stats["count"]
+            icon = "✓" if err <= 0.25 else ("△" if err <= 0.4 else "✗")
+            lines.append(
+                f"    {icon} {atype}: avg_err={err:.2f} "
+                f"(n={count}, range={stats['min_error']:.2f}–{stats['max_error']:.2f})"
+            )
+
+        # Identify best/worst predicted types
+        if sorted_types:
+            worst_type, worst_stats = sorted_types[0]
+            best_type, best_stats = sorted_types[-1]
+            lines.append(
+                f"    → Best predicted: {best_type} "
+                f"(err={best_stats['avg_error']:.2f}, n={best_stats['count']})"
+            )
+            lines.append(
+                f"    → Worst predicted: {worst_type} "
+                f"(err={worst_stats['avg_error']:.2f}, n={worst_stats['count']})"
+            )
+
+        return "\n".join(lines)
 
     # ── Persistence ───────────────────────────────────────────────
 
