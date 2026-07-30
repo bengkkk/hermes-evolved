@@ -1647,7 +1647,9 @@ def _bridge_world_model_to_self_model(
     that no longer match current patterns (e.g. a type's error dropped below
     the threshold).
 
-    Returns the number of weaknesses added (or 0 if unchanged).
+    Returns the number of weaknesses added (or 0 if unchanged). Use a
+    negative return value to indicate a *net reduction* (stale auto-weaknesses
+    were cleaned up).
 
     Rules:
       - Only creates weaknesses for patterns with ``count >= 2`` AND
@@ -1681,10 +1683,54 @@ def _bridge_world_model_to_self_model(
             if weakness_text not in new_auto:
                 new_auto.append(weakness_text)
 
-    # Merge: manual weaknesses first, then new auto weaknesses
-    merged = list(manual)
+    # ── Remove stale auto-weaknesses ──
+    # Any auto-generated weakness whose action_type no longer has a matching
+    # discrepancy pattern (error >= 0.4, count >= 2) is stale and gets
+    # cleaned up.  This is the dynamic version of the hardcoded regexes in
+    # _prune_self_model — it adapts to changing prediction accuracy without
+    # manual pattern updates.
+    #
+    # Build a set of action_types that STILL need auto-weaknesses.
+    active_auto_types: set[str] = set()
+    for p in patterns:
+        atype = p.get("action_type", "?")
+        count = p.get("count", 0)
+        avg_err = p.get("avg_error", 0.0)
+        if count >= 2 and avg_err >= 0.4:
+            active_auto_types.add(atype)
+
+    # Also check the world model's per_type_accuracy for any type that may
+    # have high error but too few samples for a discrepancy pattern yet.
+    # This handles the edge case where a type has high error but <2 samples.
+    for atype, stats in wm.get_per_type_accuracy().items():
+        if stats.get("avg_error", 0) >= 0.4:
+            active_auto_types.add(atype)
+
+    # new_auto only contains patterns that meet the current threshold
+    # (count >= 2, avg_error >= 0.4), so all are still active by definition.
+    still_auto = list(new_auto)
+    stale_removed = 0
+
+    # ── Now match EXISTING auto-weaknesses against active_auto_types ──
+    # An existing auto-weakness for a type that is no longer in
+    # active_auto_types is stale and gets removed from the manual list.
+    cleaned_manual: list[str] = []
+    for w in manual:
+        if w.startswith(auto_prefix):
+            # Extract type from existing auto-weakness
+            parts = w.split(" ")
+            auto_w_type = parts[2] if len(parts) > 2 else ""
+            if auto_w_type in active_auto_types:
+                cleaned_manual.append(w)
+            else:
+                stale_removed += 1
+        else:
+            cleaned_manual.append(w)
+
+    # Merge: cleaned manual weaknesses first, then new auto weaknesses
+    merged = list(cleaned_manual)
     added = 0
-    for w in new_auto:
+    for w in still_auto:
         if w not in merged:
             merged.append(w)
             added += 1
@@ -1692,12 +1738,24 @@ def _bridge_world_model_to_self_model(
     # Cap at 10
     sm["capabilities"]["weaknesses"] = merged[-10:]
 
+    net_change = added - stale_removed
+    if stale_removed > 0:
+        logger.info(
+            "Removed %d stale auto-weakness(es) (types no longer high-error: %s)",
+            stale_removed,
+            ", ".join(
+                w.split(" ")[2] if len(w.split(" ")) > 2 else "?"
+                for w in manual
+                if w.startswith(auto_prefix)
+                and (w.split(" ")[2] if len(w.split(" ")) > 2 else "") not in active_auto_types
+            ) or "(unknown)",
+        )
     if added > 0:
         logger.info(
             "Synced %d world model pattern(s) → self-model weaknesses",
             added,
         )
-    return added
+    return net_change
 
 
 # ═════════════════════════════════════════════════════════════════
