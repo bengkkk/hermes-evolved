@@ -1966,8 +1966,10 @@ def _bridge_world_model_to_self_model(
     for w in manual:
         if w.startswith(auto_prefix):
             # Extract type from existing auto-weakness
+            # Format: "Systematic prediction bias: <type> actions have ..."
+            # parts[0]=Systematic parts[1]=prediction parts[2]=bias: parts[3]=<type>
             parts = w.split(" ")
-            auto_w_type = parts[2] if len(parts) > 2 else ""
+            auto_w_type = parts[3] if len(parts) > 3 else ""
             if auto_w_type in active_auto_types:
                 cleaned_manual.append(w)
             else:
@@ -1992,10 +1994,10 @@ def _bridge_world_model_to_self_model(
             "Removed %d stale auto-weakness(es) (types no longer high-error: %s)",
             stale_removed,
             ", ".join(
-                w.split(" ")[2] if len(w.split(" ")) > 2 else "?"
+                w.split(" ")[3] if len(w.split(" ")) > 3 else "?"
                 for w in manual
                 if w.startswith(auto_prefix)
-                and (w.split(" ")[2] if len(w.split(" ")) > 2 else "") not in active_auto_types
+                and (w.split(" ")[3] if len(w.split(" ")) > 3 else "") not in active_auto_types
             ) or "(unknown)",
         )
     if added > 0:
