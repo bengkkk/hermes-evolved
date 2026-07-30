@@ -121,37 +121,70 @@ def _print_cycle_stats() -> None:
 # ── PID lock ─────────────────────────────────────────────────────
 
 def _acquire_daemon_lock() -> bool:
-    """Acquire a PID-based lock to prevent concurrent daemon runs.
+    """Acquire an atomic file lock to prevent concurrent daemon runs.
 
-    Returns True if lock was acquired or already held by this process,
-    False if another daemon is already running.
-    Lock is released automatically on normal shutdown.
+    Uses ``O_CREAT | O_EXCL`` for an atomic create-or-fail so two
+    processes that check at the same wall time cannot both acquire the
+    lock (eliminates the TOCTOU race in the original PID-only check).
+
+    If the lock file exists but its PID is stale (no longer alive),
+    the lock is taken over with another atomic attempt.
+
+    Returns True if lock was acquired, False if another daemon is
+    already running.
     """
     import os as _os
+
     my_pid = _os.getpid()
-    if DAEMON_LOCK_FILE.exists():
+    lock_path_str = str(DAEMON_LOCK_FILE)
+
+    def _try_atomic_create() -> bool:
+        """Atomically create the lock file.  Returns True on success."""
         try:
-            existing_pid = int(DAEMON_LOCK_FILE.read_text().strip())
-            if existing_pid == my_pid:
-                # Lock already held by us — that's fine
-                logger.debug("Daemon lock already held by this PID %d", my_pid)
-                return True
-            # Check if the PID is still alive
-            try:
-                _os.kill(existing_pid, 0)   # signal 0 = test existence
-                logger.warning(
-                    "Daemon lock held by PID %d — skipping concurrent run",
-                    existing_pid,
-                )
-                return False
-            except OSError:
-                # PID no longer exists — stale lock, take it over
-                logger.info("Stale daemon lock (PID %d gone), taking over", existing_pid)
-        except (ValueError, OSError, IOError):
-            logger.warning("Corrupted daemon lock file, overwriting")
-    DAEMON_LOCK_FILE.write_text(str(my_pid))
-    logger.debug("Acquired daemon lock (PID %d)", my_pid)
-    return True
+            fd = _os.open(lock_path_str, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY, 0o644)
+            _os.write(fd, str(my_pid).encode())
+            _os.close(fd)
+            return True
+        except FileExistsError:
+            return False
+
+    # Fast path: try atomic create
+    if _try_atomic_create():
+        logger.debug("Acquired daemon lock (PID %d)", my_pid)
+        return True
+
+    # ── Lock file exists — validate the holder ──
+    try:
+        existing_pid = int(DAEMON_LOCK_FILE.read_text().strip())
+    except (ValueError, OSError, IOError):
+        logger.warning("Corrupted daemon lock file — attempting takeover")
+        try:
+            DAEMON_LOCK_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return _try_atomic_create()
+
+    if existing_pid == my_pid:
+        # Lock already held by us — fine (e.g. --once after daemon)
+        logger.debug("Daemon lock already held by this PID %d", my_pid)
+        return True
+
+    # Check if the PID is still alive
+    try:
+        _os.kill(existing_pid, 0)  # signal 0 = test existence
+        logger.warning(
+            "Daemon lock held by PID %d — skipping concurrent run",
+            existing_pid,
+        )
+        return False
+    except OSError:
+        # PID no longer exists — stale lock, take it over
+        logger.info("Stale daemon lock (PID %d gone), taking over", existing_pid)
+        try:
+            DAEMON_LOCK_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return _try_atomic_create()
 
 
 def _release_daemon_lock() -> None:
@@ -1936,6 +1969,9 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         expired_count = wm.verify_expired_predictions()
         if expired_count > 0:
             logger.info("Auto-verified %d expired predictions", expired_count)
+            # Save immediately so changes persist even if the LLM call fails
+            # or the cycle returns early on parse errors (line 1986).
+            wm.save()
     except Exception as e:
         logger.warning("Auto-verification failed (non-blocking): %s", e)
 
