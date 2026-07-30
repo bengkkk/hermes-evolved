@@ -2444,6 +2444,25 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     except ImportError:
         pass
 
+    # 1.75 Pre-cycle self-model pruning: remove stale/duplicate entries
+    # BEFORE building the prompt, so the LLM never sees stale weaknesses
+    # like "haven't read think_daemon.py" or "orientation injection not done"
+    # which would otherwise reinforce a fixation loop (LLM sees stale entries
+    # and re-adds them via self_model_update, creating a feedback cycle).
+    # Post-cycle pruning in _apply_insights handles new stale entries added
+    # by the LLM in this cycle; this pre-cycle pass ensures the prompt is
+    # clean of accumulated stale debris from previous cycles.
+    try:
+        _pruned = _prune_self_model(sm, daemon_state=ds)
+        if _pruned > 0:
+            logger.info(
+                "Pre-cycle self-model pruning removed %d stale entries "
+                "(prompt will show clean state)",
+                _pruned,
+            )
+    except Exception as e:
+        logger.warning("Pre-cycle self-model pruning failed (non-blocking): %s", e)
+
     # 2. Build prompt
     prompt = _build_thinking_prompt(state)
     messages = [
