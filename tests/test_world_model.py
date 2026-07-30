@@ -683,7 +683,15 @@ class TestExpiredPredictions:
         assert acc["verified_predictions"] >= 1
         assert acc["avg_prediction_error"] == pytest.approx(0.5, abs=0.01)
 
-    def test_expired_prediction_updates_calibration(self):
+    def test_expired_prediction_does_not_pollute_calibration(self):
+        """Auto-verified predictions deliberately skip _update_calibration.
+
+        Auto-verified predictions always get error=0.5 (uncertain), which would
+        pollute calibration buckets with systematic bias — every entry in a given
+        confidence bucket would show error=0.5 regardless of accuracy.
+        Calibration data should only reflect predictions where the system
+        actually observed the outcome (via verify_prediction).
+        """
         wm = WorldModel()
         old_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
         wm.data["predictions"].append({
@@ -697,9 +705,12 @@ class TestExpiredPredictions:
         })
         wm.verify_expired_predictions()
         buckets = wm.data["prediction_accuracy"]["calibration_buckets"]
-        # confidence 0.6 → bucket_idx = min(int(0.6 * 5), 4) = 3
-        assert len(buckets) >= 4
-        assert buckets[3]["count"] >= 1
+        # Calibration buckets should remain empty — auto-verification does not
+        # pollute calibration data with uncertain (0.5) outcomes.
+        assert len(buckets) == 0, (
+            "Calibration buckets must not be populated by auto-verification "
+            "(intentionally skipped to avoid systematic 0.5 bias)"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
