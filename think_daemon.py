@@ -1261,7 +1261,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         logger.error("Could not import Hermes auxiliary_client. Is HERMES_ROOT correct?")
         return None
 
-    max_retries = 3
+    max_retries = 2
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -1274,7 +1274,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     provider=_RUNTIME_PROVIDER or None,
                     model=_RUNTIME_MODEL or None,
                 ),
-                timeout=18.0,  # Per-call timeout: lower = faster retries when API is slow
+                timeout=90.0,  # Per-call timeout: reasoning models can take 30-60s to begin generating
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
