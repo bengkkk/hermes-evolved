@@ -612,6 +612,7 @@ class TestBuildThinkingPrompt:
             "Active tasks:",
             "Active plan:",
             "World Model",
+            "Orientation",
             "Future goals:",
             "Last action result:",
         ]

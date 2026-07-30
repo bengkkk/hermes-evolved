@@ -240,6 +240,9 @@ Daemon health (cycle reliability):
 World Model (prediction accuracy and discrepancy feedback):
 {world_model_context}
 
+Orientation (long-term mission, phase, and remaining gaps):
+{orientation_context}
+
 Future goals:
 {goals_text}
 
@@ -486,6 +489,43 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         logger.warning("Failed to load world model context: %s", e)
         world_model_context = "  (world model unavailable — will be initialized on first action)"
 
+    # ── Orientation context (long-term mission and remaining gaps) ──
+    orient_context_parts = []
+    if orient:
+        vision = orient.get("vision", "")
+        if vision:
+            orient_context_parts.append(f"  Vision: {vision}")
+        phase = orient.get("phase", "")
+        if phase:
+            orient_context_parts.append(f"  Phase: {phase}")
+        target = orient.get("target_identity", {})
+        principles = target.get("core_principles", [])
+        if principles:
+            orient_context_parts.append(
+                "  Principles: " + "; ".join(p[:50] for p in principles)
+            )
+        gaps = orient.get("remaining_gaps", {})
+        if gaps:
+            gap_lines = []
+            for gname, ginfo in sorted(gaps.items()):
+                pri = ginfo.get("priority", "")
+                desc = ginfo.get("description", "")[:80]
+                gap_lines.append(f"    • {gname} [{pri}]: {desc}")
+            if gap_lines:
+                orient_context_parts.append("  Remaining gaps:")
+                orient_context_parts.extend(gap_lines)
+        insights = orient.get("insights", [])
+        if insights:
+            orient_context_parts.append("  Recent insights:")
+            for ins in insights[-3:]:
+                orient_context_parts.append(f"    · {ins[:80]}")
+        next_steps = orient.get("next_steps", [])
+        if next_steps:
+            orient_context_parts.append("  Next steps:")
+            for step in next_steps[-3:]:
+                orient_context_parts.append(f"    → {step[:80]}")
+    orientation_context = "\n".join(orient_context_parts) if orient_context_parts else "  (none loaded)"
+
     # ── Daemon health (failure diagnostics for the LLM) ──
     history = ds.get("cycle_history", [])
     if history:
@@ -524,6 +564,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         last_action_result=last_action_result,
         daemon_health=daemon_health,
         world_model_context=world_model_context,
+        orientation_context=orientation_context,
         goals_text=goals_text,
         workspace_root=_WORKSPACE_ROOT_STR,
     )
