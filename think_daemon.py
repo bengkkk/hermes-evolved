@@ -2357,25 +2357,10 @@ def bootstrap_evolve_data() -> int:
     target = EVOLVE_DIR / "world_model.json"
     if not target.exists():
         try:
-            # Avoid circular import: construct the default dict directly
-            _DEFAULT = {
-                "version": 4,
-                "action_triples": [],
-                "predictions": [],
-                "prediction_accuracy": {
-                    "total_predictions": 0,
-                    "verified_predictions": 0,
-                    "correct_predictions": 0,
-                    "incorrect_predictions": 0,
-                    "avg_prediction_error": 0.0,
-                    "total_triples": 0,
-                    "avg_triple_error": 0.0,
-                    "calibration_buckets": [],
-                    "error_history": [],
-                },
-                "discrepancy_patterns": [],
-                "per_type_accuracy": {},
-            }
+            # Import from world_model (verified non-circular — world_model imports
+            # only from data_layer + stdlib)
+            from world_model import _DEFAULT_WORLD_MODEL as _WM_DEFAULT
+            _DEFAULT = copy.deepcopy(_WM_DEFAULT)
             _json.dump(_DEFAULT, target.open("w"))
             logger.info("Bootstrapped %s", target)
         except Exception as e:
