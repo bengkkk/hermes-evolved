@@ -62,11 +62,11 @@ def get_evolve_dir() -> Path:
     return _EVOLVE_DIR
 
 
-def safe_read_json(path: Path, default: Any = None) -> Any:
+def safe_read_json(path: Union[Path, str], default: Any = None) -> Any:
     """Read and parse a JSON file with resilience.
 
     Args:
-        path: Path to the JSON file.
+        path: Path to the JSON file (Path or str).
         default: Value returned on failure (NOT used for version gating).
 
     Returns:
@@ -80,6 +80,9 @@ def safe_read_json(path: Path, default: Any = None) -> Any:
        (e.g. ``WorldModel.load()``), where the code knows what versions it
        can handle.
     """
+    # Coerce string to Path so callers can pass either type without crashing.
+    if isinstance(path, str):
+        path = Path(path)
     try:
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -102,12 +105,15 @@ def safe_read_json(path: Path, default: Any = None) -> Any:
     return default
 
 
-def safe_write_json(path: Path, data: Any) -> None:
+def safe_write_json(path: Union[Path, str], data: Any) -> None:
     """Atomically write a JSON file with crash safety and error resilience.
 
     Writes to a ``.tmp`` staging file, then renames atomically.
     Logs a warning on failure instead of raising.
     """
+    # Coerce string to Path so callers can pass either type without crashing.
+    if isinstance(path, str):
+        path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
