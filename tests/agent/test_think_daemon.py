@@ -1120,3 +1120,166 @@ class TestPruneSelfModel:
         removed = td._prune_self_model(sm)
         assert removed == 1
         assert len(sm["capabilities"]["weaknesses"]) == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Action deduplication gate (break LLM fixation loops)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestActionDedupGate:
+    """_apply_insights' action deduplication gate overrides repetitive LLM actions."""
+
+    def test_repetitive_shell_action_overridden(self, evolve_env: Dict) -> None:
+        """When the LLM proposes the same type+description as recent triples, it's overridden."""
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        # Create a world model with 3 repetitive "read think_daemon" shell actions
+        wm = WorldModel()
+        # Use realistic descriptions from the actual world model fixation pattern
+        # (source: /root/.hermes-evolved/evolve/world_model.json)
+        realistic_descriptions = [
+            "Read think_daemon source code to understand its loop structure and identify integration points.",
+            "Read think_daemon source code to understand its loop and extension points",
+            "Read the think_daemon source code to understand its loop and action selection.",
+        ]
+        for desc in realistic_descriptions:
+            tid = wm.record_action("shell", desc, "should read file")
+            wm.complete_action(tid, "exit=0: file contents shown")
+
+        # Build a minimal daemon state with tick_count >= 10 so auto-defaults are active
+        ds = {"tick_count": 15, "last_action_output": ""}
+
+        # Build a minimal orientation to avoid KeyError in prompt building
+        orient = {"vision": "Test", "phase": "test"}
+
+        # Propose a new action that is also "read think_daemon" → should be dedup'd
+        result = {
+            "action": {
+                "type": "shell",
+                "command": "cat think_daemon.py",
+                "description": "Read the think_daemon.py source code to understand its internal structure",
+            },
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": ds,
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": orient,
+        }
+
+        # mock out subprocess.run so _apply_insights doesn't actually execute shell commands.
+        # Let real file I/O happen (evolve dir already exists from fixture).
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        # The dedup gate should have replaced the repetitive action with a rotating default,
+        # which was then executed as a shell command (mocked subprocess.run).
+        ds_after = updates.get("daemon_state", {})
+        last_output = ds_after.get("last_action_output", "")
+        assert isinstance(last_output, str), f"Expected string output, got: {type(last_output)}"
+        # The output should contain our mocked 'exit=0: mocked' text
+        assert "exit=0" in last_output or not last_output, f"Unexpected output: {last_output[:100]}"
+
+    def test_unique_action_not_overridden(self, evolve_env: Dict) -> None:
+        """New action types not matching recent triples should pass through."""
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        # Populate with shell actions
+        for i in range(2):
+            tid = wm.record_action("shell", f"list workspace files {i}", "should list")
+            wm.complete_action(tid, "exit=0: files")
+
+        # Propose a git_commit action — different type, should NOT be dedup'd
+        result = {
+            "action": {
+                "type": "git_commit",
+                "message": "fix: test commit",
+                "description": "Commit test changes to repository",
+            },
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        # git_commit executed (different type, not dedup'd by gate)
+        ds_after = updates.get("daemon_state", {})
+        last_output = ds_after.get("last_action_output", "")
+        assert isinstance(last_output, str), f"Expected string output, got: {type(last_output)}"

@@ -1293,6 +1293,50 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 tick, idx, act["description"],
             )
     
+    # ── Action deduplication gate: break LLM fixation loops ──
+    # The LLM sometimes produces nearly-identical actions cycle after cycle
+    # (e.g. "read think_daemon.py" 9/14 times).  The rotating auto-default
+    # only activates when the action is null, but repetitive non-null actions
+    # bypass it.  This gate detects repeated action type+description patterns
+    # by comparing word-overlap against the last 5 completed action triples.
+    # When a repeat is detected, the action is overridden with the rotating
+    # default to collect diverse data and break the fixation cycle.
+    _repetitive = False
+    if act and isinstance(act, dict) and act.get("type") and not is_fallback:
+        try:
+            _wm = state.get("world_model")
+            if _wm is None:
+                from world_model import load_world_model as _lwm
+                _wm = _lwm()
+            _completed = [t for t in _wm.data.get("action_triples", []) if t.get("completed")]
+            if len(_completed) >= 2:
+                _atype = act["type"]
+                _desc = (act.get("description", "") or "").lower()
+                _desc_words = {w for w in re.findall(r"[a-z]\w{3,}", _desc)}
+                for _t in _completed[-5:]:
+                    if _t.get("action_type") != _atype:
+                        continue
+                    _rd = (_t.get("action_description", "") or "").lower()
+                    _rw = {w for w in re.findall(r"[a-z]\w{3,}", _rd)}
+                    if not _desc_words or not _rw:
+                        continue
+                    _overlap = len(_desc_words & _rw)
+                    _union = len(_desc_words | _rw)
+                    if _union > 0 and _overlap / _union > 0.4:
+                        _repetitive = True
+                        break
+                if _repetitive:
+                    _tick = ds.get("tick_count", 0)
+                    _idx = _tick % len(_ROTATING_AUTOS)
+                    act = dict(_ROTATING_AUTOS[_idx])
+                    logger.info(
+                        "Action dedup gate: '%s' repeats recent %s action(s) "
+                        "→ rotating auto[%d]: %s",
+                        _desc[:50], _atype, _idx, act.get("description", ""),
+                    )
+        except Exception as _e:
+            logger.debug("Action dedup gate bypassed: %s", _e)
+    
     # Clean stale "no action" weaknesses when actions ARE being executed
     caps = sm.setdefault("capabilities", {})
     old_weak = caps.get("weaknesses", [])
