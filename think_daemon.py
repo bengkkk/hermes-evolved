@@ -1247,9 +1247,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             if triple_id and wm is not None:
                 wm.complete_action(triple_id, f"FAILED: {e!s}")
         finally:
-            from agent.self_evolve import save_memory, load_memory
-            save_memory(load_memory())
-            # Save world model changes
+            # World model changes (memory is saved inline by add_* functions)
             if wm is not None:
                 try:
                     wm.save()

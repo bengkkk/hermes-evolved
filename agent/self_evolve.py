@@ -235,25 +235,31 @@ def save_memory(memory: Dict[str, Any]) -> None:
 def add_episodic(mtype: str, summary: str, details: str = "",
                  tags: Optional[list] = None,
                  salience: float = 0.5) -> str:
-    """Record an episodic memory. Delegates to data_layer."""
+    """Record an episodic memory and persist immediately. Delegates to data_layer."""
     mem = _Memory.load()
-    return mem.add_episodic(mtype=mtype, summary=summary, details=details,
-                            tags=tags, salience=salience)
+    mem_id = mem.add_episodic(mtype=mtype, summary=summary, details=details,
+                              tags=tags, salience=salience)
+    mem.save()
+    return mem_id
 
 
 def add_semantic(topic: str, fact: str, source: str = "experience",
                  confidence: float = 0.7) -> str:
-    """Record a semantic fact. Delegates to data_layer."""
+    """Record a semantic fact and persist immediately. Delegates to data_layer."""
     mem = _Memory.load()
-    return mem.add_semantic(topic=topic, fact=fact, source=source,
-                            confidence=confidence)
+    mem_id = mem.add_semantic(topic=topic, fact=fact, source=source,
+                              confidence=confidence)
+    mem.save()
+    return mem_id
 
 
 def add_procedural(pattern: str, trigger: str, procedure: str) -> str:
-    """Record a procedural memory. Delegates to data_layer."""
+    """Record a procedural memory and persist immediately. Delegates to data_layer."""
     mem = _Memory.load()
-    return mem.add_procedural(pattern=pattern, trigger=trigger,
-                              procedure=procedure)
+    mem_id = mem.add_procedural(pattern=pattern, trigger=trigger,
+                                procedure=procedure)
+    mem.save()
+    return mem_id
 
 
 def search_memories(query: str, memory_types: Optional[List[str]] = None,
