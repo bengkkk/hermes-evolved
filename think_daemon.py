@@ -1869,6 +1869,156 @@ def _bridge_world_model_to_self_model(
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Goal reconciliation (auto-complete stale goals)
+# ═════════════════════════════════════════════════════════════════
+
+
+def _reconcile_goals_with_world(
+    wm: WorldModel,
+    goals_data: Optional[Dict[str, Any]] = None,
+) -> int:
+    """Auto-complete goals whose verification criteria are satisfied by current state.
+
+    Checks each active/proposed goal against the current world model's per-type
+    accuracy data and other system invariants.  Goals whose stated conditions
+    are demonstrably met are transitioned to ``completed`` automatically.
+
+    Currently handles these title patterns:
+      - ``"Gather more <type> action samples"`` → completed when
+        ``per_type_accuracy[<type>].count >= 3``.
+      - ``"Investigate <type> prediction failures"`` → completed when
+        ``per_type_accuracy[<type>].avg_error < 0.4``.
+      - ``"Fix overconfidence at …"`` → completed when overall
+        ``avg_triple_error < 0.3``.
+      - ``"Resolve data layer completeness"`` → completed if the
+        ``data_layer.SelfModel`` import succeeds.
+      - Duplicate titles (same text, different IDs) → all but the most
+        recently created one are completed.
+
+    Args:
+        wm: The current WorldModel instance (used for per-type stats).
+        goals_data: Optional pre-loaded goals dict.  If ``None``, loads
+            from the default storage path via ``data_layer.Goals.load()``.
+
+    Returns:
+        Number of goals auto-completed (0 if none).
+    """
+    from data_layer import Goals as _Goals, SelfModel as _SMCheck
+
+    if goals_data is not None:
+        goals_obj = _Goals(data=goals_data)
+        save_on_exit = False  # caller manages persistence
+    else:
+        try:
+            goals_obj = _Goals.load()
+        except Exception as e:
+            logger.warning("Cannot load goals for reconciliation: %s", e)
+            return 0
+        save_on_exit = True
+
+    active = goals_obj.get_active()
+    if not active:
+        return 0
+
+    per_type = wm.get_per_type_accuracy()
+    acc = wm.data.get("prediction_accuracy", {})
+    completed_count = 0
+
+    for g in active:
+        title: str = g.get("title", "")
+        gid: str = g.get("id", "")
+        if not title or not gid:
+            continue
+        completed = False
+        note = ""
+
+        # 1. "Gather more <type> action samples" → check sample count
+        m = re.search(r"Gather more (\w+) action samples", title)
+        if m and not completed:
+            atype = m.group(1)
+            stats = per_type.get(atype, {})
+            count = stats.get("count", 0)
+            if count >= 3:
+                note = f"Auto-completed: {atype} now has {count} samples (threshold: ≥3)"
+                completed = True
+
+        # 2. "Investigate <type> prediction failures" → check error dropped
+        m = re.search(r"Investigate (\w+) prediction failures", title)
+        if m and not completed:
+            atype = m.group(1)
+            stats = per_type.get(atype, {})
+            avg_err = stats.get("avg_error", 1.0)
+            if avg_err < 0.4:
+                note = (
+                    f"Auto-completed: {atype} avg error {avg_err:.2f} dropped "
+                    f"below 0.4 threshold"
+                )
+                completed = True
+
+        # 3. "Fix overconfidence at …" → check overall error
+        if not completed and "overconfidence" in title.lower():
+            avg_err = acc.get("avg_triple_error", 1.0)
+            if avg_err < 0.3:
+                note = (
+                    f"Auto-completed: overall avg error {avg_err:.2f} "
+                    f"dropped below 0.3"
+                )
+                completed = True
+
+        # 4. "Resolve data layer completeness" → check imports
+        if not completed and "data layer" in title.lower():
+            try:
+                import data_layer as _dl
+                _ = _dl.SelfModel  # verify SelfModel is importable
+                note = "Auto-completed: data_layer.SelfModel imports successfully"
+                completed = True
+            except (ImportError, AttributeError):
+                pass
+
+        # 5. Duplicate titles → keep the newest
+        # This runs AFTER the pattern checks above so that pattern-matched
+        # goals get completed regardless; duplicate-phase only catches
+        # remaining identical-titled goals that weren't caught by patterns.
+        if completed:
+            goals_obj.update_status(gid, "completed", note)
+            completed_count += 1
+
+    # ── Phase 2: Deduplicate identical titles ──
+    # After pattern-based auto-completion, any remaining active goals
+    # with the same title as another active goal are stale duplicates.
+    # We keep only the most recently created one.
+    remaining = goals_obj.get_active()  # reload after status changes
+    title_map: Dict[str, list] = {}
+    for g in remaining:
+        t = g.get("title", "")
+        if t:
+            title_map.setdefault(t, []).append(g)
+    for t, entries in title_map.items():
+        if len(entries) > 1:
+            # Sort by creation time, keep the newest
+            entries.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            for stale in entries[1:]:
+                stale_id = stale.get("id")
+                if stale_id:
+                    goals_obj.update_status(
+                        stale_id,
+                        "completed",
+                        f"Auto-completed: duplicate of '{t}' (kept newest)",
+                    )
+                    completed_count += 1
+
+    # Persist if we loaded from disk
+    if save_on_exit and completed_count > 0:
+        try:
+            goals_obj.save()
+            logger.info("Goal reconciliation: %d goal(s) auto-completed", completed_count)
+        except Exception as e:
+            logger.warning("Failed to save reconciled goals: %s", e)
+
+    return completed_count
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Main thinking cycle
 # ═════════════════════════════════════════════════════════════════
 
@@ -2067,6 +2217,16 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         _bridge_world_model_to_self_model(wm, sm)
     except Exception as e:
         logger.warning("World model bridge failed (non-blocking): %s", e)
+
+    # 5.3 Goal reconciliation: auto-complete stale goals whose conditions are met
+    # This runs AFTER the bridge so self-model weaknesses are synced first
+    # (goals about investigating those weaknesses can then be evaluated).
+    try:
+        completed = _reconcile_goals_with_world(wm)
+        if completed > 0:
+            logger.info("Goal reconciliation: %d goal(s) auto-completed", completed)
+    except Exception as e:
+        logger.warning("Goal reconciliation failed (non-blocking): %s", e)
 
     # 5.5 World Model: record prediction if LLM made one
     pred = parsed.get("prediction")
