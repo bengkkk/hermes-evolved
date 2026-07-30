@@ -532,12 +532,27 @@ class TestBuildThinkingPrompt:
     def test_prompt_with_goals(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         state = self._make_state()
-        state["timeline"]["future"]["goals"] = [
+        # Goals are now loaded from the Goals store (evolve/goals.json),
+        # not from state[\"timeline\"][\"future\"][\"goals\"] — see commit 22cf22fde.
+        # We must write goals to the Goals store so _build_thinking_prompt sees them.
+        from data_layer import Goals
+        g = Goals()
+        g.propose(
             "Achieve 90% test coverage",
+            description="Improve test coverage across all modules",
+            rationale="Quality assurance",
+            priority=1,
+        )
+        g.propose(
             "Implement Gap 8",
-        ]
+            description="Self-directed evolution — autonomous goal pursuit",
+            rationale="Phase 2 completion",
+            priority=2,
+        )
+        g.save()
         prompt = td._build_thinking_prompt(state)
         assert "90% test coverage" in prompt or "Achieve" in prompt
+        assert "Implement Gap 8" in prompt
 
     def test_prompt_shows_no_active_plan(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
