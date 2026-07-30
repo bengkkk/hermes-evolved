@@ -268,6 +268,7 @@ class WorldModel:
         action_type: str,
         action_description: str,
         expected_outcome: str = "",
+        expected_source: str = "llm",
     ) -> str:
         """Record an action BEFORE execution, returning the triple ID.
 
@@ -278,6 +279,9 @@ class WorldModel:
             action_type: ``write_file`` | ``shell`` | ``git_commit`` | ``install_package``
             action_description: Human-readable description of what the action does.
             expected_outcome: What the system expects will happen (from LLM prediction).
+            expected_source: Where the prediction came from — ``\"llm\"`` (LLM-generated),
+                ``\"world_model\"`` (data-driven from historical triples),
+                or ``\"fallback\"`` (type+description default).
 
         Returns:
             Triple ID to pass to :meth:`complete_action`.
@@ -288,6 +292,7 @@ class WorldModel:
             "action_type": action_type,
             "action_description": action_description,
             "expected_outcome": expected_outcome or "unknown",
+            "expected_source": expected_source,
             "actual_outcome": None,  # filled in by complete_action
             "prediction_error": None,
             "timestamp": now_iso(),
@@ -335,6 +340,7 @@ class WorldModel:
         action_description: str,
         action_output: str,
         expected_outcome: str = "",
+        expected_source: str = "llm",
     ) -> Dict[str, Any]:
         """Convenience: record and complete an action in one call.
 
@@ -345,7 +351,7 @@ class WorldModel:
         For the full predict→observe→compare cycle, use
         :meth:`record_action` + :meth:`complete_action` instead.
         """
-        triple_id = self.record_action(action_type, action_description, expected_outcome)
+        triple_id = self.record_action(action_type, action_description, expected_outcome, expected_source)
         error = self.complete_action(triple_id, action_output)
         return {
             "id": triple_id,
@@ -662,7 +668,8 @@ class WorldModel:
                 err = t.get("prediction_error", 1.0)
                 icon = "✓" if err <= 0.3 else ("△" if err <= 0.6 else "✗")
                 desc = t.get("action_description", "")[:50]
-                parts.append(f"    {icon} {desc} [error={err:.2f}]")
+                source = t.get("expected_source", "?")
+                parts.append(f"    {icon} {desc} [err={err:.2f}, src={source}]")
 
         # ── Biggest discrepancies ──
         discrepancies = self.analyze_recent_discrepancies(3)

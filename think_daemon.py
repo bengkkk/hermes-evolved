@@ -1035,20 +1035,24 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             # otherwise fall back to data-driven prediction from world model,
             # then to action type + description.
             expected = act.get("expected_outcome")
+            expected_source = "llm"  # default: LLM provided it
             if not expected:
                 # Try data-driven prediction from historical action triples
                 try:
                     pred = wm.predict_action_outcome(atype, desc)
                     if pred.get("predicted_outcome"):
                         expected = pred["predicted_outcome"]
+                        expected_source = "world_model"
                         logger.info(
                             "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d)",
                             atype, expected[:60], pred.get("confidence", 0), pred.get("sample_count", 0),
                         )
                 except Exception as e:
                     logger.debug("Data-driven prediction failed (non-blocking): %s", e)
-            expected = expected or (f"{atype}: {desc[:100]}" if desc else atype)
-            triple_id = wm.record_action(atype, desc or atype, expected)
+            if not expected:
+                expected = f"{atype}: {desc[:100]}" if desc else atype
+                expected_source = "fallback"
+            triple_id = wm.record_action(atype, desc or atype, expected, expected_source)
 
             # ── Proactive risk assessment: check action guidance ──
             try:
