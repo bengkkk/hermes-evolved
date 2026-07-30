@@ -641,7 +641,10 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _prune_self_model(sm: Dict[str, Any]) -> int:
+def _prune_self_model(
+    sm: Dict[str, Any],
+    daemon_state: Optional[Dict[str, Any]] = None,
+) -> int:
     """Remove stale/duplicate entries from self-model to keep prompts clean.
 
     The daemon accumulates noise over many cycles: old weaknesses that refer
@@ -654,6 +657,14 @@ def _prune_self_model(sm: Dict[str, Any]) -> int:
          for new LLM-generated weaknesses.
       2. **Promised features**: Only keep the 8 most recent commitments.
       3. **Unknown areas**: Remove near-duplicates and cap at 8 entries.
+      4. **Stale weaknesses**: When *daemon_state* is provided, remove
+         weaknesses whose underlying cause has been resolved — e.g.
+         "LLM API unreliable" when the daemon has had recent successful
+         LLM-backed cycles, or "key name mismatch" after alignment fix.
+
+    Args:
+        sm: Self-model dict to prune (mutated in place).
+        daemon_state: Optional daemon state dict for health-aware cleanup.
 
     Returns:
         Number of entries removed across all categories.
@@ -661,11 +672,48 @@ def _prune_self_model(sm: Dict[str, Any]) -> int:
     caps = sm.setdefault("capabilities", {})
     removed = 0
 
+    # ── 0. Remove stale weaknesses whose root cause is resolved ──
+    # Uses daemon health data to detect resolved issues, keeping the
+    # self-model accurate without manual cleanup.
+    if daemon_state is not None:
+        stale_patterns: list[tuple[str, str]] = []
+
+        # Pattern 1: LLM API reliability issues (timeout was fixed)
+        # Check via last_output.fallback flag — when last cycle was
+        # LLM-backed (fallback=False), the API is proven reachable.
+        last_fallback = daemon_state.get("last_output", {}).get("fallback", True)
+        llm_working = not last_fallback
+        if llm_working:
+            stale_patterns.append((
+                "llm api|api unreliable|llm.*fallback|local fallback used"
+                "|timeout during thinking|timeout.*thinking",
+                "LLM API is now reachable (confirmed by recent LLM-backed cycles)",
+            ))
+
+        # Pattern 2: Key name mismatches (data_layer and think_daemon now aligned)
+        stale_patterns.append((
+            "key name mismatch|key mismatch|strengths key",
+            "data_layer and think_daemon use consistent keys",
+        ))
+
+        for pattern, reason in stale_patterns:
+            weaknesses = caps.get("weaknesses", [])
+            before = len(weaknesses)
+            caps["weaknesses"] = [
+                w for w in weaknesses
+                if not re.search(pattern, w, re.IGNORECASE)
+            ]
+            pattern_removed = before - len(caps["weaknesses"])
+            if pattern_removed > 0:
+                removed += pattern_removed
+                logger.info(
+                    "Removed %d stale weakness(es) matching %r — %s",
+                    pattern_removed, pattern, reason,
+                )
+
     # ── 1. Deduplicate weaknesses ──
     weaknesses: list = caps.get("weaknesses", [])
     if weaknesses:
-        # Use re-import of _is_near_duplicate logic inline to avoid
-        # coupling on the nested function's scope.  Simplified version:
         cleaned: list[str] = []
         for w in weaknesses:
             is_dup = False
@@ -1095,7 +1143,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     logger.warning("Failed to save world model: %s", e)
     # ── Self-model pruning: remove stale/duplicate entries ──
     try:
-        _prune_self_model(sm)
+        _prune_self_model(sm, daemon_state=state.get("daemon_state"))
     except Exception as e:
         logger.warning("Self-model pruning failed (non-blocking): %s", e)
 
@@ -1776,8 +1824,8 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "next_gap": parsed.get("next_gap"),
         "reasoning": parsed.get("reasoning"),
     }
+    ds["last_output"]["fallback"] = result.get("llm_fallback", False)
     if result.get("llm_fallback"):
-        ds["last_output"]["fallback"] = True
         cycle_label = "local-analysis fallback"
     else:
         cycle_label = "llm-backed"
