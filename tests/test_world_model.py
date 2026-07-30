@@ -371,6 +371,14 @@ class TestParseTimeframeDays:
         """'every 2h' style is not supported by timeframe parser."""
         assert WorldModel._parse_timeframe_days("every 2h") is None
 
+    def test_immediate_returns_zero(self):
+        """'immediate' timeframe → 0.0 days (auto-verified on first check)."""
+        assert WorldModel._parse_timeframe_days("immediate") == 0.0
+
+    def test_immediately_returns_zero(self):
+        """'immediately' timeframe → 0.0 days (same as immediate)."""
+        assert WorldModel._parse_timeframe_days("immediately") == 0.0
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  WorldModel — action triple lifecycle

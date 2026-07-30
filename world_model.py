@@ -472,7 +472,7 @@ class WorldModel:
         tf = timeframe.strip().lower()
 
         # Special cases that mean "immediately" / "already"
-        if tf in ("completed", "this cycle", "this turn", "same cycle", "now"):
+        if tf in ("completed", "this cycle", "this turn", "same cycle", "now", "immediate", "immediately"):
             return 0.0
 
         # Try "N <unit>" pattern
