@@ -1847,6 +1847,72 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     remaining_gaps = sm.get("state", {}).get("remaining_gaps", [])
     next_gap = remaining_gaps[0] if remaining_gaps else None
 
+    # ── Generate a context-aware action for fallback cycles ──
+    # Instead of always returning None (which triggers the auto-default
+    # shell-command rotation in _apply_insights), produce a state-checking
+    # action that gathers diverse data for the world model.  The action
+    # rotates among different information-gathering commands based on
+    # tick count to avoid monotonous same-type triples.
+    _action = None
+    _ws = _WORKSPACE_ROOT_STR
+    _evolve_path = str(EVOLVE_DIR)
+    _goals_cmd = (
+        'python3 -c "import sys; sys.path.insert(0,\'' + _ws + '\'); '
+        'from data_layer import Goals; g=Goals.load(); '
+        'for x in g.data.get(\'goals\',[]): '
+        "print(' [%s] P%s %s' % (x.get('status','?'), x.get('priority','?'), x.get('title','?')[:60]))"
+        '"'
+    )
+    _self_model_cmd = (
+        'python3 -c "import sys; sys.path.insert(0,\'' + _ws + '\'); '
+        'from data_layer import safe_read_json; '
+        'd=safe_read_json(\'' + _evolve_path + '/self_model.json\',{}); '
+        "print('evolved:', d.get('state',{}).get('total_cycles',0), 'cycles'); "
+        "w=d.get('capabilities',{}).get('weaknesses',[]); "
+        "[print('  - ' + ww[:80]) for ww in w[:3]]"
+        '"'
+    )
+    _daemon_cmd = (
+        'python3 -c "import sys; sys.path.insert(0,\'' + _ws + '\'); '
+        'from data_layer import safe_read_json; '
+        'd=safe_read_json(\'' + _evolve_path + '/daemon_state.json\',{}); '
+        "cs=d.get('cycle_stats',{}); "
+        "print('total=%s, ok=%s, errs=%s, avg=%ss, max=%ss' % "
+        "(cs.get('total',0), cs.get('ok',0), cs.get('error',0)+cs.get('parse_error',0), "
+        "cs.get('avg_duration',0), cs.get('max_duration',0))); "
+        "print('last:', str(d.get('last_output',{}).get('insight',''))[:80])"
+        '"'
+    )
+    _state_check_commands = [
+        {
+            "type": "shell",
+            "command": "echo '=== Goals ===' && " + _goals_cmd,
+            "description": "State check: list current goals and their statuses",
+        },
+        {
+            "type": "shell",
+            "command": "echo '=== Self Model ===' && " + _self_model_cmd,
+            "description": "State check: read self-model evolution state and top weaknesses",
+        },
+        {
+            "type": "shell",
+            "command": "echo '=== Daemon ===' && " + _daemon_cmd,
+            "description": "State check: daemon health and cycle statistics",
+        },
+        {
+            "type": "git_commit",
+            "message": "Auto-sync: evolve state snapshot at tick " + str(tick_count),
+            "description": "Auto-commit evolve state files as a periodic checkpoint",
+        },
+    ]
+    _action_idx = tick_count % len(_state_check_commands)
+    _action = dict(_state_check_commands[_action_idx])
+    # The git_commit action requires modified state files; skip if nothing to commit
+    if _action["type"] == "git_commit":
+        _action["expected_outcome"] = "git commit of evolve state files (may be empty if no changes)"
+    else:
+        _action["expected_outcome"] = "Command output showing current system state"
+
     return {
         "fallback": True,
         "insight": insight,
@@ -1856,7 +1922,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
         "event_to_record": {
             "type": "observation",
             "summary": f"LLM unavailable, local analysis used for cycle {tick_count}",
-            "impact": "World model stats updated but no new predictions or actions generated. LLM API may need attention.",
+            "impact": "World model stats updated via state-check action but no new predictions generated. LLM API may need attention.",
         },
         "outcome_to_record": None,
         "commitment": None,
@@ -1869,7 +1935,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
                 f"LLM API was unavailable; will retry next cycle",
             ],
         },
-        "action": None,
+        "action": _action,
         "plan_action": None,
         "new_plan": None,
         "new_goal": new_goal,
