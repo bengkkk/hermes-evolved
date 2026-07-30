@@ -1499,7 +1499,38 @@ class WorldModel:
         # Recompute computed fields (per-type accuracy) after load
         # to avoid stale cache until the next action is completed.
         result._update_per_type_accuracy()
+        # Backfill error_history from completed triples if it's shorter
+        # than the number of completed triples.  This handles the case
+        # after schema upgrades or data migrations where error_history
+        # was reset but completed triples still exist — without this the
+        # trend computation (_compute_error_trend) stays blind until N
+        # new actions are completed.
+        result._backfill_error_history()
         return result
+
+    def _backfill_error_history(self) -> None:
+        """Populate error_history from completed triples if missing/historic.
+
+        Only backfills when error_history is meaningfully shorter than
+        the number of completed triples (gap >= 3).  This prevents tiny
+        backfills for off-by-one issues while still fixing the cold-start
+        problem after schema upgrades.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        history = acc.get("error_history", [])
+        completed = [
+            t for t in self.data.get("action_triples", [])
+            if t.get("prediction_error") is not None
+        ]
+        if len(history) >= len(completed) or len(completed) - len(history) < 3:
+            return  # Nothing to backfill, or gap is too small to matter
+        # Rebuild error_history from the last 20 completed triple errors
+        new_history = [t["prediction_error"] for t in completed[-20:]]
+        acc["error_history"] = new_history
+        logger.info(
+            "Backfilled error_history from %d → %d entries (%d completed triples)",
+            len(history), len(new_history), len(completed),
+        )
 
     # ── Convenience ───────────────────────────────────────────────
 
