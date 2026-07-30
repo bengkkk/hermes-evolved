@@ -67,6 +67,7 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
     "interval_seconds": 600,
     "last_output": None,
     "cycle_history": [],  # list of {timestamp, status, error, duration, tick_count} — last 20
+    "consecutive_fallback_cycles": 0,  # How many consecutive cycles used local fallback (LLM unavailable)
 }
 
 
@@ -292,6 +293,9 @@ Last action result:
 
 Daemon health (cycle reliability):
 {daemon_health}
+
+Fallback recovery (LLM outage context):
+{fallback_recovery_context}
 
 World Model (prediction accuracy and discrepancy feedback):
 {world_model_context}
@@ -686,6 +690,17 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     else:
         daemon_health = "  (no cycle history yet — first run)"
 
+    # ── Fallback recovery context (fed forward from a previous cycle's recovery transition) ──
+    # When the LLM was unavailable for N consecutive cycles and then came back,
+    # a recovery note is injected into last_output. Show it here so the LLM
+    # knows what happened during its absence. The note naturally disappears
+    # after one cycle because step 7 replaces last_output every cycle.
+    _last_out = ds.get("last_output")
+    if isinstance(_last_out, dict) and _last_out.get("recovery"):
+        fallback_recovery_context = _last_out["recovery"]
+    else:
+        fallback_recovery_context = "  (none — no recent LLM outages)"
+
     return _THINKING_PROMPT.format(
         identity_name=identity.get("name", "?"),
         identity_role=identity.get("role", "?"),
@@ -703,6 +718,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         plan_status=plan_status,
         last_action_result=last_action_result,
         daemon_health=daemon_health,
+        fallback_recovery_context=fallback_recovery_context,
         world_model_context=world_model_context,
         orientation_context=orientation_context,
         goals_text=goals_text,
@@ -2585,13 +2601,35 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # 3. Call LLM
     logger.info("Thinking cycle %d starting...", ds.get("tick_count", 0) + 1)
     raw = await _call_llm(messages)
+
+    # ── Consecutive fallback tracking ──
+    # Track how many cycles the LLM has been unavailable in a row.
+    # When the LLM comes back, inject a recovery note so the LLM
+    # knows what happened during its absence.
+    _consecutive_fallback = ds.get("consecutive_fallback_cycles", 0)
+
     if raw is None:
         logger.warning("LLM unavailable — falling back to local analysis")
+        ds["consecutive_fallback_cycles"] = _consecutive_fallback + 1
         parsed = _local_analysis(state)
         result["status"] = "ok"
         result["llm_fallback"] = True
     else:
         result["llm_fallback"] = False
+        # Detect recovery: LLM succeeded after at least one fallback cycle
+        if _consecutive_fallback > 0:
+            _recovery_note = (
+                f"⚠ Fallback recovery: LLM was unavailable for {_consecutive_fallback} "
+                f"consecutive cycle(s). During that time, the system used local fallback "
+                f"analysis and exploratory actions. The daemon collected additional data "
+                f"but could not generate new macro predictions or structured insights."
+            )
+            # Store on result so step 7 can inject it into last_output
+            result["fallback_recovery_note"] = _recovery_note
+            logger.info("LLM recovered after %d fallback cycles", _consecutive_fallback)
+        # Reset the counter regardless (even if recovery note is just informational)
+        ds["consecutive_fallback_cycles"] = 0
+
         # 4. Parse response
         parsed = _try_parse_json(raw)
         if parsed is None:
@@ -2708,6 +2746,10 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "reasoning": parsed.get("reasoning"),
     }
     ds["last_output"]["fallback"] = result.get("llm_fallback", False)
+    # Inject fallback recovery note (set when LLM came back after consecutive fallbacks)
+    _recovery = result.get("fallback_recovery_note")
+    if _recovery:
+        ds["last_output"]["recovery"] = _recovery
     if result.get("llm_fallback"):
         cycle_label = "local-analysis fallback"
     else:
