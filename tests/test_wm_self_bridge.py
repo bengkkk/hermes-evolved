@@ -134,30 +134,50 @@ class TestWmSelfBridge:
         assert added == 1
 
         # Now simulate the pattern resolving: add more low-error shell actions
-        # that bring the avg down below threshold
+        # that make the recent 5 all good (triggering recency decay)
         for i in range(5):
             tid = wm.record_action("shell", f"fixed shell {i}", "ok")
             wm.complete_action(tid, "exit=0: perfect")
 
-        # Bridge again — the auto weakness should be gone since pattern
-        # is no longer high-error (we added 5 low-error actions)
+        # Bridge again — the auto weakness should be removed because the
+        # recency-based decay in _update_discrepancy_patterns detects that
+        # all 5 most recent shell actions have error <= 0.3.
         added2 = bridge(wm, sm)
-        # may be 0 (if avg dropped) or the existing one stays if avg is still >= 0.4
         weaknesses = sm["capabilities"]["weaknesses"]
         auto_weaknesses = [w for w in weaknesses if w.startswith("Systematic prediction bias:")]
-        # With the new data, shell avg should be lower — check if it's below threshold
-        pta = wm.get_per_type_accuracy()
-        shell_stats = pta.get("shell", {})
-        shell_avg = shell_stats.get("avg_error", 1.0)
-        if shell_avg < 0.4:
-            # Pattern resolved — auto weakness should be gone
-            assert len(auto_weaknesses) == 0, (
-                f"Expected no auto weaknesses after pattern resolved "
-                f"(shell avg={shell_avg:.2f}), got {auto_weaknesses}"
-            )
-        else:
-            # Still above threshold
-            assert len(auto_weaknesses) >= 1
+        # The pattern is suppressed by recency decay (5 consecutive good actions)
+        # even if the overall type avg is still slightly above 0.4
+        assert len(auto_weaknesses) == 0, (
+            f"Expected auto weakness removed by recency decay, "
+            f"got {auto_weaknesses}"
+        )
+
+    def test_stale_auto_weakness_persists_with_recent_failure(self):
+        """Auto-weakness should persist if a recent action still has high error."""
+        bridge = _import_bridge()
+        wm = self._setup_wm_with_pattern("shell", count=3, avg_error=0.85)
+        sm = {"capabilities": {"weaknesses": []}}
+
+        added = bridge(wm, sm)
+        assert added == 1
+
+        # Add 4 good actions — not enough for recency decay (need 5)
+        for i in range(4):
+            tid = wm.record_action("shell", f"ok shell {i}", "ok")
+            wm.complete_action(tid, "exit=0: perfect")
+
+        # And 1 recent failure
+        tid = wm.record_action("shell", "recent fail", "should work")
+        wm.complete_action(tid, "exit=1: failed")
+
+        added2 = bridge(wm, sm)
+        weaknesses = sm["capabilities"]["weaknesses"]
+        auto_weaknesses = [w for w in weaknesses if w.startswith("Systematic prediction bias:")]
+        # Pattern persists because the 5th most recent action is a failure
+        assert len(auto_weaknesses) >= 1, (
+            f"Expected auto weakness to persist with recent failure, "
+            f"got {auto_weaknesses}"
+        )
 
     def test_capped_at_ten(self):
         """Weakness list should be capped at 10 entries."""
