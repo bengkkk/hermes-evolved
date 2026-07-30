@@ -935,6 +935,40 @@ class WorldModel:
         for atype, triples in by_type.items():
             if len(triples) < min_samples:
                 continue
+
+            # ── Decay check: suppress pattern if type's overall accuracy has improved ──
+            # A pattern where 3/14 actions failed (old, resolved failures) should not
+            # persist when the type's overall avg_error is low.  Without this check,
+            # old high-error actions (e.g. exploratory shell commands from early cycles)
+            # create permanent discrepancy patterns that keep triggering action guidance
+            # warnings and reinforcing stale reasoning loops.
+            total_of_type = sum(1 for t in completed if t.get("action_type") == atype)
+            high_error_ratio = len(triples) / max(total_of_type, 1)
+            high_error_avg = sum(t["prediction_error"] for t in triples) / len(triples)
+
+            if high_error_ratio < 0.5 and high_error_avg < 0.7:
+                # Fewer than half of the actions of this type are high-error,
+                # AND the high-error group's avg is < 0.7 → likely old outliers
+                continue
+
+            # ── Recency-based decay: check if all high-error actions are old ──
+            # Sort the type's actions by timestamp. If the 5 most recent actions
+            # of this type ALL have prediction_error <= 0.3 (i.e., they succeeded
+            # as expected), then the high-error pattern is likely historical noise.
+            # Without this, a few early failures keep triggering action guidance
+            # warnings forever, even after dozens of successful subsequent actions.
+            all_of_type_sorted = sorted(
+                [t for t in completed if t.get("action_type") == atype],
+                key=lambda t: t.get("timestamp", ""),
+            )
+            recent_of_type = all_of_type_sorted[-5:]
+            if len(recent_of_type) >= 3:
+                recent_all_good = all(
+                    t.get("prediction_error", 1.0) <= 0.3
+                    for t in recent_of_type
+                )
+                if recent_all_good:
+                    continue
             avg_err = sum(t["prediction_error"] for t in triples) / len(triples)
             timestamps = [t.get("timestamp", "") for t in triples if t.get("timestamp")]
             last_obs = max(timestamps) if timestamps else ""
