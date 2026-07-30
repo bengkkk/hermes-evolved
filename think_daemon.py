@@ -1331,6 +1331,14 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         if tick >= 10:
             idx = tick % len(_ROTATING_AUTOS)
             act = dict(_ROTATING_AUTOS[idx])
+            # Clear hardcoded expected_outcome so the world model's
+            # data-driven predictor (predict_action_outcome) fills in
+            # a more accurate prediction from historical action triples.
+            # Without this, auto-default actions produce systematic ~0.5
+            # prediction errors (hardcoded generic text vs variable actual
+            # output), which pollute the calibration curve and trend analysis
+            # with noise rather than genuine prediction-failure signals.
+            act.pop("expected_outcome", None)
             if is_fallback:
                 # In fallback mode, take exploratory actions anyway — collecting
                 # diverse data is valuable even without LLM guidance, and the
@@ -1377,6 +1385,10 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     _tick = ds.get("tick_count", 0)
                     _idx = _tick % len(_ROTATING_AUTOS)
                     act = dict(_ROTATING_AUTOS[_idx])
+                    # Same expected_outcome clearing as the auto-default path above:
+                    # let the world model's data-driven predictor use historical
+                    # action triples for a more accurate expected outcome.
+                    act.pop("expected_outcome", None)
                     logger.info(
                         "Action dedup gate: '%s' repeats recent %s action(s) "
                         "→ rotating auto[%d]: %s",
