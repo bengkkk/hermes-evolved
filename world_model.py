@@ -1631,6 +1631,14 @@ class WorldModel:
         # trend computation (_compute_error_trend) stays blind until N
         # new actions are completed.
         result._backfill_error_history()
+        # Clean stale calibration bucket data that may have accumulated
+        # from expired auto-verifications in older code versions.
+        # The current code explicitly avoids calling _update_calibration
+        # on expired auto-verifications (see verify_expired_predictions),
+        # but legacy data persists on disk.  If the combined count across
+        # all buckets exceeds the number of actually-verified predictions
+        # (correct + incorrect), some entries are stale.
+        result._clean_stale_calibration_buckets()
         return result
 
     def _backfill_error_history(self) -> None:
@@ -1656,6 +1664,68 @@ class WorldModel:
             "Backfilled error_history from %d → %d entries (%d completed triples)",
             len(history), len(new_history), len(completed),
         )
+
+    def _clean_stale_calibration_buckets(self) -> None:
+        """Remove stale calibration bucket entries from expired auto-verifications.
+
+        The current code intentionally does NOT call ``_update_calibration``
+        from ``verify_expired_predictions`` (auto-verification), because
+        expired predictions always get error=0.5 (uncertain) and would
+        pollute the calibration curve with a systematic bias.
+
+        However, older code versions DID call ``_update_calibration`` on
+        expired predictions, and legacy data persists on disk.  This method
+        detects stale entries by comparing the total count across all buckets
+        against the number of actually-verified predictions (``correct_predictions``
+        + ``incorrect_predictions``).  If the bucket count exceeds that sum,
+        the excess entries are stale and the buckets are reset.
+
+        Also handles the degenerate case where ALL entries in a non-empty
+        bucket have avg_error == 0.5 but no prediction was ever explicitly
+        verified — this is the signature of legacy auto-verification data.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        buckets = acc.get("calibration_buckets", [])
+
+        if not buckets:
+            return
+
+        actually_verified = (
+            acc.get("correct_predictions", 0)
+            + acc.get("incorrect_predictions", 0)
+        )
+        bucket_total = sum(b.get("count", 0) for b in buckets)
+
+        # Case 1: Bucket count exceeds verified count — excess is stale
+        if bucket_total > actually_verified:
+            logger.info(
+                "Cleaning %d stale calibration bucket entries "
+                "(bucket_count=%d > actually_verified=%d)",
+                bucket_total - actually_verified,
+                bucket_total, actually_verified,
+            )
+            # Reset to defaults: only keep buckets up to the actual
+            # verified count, distributed proportionally?  Actually, since
+            # we can't recover which pre-existing entries were legitimate,
+            # just reset the entire bucket structure.
+            acc["calibration_buckets"] = []
+            return
+
+        # Case 2: All buckets have avg_error == 0.5 but nothing ever
+        # explicitly verified — legacy expired-only data
+        if actually_verified == 0 and bucket_total > 0:
+            all_half = all(
+                b.get("avg_error", 0) == 0.5 or b.get("count", 0) == 0
+                for b in buckets
+            )
+            if all_half:
+                logger.info(
+                    "Cleaning %d stale calibration bucket entries "
+                    "(all avg_error=0.5 from expired auto-verifications)",
+                    bucket_total,
+                )
+                acc["calibration_buckets"] = []
+                return
 
     # ── Convenience ───────────────────────────────────────────────
 

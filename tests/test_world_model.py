@@ -1503,3 +1503,86 @@ class TestPredictActionOutcome:
         # Very long description — should not crash
         result_long = wm.predict_action_outcome("shell", "a" * 5000)
         assert result_long is not None
+
+
+class TestCalibrationBucketCleanup:
+    """Tests for _clean_stale_calibration_buckets on load."""
+
+    def test_clean_stale_buckets_legacy_expired(self):
+        """Legacy data: all buckets are 0.5 error, nothing verified — cleaned."""
+        wm = WorldModel()
+        wm.data["prediction_accuracy"]["calibration_buckets"] = [
+            {"count": 8, "total_error": 4.0, "avg_error": 0.5}
+        ]
+        wm.data["prediction_accuracy"]["correct_predictions"] = 0
+        wm.data["prediction_accuracy"]["incorrect_predictions"] = 0
+        wm._clean_stale_calibration_buckets()
+        assert wm.data["prediction_accuracy"]["calibration_buckets"] == []
+
+    def test_clean_stale_buckets_excess_count(self):
+        """Bucket count > actual verified predictions — cleaned."""
+        wm = WorldModel()
+        wm.data["prediction_accuracy"]["calibration_buckets"] = [
+            {"count": 5, "total_error": 2.0, "avg_error": 0.4}
+        ]
+        wm.data["prediction_accuracy"]["correct_predictions"] = 2
+        wm.data["prediction_accuracy"]["incorrect_predictions"] = 1
+        # bucket_total=5 > actually_verified=3 → stale
+        wm._clean_stale_calibration_buckets()
+        assert wm.data["prediction_accuracy"]["calibration_buckets"] == []
+
+    def test_preserve_legitimate_calibration_data(self):
+        """Bucket count matches verified predictions — preserved."""
+        wm = WorldModel()
+        wm.data["prediction_accuracy"]["calibration_buckets"] = [
+            {"count": 3, "total_error": 0.6, "avg_error": 0.2}
+        ]
+        wm.data["prediction_accuracy"]["correct_predictions"] = 3
+        wm.data["prediction_accuracy"]["incorrect_predictions"] = 0
+        wm._clean_stale_calibration_buckets()
+        # Should NOT be cleaned — data is consistent
+        assert len(wm.data["prediction_accuracy"]["calibration_buckets"]) == 1
+        assert wm.data["prediction_accuracy"]["calibration_buckets"][0]["count"] == 3
+
+    def test_preserve_empty_buckets(self):
+        """No calibration data — no-op."""
+        wm = WorldModel()
+        wm._clean_stale_calibration_buckets()
+        assert wm.data["prediction_accuracy"]["calibration_buckets"] == []
+
+    def test_cleanup_invoked_on_load_legacy_data(self):
+        """Verify _clean_stale_calibration_buckets runs during WorldModel.load()."""
+        import tempfile, json
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test_wm.json"
+            # Write legacy dirty data
+            dirty = {
+                "version": 4,
+                "action_triples": [],
+                "predictions": [],
+                "prediction_accuracy": {
+                    "total_predictions": 8,
+                    "verified_predictions": 8,
+                    "correct_predictions": 0,
+                    "incorrect_predictions": 0,
+                    "avg_prediction_error": 0.5,
+                    "total_triples": 0,
+                    "avg_triple_error": 0.0,
+                    "calibration_buckets": [
+                        {"count": 8, "total_error": 4.0, "avg_error": 0.5}
+                    ],
+                    "error_history": [0.5] * 8,
+                },
+                "discrepancy_patterns": [],
+                "per_type_accuracy": {},
+            }
+            path.write_text(json.dumps(dirty), encoding="utf-8")
+            # Load should clean the buckets
+            loaded = WorldModel.load(path)
+            assert loaded.data["prediction_accuracy"]["calibration_buckets"] == [], (
+                f"Expected empty buckets after load with legacy data, "
+                f"got {loaded.data['prediction_accuracy']['calibration_buckets']}"
+            )
+

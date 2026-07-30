@@ -1927,12 +1927,29 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             "message": "Auto-sync: evolve state snapshot at tick " + str(tick_count),
             "description": "Auto-commit evolve state files as a periodic checkpoint",
         },
+        {
+            "type": "write_file",
+            "path": str(EVOLVE_DIR / "state_snapshot.txt"),
+            "content": (
+                "=== Hermes Evolved State Snapshot ===\n"
+                f"Tick: {tick_count}\n"
+                f"Time: {datetime.now(timezone.utc).isoformat()}\n"
+                f"Triples: {total_completed}/{total_triples}\n"
+                f"Trend: {trend_str}\n"
+                f"Weaknesses: {len(sm.get('capabilities', {}).get('weaknesses', []))}\n"
+                f"Unknowns: {len(sm.get('capabilities', {}).get('unknown_areas', []))}\n"
+                f"Error history (last 5): {error_history[-5:] if len(error_history) >= 5 else error_history}\n"
+            ),
+            "description": "State check: write evolve state snapshot for diagnostics",
+        },
     ]
     _action_idx = tick_count % len(_state_check_commands)
     _action = dict(_state_check_commands[_action_idx])
     # Set expected outcome for prediction feedback — specific per action
     if _action["type"] == "git_commit":
         _action["expected_outcome"] = "exit=0: auto-sync commit of evolve state files (may be 'nothing to commit')"
+    elif _action["type"] == "write_file":
+        _action["expected_outcome"] = f"Wrote state snapshot ({len(_action.get('content', ''))} bytes)"
     elif "Goals" in _action.get("command", ""):
         _action["expected_outcome"] = "exit=0: list of current goals with their statuses and priorities"
     elif "Self Model" in _action.get("command", ""):
