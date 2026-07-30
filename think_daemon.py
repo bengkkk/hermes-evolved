@@ -765,9 +765,24 @@ def _prune_self_model(
             "|insufficient knowledge of orientation injection mechanism"
             "|exact mechanism to inject orientation"
             "|requirements for orientation injection"
-            "|exact location of orientation configuration",
+            "|exact location of orientation configuration"
+            "|still uncertain about system prompt file location",
             "Orientation injection infrastructure is complete (data_layer persists orientation.json)",
         ))
+
+        # Pattern 7: Generic workspace / file-layout unfamiliarity — the daemon
+        # has been running for many cycles; initial unfamiliarity is resolved
+        # by accumulated experience rather than a specific configuration change.
+        if daemon_state.get("tick_count", 0) >= 10:
+            stale_patterns.append((
+                r"still lack direct knowledge of codebase file layout"
+                r"|still unfamiliar with .*(?:file layout|workspace structure)"
+                r"|still dependent on shell exploration to locate key files"
+                r"|slow exploration due to lack of directory context"
+                r"|unfamiliarity with (?:hermes-evolved file layout|think_daemon)"
+                r"|lack of familiarity with think_daemon",
+                "Workspace familiarity is established after 10+ daemon cycles",
+            ))
 
         for pattern, reason in stale_patterns:
             weaknesses = caps.get("weaknesses", [])
@@ -859,6 +874,17 @@ def _prune_self_model(
                     "|where to inject orientation layer",
                     "Prompt assembly location is known (agent/prompt_builder.py) — "
                     "modifying core system prompt is deferred",
+                ))
+
+            # Pattern: Data layer import path resolved — we import from data_layer
+            # successfully every cycle; the exact file location is established.
+            if daemon_state.get("tick_count", 0) >= 5:
+                u_patterns.append((
+                    r"exact filename and correct import path for data_layer"
+                    r"|exact code structure of think_daemon loop"
+                    r"|system prompt file path in workspace",
+                    "Data layer import path is established; think_daemon loop "
+                    "has been running for many cycles",
                 ))
 
             for pattern, reason in u_patterns:
