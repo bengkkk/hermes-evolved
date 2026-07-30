@@ -401,7 +401,7 @@ class WorldModel:
                 # Feed action triple into calibration curve using stored confidence
                 confidence = triple.get("prediction_confidence")
                 if confidence is not None:
-                    self._update_calibration(confidence, error)
+                    self._calibrate_from_action(confidence, error)
                 return error
         return None
 
@@ -934,6 +934,21 @@ class WorldModel:
         bucket["avg_error"] = round(
             bucket["total_error"] / bucket["count"], 4
         )
+
+    def _calibrate_from_action(
+        self, confidence: float, error: float
+    ) -> None:
+        """Record a calibration entry from an action triple.
+
+        Like _update_calibration, but also tracks the total number of
+        action-triple calibration entries so the stale-bucket cleaner
+        can distinguish legitimate data from auto-verified pollution.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        acc["action_triple_calibrations"] = (
+            acc.get("action_triple_calibrations", 0) + 1
+        )
+        self._update_calibration(confidence, error)
 
     # ── Per-type accuracy (for adaptive confidence calibration) ─────
 
@@ -1705,9 +1720,10 @@ class WorldModel:
         However, older code versions DID call ``_update_calibration`` on
         expired predictions, and legacy data persists on disk.  This method
         detects stale entries by comparing the total count across all buckets
-        against the number of actually-verified predictions (``correct_predictions``
-        + ``incorrect_predictions``).  If the bucket count exceeds that sum,
-        the excess entries are stale and the buckets are reset.
+        against the number of legitimate calibration entries (``correct_predictions``
+        + ``incorrect_predictions`` + ``action_triple_calibrations``).
+        If the bucket count exceeds that sum, the excess entries are stale
+        and the buckets are reset.
 
         Also handles the degenerate case where ALL entries in a non-empty
         bucket have avg_error == 0.5 but no prediction was ever explicitly
@@ -1722,6 +1738,7 @@ class WorldModel:
         actually_verified = (
             acc.get("correct_predictions", 0)
             + acc.get("incorrect_predictions", 0)
+            + acc.get("action_triple_calibrations", 0)
         )
         bucket_total = sum(b.get("count", 0) for b in buckets)
 
