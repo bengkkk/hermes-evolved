@@ -558,11 +558,13 @@ class WorldModel:
             # Calculate elapsed days
             elapsed_days = (now - pred_time).total_seconds() / 86400.0
 
-            # Allow a grace period: 10% of the timeframe or 1 hour, whichever is larger.
-            # For sub-day timeframes like "this cycle" or "1 hour", the 1-hour floor
-            # ensures at least one daemon cycle worth of tolerance, while keeping the
-            # verification prompt enough that cycle-based predictions don't linger forever.
-            grace = max(days * 0.1, 1.0 / 24.0)  # at least ~1 hour
+            # Allow a grace period: 10% of the timeframe or 10 minutes, whichever is larger.
+            # For sub-day timeframes like "this cycle" or "immediate", the 10-minute floor
+            # ensures at least one daemon cycle worth of tolerance (the daemon runs every
+            # 600s ≈ 10 min) while keeping cycle-based predictions responsive. The old 1-hour
+            # floor was too long and left "immediate" and "1 cycle" predictions unverified
+            # for a full hour, accumulating unverified predictions that masked real trends.
+            grace = max(days * 0.1, 1.0 / 144.0)  # at least ~10 min
             if elapsed_days >= days + grace:
                 # Timeframe has expired — auto-verify as uncertain
                 pred["verified"] = True
