@@ -2030,6 +2030,10 @@ def _reconcile_goals_with_world(
         ``avg_triple_error < 0.3``.
       - ``"Resolve data layer completeness"`` → completed if the
         ``data_layer.SelfModel`` import succeeds.
+      - ``"Complete orientation injection mechanism"`` and similar → completed
+        if ``orientation.json`` exists with meaningful data (``focus`` and
+        ``insights`` fields populated), since the orientation context is
+        already injected into the thinking prompt every cycle.
       - Duplicate titles (same text, different IDs) → all but the most
         recently created one are completed.
 
@@ -2113,7 +2117,41 @@ def _reconcile_goals_with_world(
             except (ImportError, AttributeError):
                 pass
 
-        # 5. Duplicate titles → keep the newest
+        # 5. "Complete orientation injection mechanism" → check orientation.json exists
+        # with meaningful data AND the prompt injection is already implemented.
+        # This goal tends to stick around because the LLM fixates on "finding the
+        # system prompt file" even though orientation is ALREADY injected into the
+        # thinking prompt every cycle via the {orientation_context} block.
+        if not completed and re.search(
+            r"orientation\s*(injection|mechanism|complete|finish)",
+            title, re.IGNORECASE,
+        ):
+            try:
+                orient_path = ORIENTATION_FILE
+                if orient_path.exists():
+                    import json as _json
+                    orient_data = _json.loads(orient_path.read_text(encoding="utf-8"))
+                    if (isinstance(orient_data, dict)
+                            and orient_data.get("insights")
+                            and orient_data.get("focus")):
+                        note = (
+                            "Auto-completed: orientation.json exists with meaningful data. "
+                            "Orientation is already injected into the thinking prompt every cycle."
+                        )
+                        completed = True
+                    else:
+                        logger.debug(
+                            "Orientation goal not completed: orientation.json exists but "
+                            "lacks focus/insights data: %s", orient_data,
+                        )
+                else:
+                    logger.debug(
+                        "Orientation goal not completed: %s does not exist", orient_path,
+                    )
+            except Exception as _e:
+                logger.debug("Orientation goal check failed: %s", _e)
+
+        # 6. Duplicate titles → keep the newest
         # This runs AFTER the pattern checks above so that pattern-matched
         # goals get completed regardless; duplicate-phase only catches
         # remaining identical-titled goals that weren't caught by patterns.
