@@ -1130,11 +1130,25 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # didn't produce an action because it's unavailable, not because
     # it chose not to. Auto-defaulting would pollute the world model
     # with synthetic action triples (spamming noisy "ls" entries).
+    #
+    # Rotating commands to prevent repeated "explore workspace" spam:
+    # each tick, pick the next action in sequence, so the system gathers
+    # diverse data instead of spamming the same ls command.
+    _ROTATING_AUTOS = [
+        {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: list workspace"},
+        {"type": "shell", "command": f"git -C {_WORKSPACE_ROOT_STR} log --oneline -3", "description": "Auto-default: recent git log"},
+        {"type": "shell", "command": "python3 -c 'from world_model import load_world_model; wm=load_world_model(); d=wm.data; print(len(d.get(\"action_triples\",[])), \"triples,\", len(d.get(\"predictions\",[])), \"preds\")'", "description": "Auto-default: world model stats"},
+        {"type": "shell", "command": f"wc -l {_WORKSPACE_ROOT_STR}/think_daemon.py {_WORKSPACE_ROOT_STR}/world_model.py {_WORKSPACE_ROOT_STR}/data_layer.py", "description": "Auto-default: evolved file sizes"},
+        {"type": "shell", "command": f"find {_WORKSPACE_ROOT_STR} -maxdepth 1 -type f -name '*.py' | wc -l", "description": "Auto-default: count top-level .py files"},
+        {"type": "shell", "command": f"python3 -c \"import pathlib; d=pathlib.Path('{_WORKSPACE_ROOT_STR}/..'); [print(f.name) for f in d.iterdir() if f.name.startswith('hermes') or f.name.startswith('.hermes')]\"", "description": "Auto-default: sibling dirs check"},
+    ]
     is_fallback = result.get("fallback", False)
     if not (act and isinstance(act, dict) and act.get("type")):
-        if ds.get("tick_count", 0) >= 10 and not is_fallback:
-            act = {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: explore workspace"}
-            logger.info("Auto-default action (null action detected at cycle %d)", ds.get("tick_count", 0))
+        tick = ds.get("tick_count", 0)
+        if tick >= 10 and not is_fallback:
+            idx = tick % len(_ROTATING_AUTOS)
+            act = dict(_ROTATING_AUTOS[idx])
+            logger.info("Auto-default action (tick %d → auto[%d]: %s)", tick, idx, act["description"])
     
     # Clean stale "no action" weaknesses when actions ARE being executed
     caps = sm.setdefault("capabilities", {})
