@@ -458,7 +458,16 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     # for Gap 8 (self-directed evolution): the system must see its own goals.
     future = tl.get("future", {})
     try:
-        from data_layer import Goals as _GoalsLoader
+        # ── Stale-module-safe import: daemon is long-lived, data_layer may
+        # have been imported before Goals was added. Reload if needed. ──
+        try:
+            from data_layer import Goals as _GoalsLoader
+        except ImportError:
+            import importlib as _il
+            import data_layer as _dl
+            _il.reload(_dl)
+            from data_layer import Goals as _GoalsLoader
+            logger.info("Reloaded data_layer module to pick up newly added Goals class")
         _goals_obj = _GoalsLoader.load()
         _active = _goals_obj.get_active()
         if _active:
@@ -1808,7 +1817,15 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             # Deduplicate: skip if an identical goal already exists
             # in the Goals store (evolve/goals.json)
             try:
-                from data_layer import Goals as _Goals
+                # ── Stale-module-safe import ──
+                try:
+                    from data_layer import Goals as _Goals
+                except ImportError:
+                    import importlib as _il
+                    import data_layer as _dl
+                    _il.reload(_dl)
+                    from data_layer import Goals as _Goals
+                    logger.info("Reloaded data_layer module to pick up newly added Goals class")
                 existing = _Goals.load().get_active()
                 already_present = any(
                     top["title"].lower() in g.get("title", "").lower()
@@ -2047,7 +2064,18 @@ def _reconcile_goals_with_world(
     Returns:
         Number of goals auto-completed (0 if none).
     """
-    from data_layer import Goals as _Goals, SelfModel as _SMCheck
+    # ── Stale-module-safe import ──
+    # The daemon is long-lived — data_layer may have been imported before
+    # Goals/SelfModel were added. If the direct import fails, reload the
+    # cached module to pick up newly added classes.
+    try:
+        from data_layer import Goals as _Goals, SelfModel as _SMCheck
+    except ImportError:
+        import importlib as _il
+        import data_layer as _dl_mod
+        _il.reload(_dl_mod)
+        from data_layer import Goals as _Goals, SelfModel as _SMCheck
+        logger.info("Reloaded data_layer module to pick up newly added Goals/SelfModel classes")
 
     if goals_data is not None:
         goals_obj = _Goals(data=goals_data)
@@ -2217,7 +2245,15 @@ def _auto_activate_goals() -> int:
     bridging Gap 4 (goal infrastructure) into Gap 8 (self-directed evolution).
     """
     try:
-        from data_layer import Goals as _Goals
+        # ── Stale-module-safe import ──
+        try:
+            from data_layer import Goals as _Goals
+        except ImportError:
+            import importlib as _il
+            import data_layer as _dl
+            _il.reload(_dl)
+            from data_layer import Goals as _Goals
+            logger.info("Reloaded data_layer module to pick up newly added Goals class")
 
         goals_obj = _Goals.load()
         all_goals = goals_obj.data.get("goals", [])
