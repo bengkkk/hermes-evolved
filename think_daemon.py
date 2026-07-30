@@ -953,9 +953,14 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 
     # ── Actions (Gap 10) ──
     act = result.get("action")
-    # Auto-default action for cycle 1+ to prevent null-action drift
+    # Auto-default action for cycle 1+ to prevent null-action drift.
+    # Skip auto-default in fallback (local-analysis) mode — the LLM
+    # didn't produce an action because it's unavailable, not because
+    # it chose not to. Auto-defaulting would pollute the world model
+    # with synthetic action triples (spamming noisy "ls" entries).
+    is_fallback = result.get("fallback", False)
     if not (act and isinstance(act, dict) and act.get("type")):
-        if ds.get("tick_count", 0) >= 10:
+        if ds.get("tick_count", 0) >= 10 and not is_fallback:
             act = {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: explore workspace"}
             logger.info("Auto-default action (null action detected at cycle %d)", ds.get("tick_count", 0))
     
@@ -1416,6 +1421,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     next_gap = remaining_gaps[0] if remaining_gaps else None
 
     return {
+        "fallback": True,
         "insight": insight,
         "focus_next": f"Complete LLM-backed thinking cycle; {'continue: ' + current_focus if current_focus else 're-evaluate priorities'}",
         "confidence": adjusted_confidence,
