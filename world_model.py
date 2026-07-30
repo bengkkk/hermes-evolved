@@ -140,30 +140,19 @@ def _compute_prediction_error(
     if informational_nonerror:
         return 0.15
 
-    # ── Exit-code aware comparison (ground truth) ──
-    # The exit code IS the ground truth: exit=0 always means success,
-    # exit != 0 always means failure.  This check MUST come BEFORE the
-    # tool-keyword heuristic below but AFTER the informational pattern
-    # check above, because content like "host not found" or "Traceback"
-    # can appear in an otherwise successful command (exit=0).
+    # ── Exit-code observation (ground truth for command success/failure) ──
+    # The exit code tells us whether the command itself succeeded, but NOT
+    # whether the OUTCOME matched the PREDICTION.  We therefore observe it
+    # and apply it as a modifier at the end rather than short-circuiting,
+    # so content comparison still happens and produces varied errors that
+    # the world model can learn from.
+    # Exit=0 caps the final error at 0.5 (command succeeded → not a total loss);
+    # exit≠0 floors at 0.5 (command failed → not a perfect match).
+    _exit_was_zero: Optional[bool] = None
     exit_match = re.search(r'exit=(\d+)', a_lower)
     if exit_match:
         exit_code = int(exit_match.group(1))
-        if exit_code == 0:
-            # Exit code 0 = command succeeded → low error regardless
-            return 0.15
-        # exit != 0 — check if the expected text suggests success
-        success_expected = any(kw in e_lower for kw in
-            ('success', 'complete', 'create', 'write', 'deploy', 'install',
-             'commit', 'push', 'run', 'list', 'show', 'print',
-             'pass', 'test', 'status', 'check', 'git', 'file',
-             'read', 'done', 'build', 'fix', 'fetch', 'merge',
-             'pull', 'add', 'update', 'find', 'search', 'info',
-             'log', 'clean', 'set', 'get', 'patch', 'branch', 'diff'))
-        if success_expected:
-            return 0.85  # Expected success but got failure
-        else:
-            return 0.7   # Neutral expected but command failed
+        _exit_was_zero = (exit_code == 0)
 
     # ── Shell/Tool success/failure keywords ──
     # Content-based heuristics for outputs that lack an explicit exit=
@@ -177,52 +166,75 @@ def _compute_prediction_error(
         r'\b(passed|succeeded|ok|complete|done)\b',
         a_lower,
     ))
+
+    # ── Content-based error: accumulate into a single variable ──
+    # We'll apply the exit-code modifier at the end so that errors
+    # reflect BOTH content mismatch AND command success/failure.
+    _error: float
+
     if tool_failure and not tool_success:
-        return 0.85  # Tool reported failure
-    if tool_success and not tool_failure:
-        return 0.15  # Tool reported success
-
-    # ── Character bigram similarity ──
-    # For short strings, bigram overlap handles word variations better
-    def _bigrams(s: str) -> set:
-        return {s[i:i + 2] for i in range(len(s) - 1)}
-
-    e_bg = _bigrams(e_lower)
-    a_bg = _bigrams(a_lower)
-
-    if e_bg and a_bg:
-        intersection = e_bg & a_bg
-        union = e_bg | a_bg
-        jaccard = len(intersection) / len(union)
-        if jaccard >= 0.6:
-            return 0.15
-        elif jaccard >= 0.35:
-            return 0.4
-        elif jaccard >= 0.15:
-            return 0.6
-        elif jaccard > 0.0:
-            return 0.8
-
-    # ── Token overlap (word-level, last resort) ──
-    def _tokenize(s: str) -> set:
-        return set(re.findall(r"[a-z0-9]+", s))
-
-    e_tokens = _tokenize(e_lower)
-    a_tokens = _tokenize(a_lower)
-
-    if not e_tokens or not a_tokens:
-        return 1.0
-
-    intersection = e_tokens & a_tokens
-    union = e_tokens | a_tokens
-    jaccard = len(intersection) / len(union)
-
-    if jaccard >= 0.5:
-        return 0.5
-    elif jaccard > 0.0:
-        return 0.75
+        _error = 0.85  # Tool reported failure
+    elif tool_success and not tool_failure:
+        _error = 0.15  # Tool reported success
     else:
-        return 1.0
+        # ── Character bigram similarity ──
+        def _bigrams(s: str) -> set:
+            return {s[i:i + 2] for i in range(len(s) - 1)}
+
+        e_bg = _bigrams(e_lower)
+        a_bg = _bigrams(a_lower)
+
+        if e_bg and a_bg:
+            intersection = e_bg & a_bg
+            union = e_bg | a_bg
+            jaccard = len(intersection) / len(union)
+            if jaccard >= 0.6:
+                _error = 0.15
+            elif jaccard >= 0.35:
+                _error = 0.4
+            elif jaccard >= 0.15:
+                _error = 0.6
+            elif jaccard > 0.0:
+                _error = 0.8
+            else:
+                # fall through to token overlap below
+                _error = None
+        else:
+            _error = None
+
+        # ── Token overlap (word-level, last resort) ──
+        if _error is None:
+            def _tokenize(s: str) -> set:
+                return set(re.findall(r"[a-z0-9]+", s))
+
+            e_tokens = _tokenize(e_lower)
+            a_tokens = _tokenize(a_lower)
+
+            if not e_tokens or not a_tokens:
+                _error = 1.0
+            else:
+                intersection = e_tokens & a_tokens
+                union = e_tokens | a_tokens
+                jaccard = len(intersection) / len(union)
+
+                if jaccard >= 0.5:
+                    _error = 0.5
+                elif jaccard > 0.0:
+                    _error = 0.75
+                else:
+                    _error = 1.0
+
+    # ── Exit-code modifier ──
+    # Apply AFTER content comparison so errors reflect BOTH content
+    # mismatch AND whether the command technically succeeded or failed.
+    if _exit_was_zero is True:
+        # Command succeeded — cap error at 0.5 (can't be total failure)
+        return min(_error, 0.5)
+    elif _exit_was_zero is False:
+        # Command failed — floor error at 0.5 (can't be perfect match)
+        return max(_error, 0.5)
+    else:
+        return _error
 
 
 # ═══════════════════════════════════════════════════════════════════

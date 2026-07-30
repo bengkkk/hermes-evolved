@@ -117,14 +117,16 @@ class TestComputePredictionError:
     # ── Exit code heuristics ──
 
     def test_exit_zero_success(self):
-        """exit=0 with success expected → low error (0.15)."""
+        """exit=0 with content similarity → error based on content, capped at 0.5."""
         err = _compute_prediction_error("deploy should succeed", "exit=0: deployed successfully")
-        assert err == pytest.approx(0.15, abs=0.01)
+        # Bigram jaccard ~0.41 → 0.4, capped by exit=0 at min(0.4, 0.5)=0.4
+        assert err == pytest.approx(0.4, abs=0.01)
 
     def test_exit_zero_neutral(self):
-        """exit=0 with neutral expected → low error (0.15)."""
+        """exit=0 with completely different content → error 0.5 (exit=0 cap)."""
         err = _compute_prediction_error("list directory", "exit=0: file1.txt  file2.txt")
-        assert err == pytest.approx(0.15, abs=0.01)
+        # Token overlap minimal → 1.0, capped by exit=0 at min(1.0, 0.5)=0.5
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_exit_one_failure_expected_success(self):
         """exit=1 when success was expected → high error (0.85)."""
@@ -139,10 +141,10 @@ class TestComputePredictionError:
         assert err == pytest.approx(0.85, abs=0.01)
 
     def test_exit_one_truly_neutral(self):
-        """exit=1 with expected text having NO success keywords → 0.7.
-        Also ensure actual output avoids tool_failure keywords ('not found')."""
+        """exit=1 with expected having NO success keywords → content-based error floored at 0.5."""
         err = _compute_prediction_error("inspect something", "exit=1: some issue occurred")
-        assert err == pytest.approx(0.7, abs=0.01)
+        # Bigram jaccard ~0.11 → 0.8 (low overlap), floored by exit≠0 at max(0.8, 0.5)=0.8
+        assert err == pytest.approx(0.8, abs=0.01)
 
     # Note: exit code regex captures "exit=N:" pattern specifically.
     # A message like "Process exited with code 1" is NOT matched
@@ -156,10 +158,8 @@ class TestComputePredictionError:
         assert err == pytest.approx(0.85, abs=0.01)
 
     def test_tool_success_keyword_only(self):
-        """Success keyword without failure keyword → 0.15.
-        Note: 'completed' does NOT match \bcomplete\b (word boundary).
-        Use 'exit=0: success' pattern which always returns 0.15."""
-        err = _compute_prediction_error("do something", "exit=0: all tasks ok")
+        """Success keyword without failure keyword → 0.15."""
+        err = _compute_prediction_error("do something", "all tasks ok")
         assert err == pytest.approx(0.15, abs=0.01)
 
     def test_tool_both_keywords_passed_failed(self):
@@ -215,9 +215,9 @@ class TestComputePredictionError:
     # ── Realistic Hermes output patterns ──
 
     def test_git_commit_success(self):
-        """Successful git commit."""
+        """Successful git commit — content differs from expected, capped at 0.5."""
         err = _compute_prediction_error("commit changes", "exit=0: 1 file changed, 1 insertion(+)")
-        assert err == pytest.approx(0.15, abs=0.01)
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_install_package_already_installed(self):
         """pip install with already-satisfied output.
@@ -229,9 +229,9 @@ class TestComputePredictionError:
         assert err == pytest.approx(0.15, abs=0.01)
 
     def test_shell_list_dir(self):
-        """Shell directory listing."""
+        """Shell directory listing — content different from expected, capped at 0.5."""
         err = _compute_prediction_error("list workspace files", "exit=0: main.py  utils.py  tests/")
-        assert err == pytest.approx(0.15, abs=0.01)
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_shell_failure_permission(self):
         """Shell permission denied."""
@@ -244,9 +244,11 @@ class TestComputePredictionError:
         assert err >= 0.5
 
     def test_tool_output_with_exit_0_no_stdout(self):
-        """exit=0 with empty stdout."""
+        """exit=0 with empty stdout → 0.5 (capped by exit=0)."""
         err = _compute_prediction_error("run quiet command", "exit=0: ")
-        assert err == pytest.approx(0.15, abs=0.01)
+        # "exit=0: " stripped → "exit=0:" → no bigram overlap with expected
+        # falls to token level → 1.0, capped by exit=0 at 0.5
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_error_contains_expected_phrase(self):
         """Actual contains the expected phrase as substring."""
@@ -266,14 +268,14 @@ class TestComputePredictionError:
     # ── Exit code vs keyword precedence ──
 
     def test_exit_0_overrides_failure_keywords(self):
-        """exit=0 always gives low error (0.15), even if output
-        contains failure keywords like 'not found' or 'Traceback'.
-        The exit code is the ground truth — the command succeeded."""
+        """exit=0 with failure keywords in output → capped at 0.5 (command succeeded).
+        The exit code says the command worked, but content differs from expected."""
         err = _compute_prediction_error(
             "resolve hostname",
             "exit=0: (no output — host not found)",
         )
-        assert err == pytest.approx(0.15, abs=0.01)
+        # tool_failure triggered (not found), _error=0.85, capped by exit=0 at 0.5
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_exit_1_still_high_with_success_keywords(self):
         """exit=1 still gives high error (0.85) when expected text
@@ -285,13 +287,13 @@ class TestComputePredictionError:
         assert err == pytest.approx(0.85, abs=0.01)
 
     def test_exit_0_with_traceback_keyword(self):
-        """exit=0 with 'Traceback' in output — still low error
-        because the shell exit code says the command succeeded."""
+        """exit=0 with 'Traceback' in output → capped at 0.5."""
         err = _compute_prediction_error(
             "run script",
             "exit=0: Traceback printed but exit was 0",
         )
-        assert err == pytest.approx(0.15, abs=0.01)
+        # tool_failure triggered (traceback), _error=0.85, capped by exit=0 at 0.5
+        assert err == pytest.approx(0.5, abs=0.01)
 
     # ── Pathological exit code edge cases ──
 
@@ -305,9 +307,10 @@ class TestComputePredictionError:
         assert err >= 0.5
 
     def test_exit_0_always_low(self):
-        """exit=0 overrides everything else — always returns 0.15."""
+        """exit=0 with content mismatch → capped at 0.5 (not the old hardcoded 0.15)."""
         err = _compute_prediction_error("this will definitely fail", "exit=0: it worked")
-        assert err == pytest.approx(0.15, abs=0.01)
+        # Content completely different → 1.0, capped by exit=0 at 0.5
+        assert err == pytest.approx(0.5, abs=0.01)
 
     def test_short_expected_and_actual_no_match(self):
         """Very short strings with no overlap."""
@@ -315,9 +318,9 @@ class TestComputePredictionError:
         assert err == pytest.approx(1.0, abs=0.01)
 
     def test_version_numbers_in_output(self):
-        """Output contains version numbers."""
+        """Output contains version numbers — content mismatch, capped at 0.5."""
         err = _compute_prediction_error("check version", "exit=0: Python 3.11.5")
-        assert err == pytest.approx(0.15, abs=0.01)
+        assert err == pytest.approx(0.5, abs=0.01)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -471,13 +474,14 @@ class TestActionTripleLifecycle:
         assert pta["write_file"]["count"] == 1
 
     def test_low_error_action_type(self):
-        """Multiple successful actions of same type → low avg error."""
+        """Multiple actions of same type — content mismatch capped at 0.5 by exit=0."""
         wm = WorldModel()
         for i in range(3):
             tid = wm.record_action("install_package", f"install pkg{i}", "should install")
             wm.complete_action(tid, "exit=0: Successfully installed")
         pta = wm.get_per_type_accuracy()
-        assert pta["install_package"]["avg_error"] <= 0.3
+        # Each action: bigram overlap gives 0.6, capped by exit=0 at min(0.6, 0.5)=0.5
+        assert abs(pta["install_package"]["avg_error"] - 0.5) < 0.1
 
     def test_high_error_action_type(self):
         """Multiple failing actions → high avg error."""
@@ -551,7 +555,9 @@ class TestMacroPredictions:
         pid = wm.record_prediction("will work", "1 day", 0.8, "")
         wm.verify_prediction(pid, "exit=0: success")
         acc = wm.data["prediction_accuracy"]
-        assert acc["correct_predictions"] == 1
+        # Error 0.5 (content mismatch capped by exit=0) → counts as incorrect
+        assert acc["correct_predictions"] == 0
+        assert acc["incorrect_predictions"] == 1
 
     def test_incorrect_prediction_tracking(self):
         wm = WorldModel()

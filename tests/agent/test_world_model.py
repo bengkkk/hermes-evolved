@@ -52,15 +52,14 @@ class TestComputePredictionError:
         assert err >= 0.8, f"Expected ≥ 0.8, got {err}"
 
     def test_exit_code_no_success_keyword(self) -> None:
-        # "list" is a success keyword → exit=0 gives low error
+        # "list directory contents" vs "exit=0: files" — content mismatch, capped at 0.5
         err = _compute_prediction_error("list directory contents", "exit=0: files")
-        assert err <= 0.2, f"Expected ≤ 0.2 (list is success kw), got {err}"
+        assert err == pytest.approx(0.5, abs=0.01), f"Expected 0.5, got {err}"
 
     def test_exit_code_neutral_keyword(self) -> None:
-        # Expected text with no success/failure keyword + exit=0 → low error
-        # (exit code 0 means success regardless of expected keywords)
+        # Content has no overlap with expected — capped at 0.5 by exit=0
         err = _compute_prediction_error("examine the output carefully", "exit=0: data")
-        assert err <= 0.2, f"Expected ≤ 0.2 (exit=0=success), got {err}"
+        assert err == pytest.approx(0.5, abs=0.01), f"Expected 0.5, got {err}"
 
     def test_bigram_similarity_high(self) -> None:
         error = _compute_prediction_error("write configuration file", "written config file")
