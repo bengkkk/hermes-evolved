@@ -172,6 +172,29 @@ def _acquire_daemon_lock() -> bool:
     # Check if the PID is still alive
     try:
         _os.kill(existing_pid, 0)  # signal 0 = test existence
+        # ── Zombie check ──
+        # A zombie process still responds to signal 0 (it's in the task
+        # table), but it can never run again and won't be releasing the
+        # lock.  Treat it as stale.
+        try:
+            _stat_path = f"/proc/{existing_pid}/status"
+            if _os.path.exists(_stat_path):
+                with open(_stat_path) as _sf:
+                    _state_line = next(
+                        (l for l in _sf if l.startswith("State:")), ""
+                    )
+                if "Z (zombie)" in _state_line or "zombie" in _state_line:
+                    logger.info(
+                        "Stale daemon lock (PID %d is zombie), taking over",
+                        existing_pid,
+                    )
+                    try:
+                        DAEMON_LOCK_FILE.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    return _try_atomic_create()
+        except (OSError, IOError, StopIteration):
+            pass
         logger.warning(
             "Daemon lock held by PID %d — skipping concurrent run",
             existing_pid,
@@ -3226,6 +3249,18 @@ def main():
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Also log to the archive file so cycles are visible in daemon.log
+    # regardless of how the daemon was launched (cron, terminal, manual).
+    try:
+        _fh = logging.FileHandler(str(DAEMON_LOG_FILE))
+        _fh.setLevel(getattr(logging, args.log_level))
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        logging.getLogger().addHandler(_fh)
+    except Exception:
+        pass
 
     if args.verify:
         exit_code = _run_verification()
