@@ -35,6 +35,7 @@ import copy
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -787,6 +788,9 @@ _DEFAULT_GOALS: Dict[str, Any] = {
     "goals": [],
 }
 
+# Monotonically incrementing counter for unique goal IDs within the same second
+_goals_id_counter: int = 0
+
 
 class Goals:
     """Self-generated goal store with lifecycle tracking.
@@ -808,8 +812,50 @@ class Goals:
         priority: int = 3,
         dependencies: Optional[List[str]] = None,
     ) -> str:
-        """Propose a new self-generated goal. Returns the goal ID."""
-        goal_id = f"goal_{now_compact()}"
+        """Propose a new self-generated goal. Returns the goal ID.
+
+        Before creating a new goal, checks for an existing active goal with
+        a similar title.  Duplicates are detected via word-token overlap:
+        if the proposed title shares >50% of its significant words (words
+        longer than 3 characters, excluding common stopwords) with an
+        existing active goal's title, the existing goal is returned instead
+        and its priority/rationale/gap_reference are refreshed from the new
+        proposal (but the existing title and description are kept).
+
+        This prevents the goal store from filling with near-identical
+        variants of the same objective (a real problem observed with
+        LLM-generated goals where every cycle proposes a slight
+        rephrasing of 'integrate goal lifecycle into think_daemon').
+        """
+        existing_id = self._find_similar_active_goal(title, gap_reference)
+        if existing_id is not None:
+            # Refresh metadata from the new proposal but keep original
+            # title, description, and creation time.
+            for g in self.data.get("goals", []):
+                if g.get("id") == existing_id:
+                    # Only upgrade priority (lower number = higher priority)
+                    existing_p = g.get("priority", 5)
+                    if priority < existing_p:
+                        g["priority"] = priority
+                    if rationale and not g.get("rationale"):
+                        g["rationale"] = rationale
+                    if gap_reference and not g.get("gap_reference"):
+                        g["gap_reference"] = gap_reference
+                    if verification_criteria and not g.get("verification_criteria"):
+                        g["verification_criteria"] = verification_criteria
+                    g["notes"] = (
+                        f"Deduplicated: merged proposal with existing goal "
+                        f"on {now_iso().split('T')[0]}"
+                    )
+                    logger.info(
+                        "Deduplicated goal proposal %r → existing goal %s (%s)",
+                        title[:60], existing_id, g.get("title", "")[:60],
+                    )
+                    return existing_id
+
+        global _goals_id_counter
+        goal_id = f"goal_{now_compact()}_{_goals_id_counter}"
+        _goals_id_counter += 1
         goal: Dict[str, Any] = {
             "id": goal_id,
             "title": title,
@@ -828,6 +874,83 @@ class Goals:
         self.data.setdefault("goals", []).append(goal)
         self.data["goals"] = self.data["goals"][-100:]
         return goal_id
+
+    @staticmethod
+    def _extract_significant_words(text: str) -> set:
+        """Extract significant words from a title for similarity matching.
+
+        Filters out common stopwords and short words (<=3 characters) to
+        focus on meaningful tokens that distinguish one goal from another.
+        """
+        _STOPWORDS: frozenset = frozenset({
+            "with", "from", "that", "this", "into", "what", "will", "have",
+            "been", "were", "been", "than", "then", "each", "more", "some",
+            "about", "also", "than", "very", "just", "should", "their",
+            "them", "they", "when", "make", "made", "does", "used", "use",
+            "using", "after", "before", "without", "between", "other",
+            "over", "under", "such", "much", "still", "already",
+        })
+        words = set(re.findall(r"[a-z][a-z0-9]+", text.lower()))
+        return {
+            w for w in words
+            if len(w) > 3 and w not in _STOPWORDS
+        }
+
+    def _find_similar_active_goal(
+        self,
+        title: str,
+        gap_reference: str = "",
+    ) -> Optional[str]:
+        """Check if a goal with a similar title already exists and is active.
+
+        Uses word-token overlap (Jaccard similarity on significant words).
+        A match requires:
+          - The existing goal is NOT completed or abandoned
+          - Word overlap > 0.5 (or one title contains the other's words)
+          - A shared gap_reference, OR the gap is the same general area
+
+        Returns the existing goal ID, or None if no duplicate exists.
+        """
+        proposed_words = self._extract_significant_words(title)
+        if not proposed_words:
+            return None
+
+        proposed_gap = (gap_reference or "").strip()
+        ACTIVE_STATUSES = {"proposed", "active", "in_progress"}
+
+        for g in self.data.get("goals", []):
+            if g.get("status") not in ACTIVE_STATUSES:
+                continue
+
+            existing_words = self._extract_significant_words(
+                g.get("title", "")
+            )
+            if not existing_words:
+                continue
+
+            # Jaccard similarity on significant words
+            intersection = proposed_words & existing_words
+            union = proposed_words | existing_words
+            similarity = len(intersection) / max(len(union), 1)
+
+            if similarity > 0.5:
+                # Strong word overlap → match regardless of gap reference
+                return g.get("id")
+
+            if similarity > 0.35:
+                # Moderate overlap + same gap reference → match (catches
+                # reworded variants of the same objective, e.g.
+                # "Integrate goal lifecycle into think_daemon" vs
+                # "Goal lifecycle integration in think_daemon")
+                existing_gap = (g.get("gap_reference", "") or "").strip()
+                if proposed_gap and existing_gap and (
+                    proposed_gap == existing_gap
+                    or proposed_gap.split("—")[0].strip()
+                    == existing_gap.split("—")[0].strip()
+                ):
+                    return g.get("id")
+
+        return None
 
     def update_status(self, goal_id: str, new_status: str, note: str = "") -> bool:
         """Update a goal's lifecycle status.
