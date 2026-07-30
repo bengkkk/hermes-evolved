@@ -2134,6 +2134,90 @@ def _reconcile_goals_with_world(
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Goal auto-activation (promote proposed → active)
+# ═════════════════════════════════════════════════════════════════
+
+
+def _auto_activate_goals() -> int:
+    """Auto-activate proposed goals when the system has no active goal.
+
+    Promotes the highest-priority proposed goal to ``active`` when:
+      1. There is at least one ``proposed`` goal.
+      2. No ``active`` or ``in_progress`` goal already exists, OR
+         all existing active goals have lower priority (higher number)
+         than the best proposed goal.
+
+    Returns the number of goals promoted (0 or 1 per cycle — one step at a time).
+
+    This ensures the daemon autonomously pursues its self-generated goals
+    without waiting for the LLM to issue a ``goal_action`` directive,
+    bridging Gap 4 (goal infrastructure) into Gap 8 (self-directed evolution).
+    """
+    try:
+        from data_layer import Goals as _Goals
+
+        goals_obj = _Goals.load()
+        all_goals = goals_obj.data.get("goals", [])
+
+        # Find proposed goals (not yet active/in_progress/completed/abandoned)
+        proposed = [g for g in all_goals if g.get("status") == "proposed"]
+        if not proposed:
+            return 0
+
+        # Find currently active / in_progress goals
+        active = [g for g in all_goals if g.get("status") in ("active", "in_progress")]
+
+        # Sort proposed by priority (lower number = higher priority), then by creation time
+        proposed.sort(key=lambda g: (g.get("priority", 5), g.get("created_at", "")))
+
+        best_proposed = proposed[0]
+        best_pri = best_proposed.get("priority", 5)
+        best_id = best_proposed.get("id", "")
+
+        # If there's already an active/in_progress goal with equal or better priority,
+        # don't override — let the system focus on what it's already working on.
+        if active:
+            min_active_pri = min(g.get("priority", 5) for g in active)
+            if min_active_pri <= best_pri:
+                return 0
+
+        # Check dependencies are met (skip goals with unresolved dependencies)
+        deps = best_proposed.get("dependencies", [])
+        if deps:
+            dep_ids = set(deps)
+            completed_ids = {
+                g.get("id", "") for g in all_goals
+                if g.get("status") in ("completed", "abandoned")
+            }
+            unmet = dep_ids - completed_ids
+            if unmet:
+                logger.info(
+                    "Goal %r has unmet dependencies %s — skipping auto-activation",
+                    best_proposed.get("title", "?"), sorted(unmet),
+                )
+                return 0
+
+        # Promote!  Only promote one per cycle to avoid overwhelming the system.
+        goals_obj.update_status(
+            best_id, "active",
+            note=f"Auto-activated: highest-priority proposed goal (P{best_pri})",
+        )
+        goals_obj.save()
+        logger.info(
+            "Auto-activated goal %s — %s (P%d)",
+            best_id, best_proposed.get("title", "?")[:60], best_pri,
+        )
+        return 1
+
+    except ImportError:
+        logger.debug("_auto_activate_goals: Goals class not available")
+        return 0
+    except Exception as e:
+        logger.warning("Goal auto-activation error: %s", e)
+        return 0
+
+
+# ═════════════════════════════════════════════════════════════════
 #  Main thinking cycle
 # ═════════════════════════════════════════════════════════════════
 
@@ -2342,6 +2426,17 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
             logger.info("Goal reconciliation: %d goal(s) auto-completed", completed)
     except Exception as e:
         logger.warning("Goal reconciliation failed (non-blocking): %s", e)
+
+    # 5.4 Auto-activate proposed goals so the system pursues them without
+    # waiting for the LLM to explicitly set goal_action.  This bridges
+    # Gap 4 (goal infrastructure) into Gap 8 (self-directed evolution):
+    # the daemon autonomously activates pending goals when it has capacity.
+    try:
+        activated = _auto_activate_goals()
+        if activated > 0:
+            logger.info("Goal auto-activation: %d goal(s) promoted to active", activated)
+    except Exception as e:
+        logger.warning("Goal auto-activation failed (non-blocking): %s", e)
 
     # 5.5 World Model: record prediction if LLM made one
     pred = parsed.get("prediction")
