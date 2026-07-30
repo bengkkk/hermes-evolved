@@ -928,21 +928,36 @@ class Goals:
             if not existing_words:
                 continue
 
+            existing_gap = (g.get("gap_reference", "") or "").strip()
+
             # Jaccard similarity on significant words
             intersection = proposed_words & existing_words
             union = proposed_words | existing_words
             similarity = len(intersection) / max(len(union), 1)
 
             if similarity > 0.5:
-                # Strong word overlap → match regardless of gap reference
-                return g.get("id")
+                # Strong word overlap → match regardless of gap reference,
+                # BUT only when both titles have enough significant words
+                # to actually distinguish them.
+                #
+                # Short titles (≤2 significant words) like "Goal A"/"Goal B"
+                # or "Complete Gap 6"/"Complete Gap 8" can hit 100%
+                # similarity from just one or two shared words.  Requiring
+                # a shared gap_reference for short titles prevents false
+                # deduplication while still catching the real spam case
+                # (LLM-rephrased variants of a long goal title).
+                if len(proposed_words) >= 3 and len(existing_words) >= 3:
+                    return g.get("id")
+                # Short titles: require same gap reference to deduplicate
+                if proposed_gap and existing_gap and proposed_gap == existing_gap:
+                    return g.get("id")
+                # Still allow the similarity > 0.35 check below to apply
 
             if similarity > 0.35:
                 # Moderate overlap + same gap reference → match (catches
                 # reworded variants of the same objective, e.g.
                 # "Integrate goal lifecycle into think_daemon" vs
                 # "Goal lifecycle integration in think_daemon")
-                existing_gap = (g.get("gap_reference", "") or "").strip()
                 if proposed_gap and existing_gap and (
                     proposed_gap == existing_gap
                     or proposed_gap.split("—")[0].strip()
