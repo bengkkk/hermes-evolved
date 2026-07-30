@@ -429,10 +429,29 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     tl_commits = present.get("commitments", [])
     active_commits = [c for c in tl_commits if c.get("status") == "active"]
     timeline_commit_text = "; ".join(c["what"] for c in active_commits[:3]) if active_commits else "(none)"
-    sm_commit_list = commits.get("promised_features", []) + commits.get("active_obligations", [])
+
+    # Filter out stale/self-referential promised_features that trap the LLM in loops.
+    # The LLM often adds items like "Verify data layer import" or "Complete step 1"
+    # which (a) refer to non-existent APIs or (b) have been resolved for cycles.
+    # These re-enter the prompt every cycle, reinforcing a fixation loop.
+    _STALE_PROMISE_PREFIXES = (
+        "data layer", "DataLayer", "data_layer",
+        "Verify data", "Fix data", "Resolve data",
+        "inject orientation", "Inject orientation",
+        "step ", "Complete step", "Complete verification",
+        "will review all", "Will review all",
+        "Complete orientation",
+        "Inspect data_layer",
+    )
+    all_commitments = []
+    for c in commits.get("promised_features", []):
+        if not any(c.strip().lower().startswith(p.lower()) for p in _STALE_PROMISE_PREFIXES):
+            all_commitments.append(c)
+    all_commitments += commits.get("active_obligations", [])
+
     all_commits = timeline_commit_text
-    if sm_commit_list:
-        all_commits += "; " + "; ".join(sm_commit_list[:3])
+    if all_commitments:
+        all_commits += "; " + "; ".join(all_commitments[:3])
 
     # Recent outcomes
     outcomes = tl.get("past", {}).get("outcomes", [])
