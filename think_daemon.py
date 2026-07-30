@@ -420,10 +420,35 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     tasks = present.get("active_tasks", [])
     tasks_text = "; ".join(tasks[:5]) if tasks else "(none)"
 
-    # Goals
+    # Goals — load from the actual goals store (evolve/goals.json), not the
+    # timeline dict which may be stale or empty.  This is the key integration
+    # for Gap 8 (self-directed evolution): the system must see its own goals.
     future = tl.get("future", {})
-    goals = future.get("goals", [])
-    goals_text = "\n".join(f"  → {g}" for g in goals[:5]) if goals else "  (none)"
+    try:
+        from data_layer import Goals as _GoalsLoader
+        _goals_obj = _GoalsLoader.load()
+        _active = _goals_obj.get_active()
+        if _active:
+            _goal_lines = []
+            for g in _active[:8]:  # show top 8 by priority
+                _sym = {"proposed": "◇", "active": "○", "in_progress": "◎"}.get(
+                    g.get("status", ""), "·"
+                )
+                _pri = g.get("priority", 3)
+                _title = g.get("title", "?")
+                _desc = (g.get("description", "") or "")[:80]
+                _gap = f" [{g['gap_reference']}]" if g.get("gap_reference") else ""
+                _goal_lines.append(f"  {_sym} P{_pri} — {_title}{_gap}")
+                _goal_lines.append(f"      {_desc}")
+            goals_text = "\n".join(_goal_lines)
+            _active_count = sum(1 for g in _active if g.get("status") in ("active", "in_progress"))
+            _proposed_count = sum(1 for g in _active if g.get("status") == "proposed")
+            goals_text += "\n  ({} active, {} proposed)".format(_active_count, _proposed_count)
+        else:
+            goals_text = "  (none)"
+    except Exception as e:
+        logger.warning("Failed to load goals: %s", e)
+        goals_text = "  (goals unavailable)"
 
     # Commitments (from timeline + self_model)
     tl_commits = present.get("commitments", [])
