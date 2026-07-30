@@ -545,6 +545,20 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
                 orient_context_parts.append(f"    → {step[:80]}")
     orientation_context = "\n".join(orient_context_parts) if orient_context_parts else "  (none loaded)"
 
+    # ── Clarifying directive: orientation injection is complete ──
+    # The LLM often fixates on "finding the system prompt file to inject orientation"
+    # without realizing that orientation is ALREADY injected into this prompt via the
+    # {orientation_context} block above.  This directive tells it explicitly.
+    orient_prompt_note = (
+        "  ℹ Note: Orientation injection IS complete — the orientation context\n"
+        "    shown above is loaded from orientation.json and injected into this\n"
+        "    prompt every cycle. There is NO separate system prompt file to modify.\n"
+        "    Do NOT search for 'system_prompt.txt' or 'orientation.yaml' or similar.\n"
+        "    The remaining work is on Gap 8 (self-directed evolution), not on\n"
+        "    finding files that don't exist."
+    )
+    orientation_context += "\n" + orient_prompt_note
+
     # ── Daemon health (failure diagnostics for the LLM) ──
     history = ds.get("cycle_history", [])
     if history:
