@@ -1432,16 +1432,39 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 logger.warning("Unknown action type: %s", atype)
 
             # ── World Model: complete action with actual outcome ──
-            if action_output and triple_id and wm is not None:
-                wm.complete_action(triple_id, action_output)
-            elif triple_id and wm is not None:
-                # Action produced no output — record that as the outcome
-                wm.complete_action(triple_id, "(no output)")
+            _pred_err = None
+            _expected_text = ""
+            if triple_id and wm is not None:
+                actual_for_wm = action_output if action_output else "(no output)"
+                _pred_err = wm.complete_action(triple_id, actual_for_wm)
+                # Retrieve the triple to get the expected-outcome text for feedback
+                for _t in wm.data.get("action_triples", []):
+                    if _t.get("id") == triple_id:
+                        _expected_text = _t.get("expected_outcome", "") or ""
+                        break
 
-            # Build output for next cycle's prompt (guidance + outcome)
+            # Build output for next cycle's prompt (guidance + prediction feedback + outcome)
             combined_output = ""
             if action_guidance:
                 combined_output += f"[RISK WARNING] {action_guidance}\n"
+            # ── Prediction comparison feedback ──
+            # Tell the LLM what it predicted vs what actually happened, closing the
+            # world-model learning loop so it can calibrate its expectations.
+            if _pred_err is not None and _expected_text:
+                _actual_preview = (action_output or "(no output)")[:100]
+                _exp_preview = _expected_text[:80]
+                if _pred_err <= 0.3:
+                    _icon = "✓"
+                elif _pred_err <= 0.6:
+                    _icon = "△"
+                else:
+                    _icon = "✗"
+                combined_output += (
+                    f"[PREDICTION {_icon}] error={_pred_err:.2f}: "
+                    f"expected \"{_exp_preview}\" → \"{_actual_preview}\"\n"
+                )
+            elif _pred_err is not None:
+                combined_output += f"[PREDICTION] error={_pred_err:.2f} (no expected_outcome set)\n"
             if action_output:
                 combined_output += action_output
             if combined_output:
