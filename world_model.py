@@ -30,7 +30,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from data_layer import get_evolve_dir, safe_write_json, safe_read_json, now_compact, now_iso
+# ── Data layer: try workspace version first, fall back to direct path computation ──
+try:
+    # First try importing from the workspace data_layer (has evolve-specific functions)
+    from data_layer import get_evolve_dir, safe_write_json, safe_read_json, now_compact, now_iso
+except ImportError:
+    # Fallback for environments where data_layer is missing evolve functions
+    # (e.g., when running from /opt/hermes-evolved/ which has a minimal data_layer)
+    import json as _json
+    import os as _os
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path as _Path
+
+    def get_evolve_dir() -> _Path:
+        hermes_home = _Path(_os.environ.get("HERMES_HOME", _Path.home() / ".hermes"))
+        return hermes_home / "evolve"
+
+    def safe_write_json(path: _Path, data: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(_json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+    def safe_read_json(path: _Path) -> Any:
+        if path.exists():
+            try:
+                return _json.loads(path.read_text(encoding="utf-8"))
+            except _json.JSONDecodeError:
+                return None
+        return None
+
+    def now_compact() -> str:
+        return _dt.now(_tz.utc).strftime("%Y%m%d%H%M%S")
+
+    def now_iso() -> str:
+        return _dt.now(_tz.utc).isoformat()
 
 logger = logging.getLogger(__name__)
 
