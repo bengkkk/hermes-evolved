@@ -1699,15 +1699,13 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         from agent.self_evolve import get_active_plan, create_plan, record_event
         if get_active_plan() is None:
             plan_id = create_plan(
-                "Complete hermes-evolved self-evolution framework",
+                "Complete Gap 8 — Self-directed evolution",
                 steps=[
-                    {"description": "Finalize Timeline and SelfModel data layer",
-                     "verification": "timeline.json has past/present/future sections"},
-                    {"description": "Inject orientation into system prompt",
-                     "verification": "format_orientation_context() content reaches session"},
-                    {"description": "Set up persistent cognition daemon",
-                     "verification": "think_daemon.py --once completes in < 60s"},
-                    {"description": "Push evolve code to GitHub",
+                    {"description": "Bootstrap evolve data with current state snapshot",
+                     "verification": "all 6 evolve JSON files exist with meaningful data"},
+                    {"description": "Set up persistent cognition daemon for continuous operation",
+                     "verification": "think_daemon --once completes in < 60s with LLM-backed output"},
+                    {"description": "Push evolve code to GitHub for version tracking",
                      "verification": "git push succeeds"},
                 ]
             )
@@ -2088,26 +2086,26 @@ def bootstrap_evolve_data() -> int:
                     "role": "Self-evolving AI system",
                 },
                 "state": {
-                    "evolution_version": 6,
-                    "current_gap_focus": "Gap 6 — World Model",
+                    "evolution_version": 7,
+                    "current_gap_focus": "Gap 8 — Self-directed evolution",
                     "total_cycles": 0,
-                    "remaining_gaps": ["4", "6", "8", "10"],
+                    "remaining_gaps": ["4", "8", "10"],
                 },
                 "capabilities": {
                     "strengths": [
-                        "File-backed persistent state (data_layer.py)",
-                        "World model with predict→act→observe→learn loop",
-                        "Persistent cognition daemon with LLM fallback",
-                        "Orientation context integrated into Hermes system prompt",
+                        "World model with full predict→act→observe→learn loop (159 tests, 15 verification checks)",
+                        "Persistent cognition daemon with LLM fallback (299 tests passing)",
+                        "File-backed persistent state (data_layer.py with Timeline, SelfModel, Memory, Goals, Orientation)",
+                        "Discrepancy-driven improvement suggestions bridging world model to self-directed goals",
                     ],
                     "weaknesses": [
-                        "World model has no action history yet",
                         "No self-generated goals defined",
                         "No multi-type memory accumulated",
+                        "Daemon not yet running in production (standalone/persistent mode)",
                     ],
                     "unknown_areas": [
-                        "Hermes provider/model resolution chain for daemon LLM calls",
-                        "How to persist a background daemon across process restarts",
+                        "How to persist a background daemon across process restarts (systemd/cron integration)",
+                        "Hermes provider/model resolution chain for daemon LLM calls outside Hermes session",
                     ],
                 },
                 "commitments": {
@@ -2170,15 +2168,15 @@ def bootstrap_evolve_data() -> int:
         try:
             _json.dump({
                 "version": 1,
-                "focus": "Complete hermes-evolved self-evolution framework",
+                "focus": "Advance to Gap 8 — Self-directed evolution",
                 "insights": [
-                    "Data layer, world model, and think_daemon are all built and tested (244 tests passing). "
-                    "Next: seed the evolve data and enable the daemon to run continuously.",
+                    "Gap 6 (World Model) is complete: predict→act→observe→learn loop with 159 tests and 15 verification checks passing. "
+                    "Next: shift focus to Gap 8 — make the system truly self-directing.",
                 ],
                 "next_steps": [
-                    "Bootstrap evolve data files with meaningful defaults",
-                    "Run initial daemon cycle",
-                    "Set up persistent daemon via cron or systemd",
+                    "Update orientation injection into Hermes system prompt for cross-session awareness",
+                    "Run initial think_daemon cycle to seed real action history",
+                    "Set up persistent daemon via systemd or cron for continuous operation",
                 ],
             }, target.open("w"))
             logger.info("Bootstrapped %s", target)
