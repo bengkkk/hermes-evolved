@@ -1302,12 +1302,12 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # each tick, pick the next action in sequence, so the system gathers
     # diverse data instead of spamming the same ls command.
     _ROTATING_AUTOS = [
-        {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: list workspace"},
-        {"type": "shell", "command": f"git -C {_WORKSPACE_ROOT_STR} log --oneline -3", "description": "Auto-default: recent git log"},
-        {"type": "shell", "command": "python3 -c 'from world_model import load_world_model; wm=load_world_model(); d=wm.data; print(len(d.get(\"action_triples\",[])), \"triples,\", len(d.get(\"predictions\",[])), \"preds\")'", "description": "Auto-default: world model stats"},
-        {"type": "shell", "command": f"wc -l {_WORKSPACE_ROOT_STR}/think_daemon.py {_WORKSPACE_ROOT_STR}/world_model.py {_WORKSPACE_ROOT_STR}/data_layer.py", "description": "Auto-default: evolved file sizes"},
-        {"type": "shell", "command": f"find {_WORKSPACE_ROOT_STR} -maxdepth 1 -type f -name '*.py' | wc -l", "description": "Auto-default: count top-level .py files"},
-        {"type": "shell", "command": f"python3 -c \"import pathlib; d=pathlib.Path('{_WORKSPACE_ROOT_STR}/..'); [print(f.name) for f in d.iterdir() if f.name.startswith('hermes') or f.name.startswith('.hermes')]\"", "description": "Auto-default: sibling dirs check"},
+        {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: list workspace", "expected_outcome": "exit=0: directory listing of workspace files"},
+        {"type": "shell", "command": f"git -C {_WORKSPACE_ROOT_STR} log --oneline -3", "description": "Auto-default: recent git log", "expected_outcome": "exit=0: recent git log entries (may show 'fatal: not a git repository')"},
+        {"type": "shell", "command": "python3 -c 'from world_model import load_world_model; wm=load_world_model(); d=wm.data; print(len(d.get(\"action_triples\",[])), \"triples,\", len(d.get(\"predictions\",[])), \"preds\")'", "description": "Auto-default: world model stats", "expected_outcome": "exit=0: world model stats with triple and prediction counts"},
+        {"type": "shell", "command": f"wc -l {_WORKSPACE_ROOT_STR}/think_daemon.py {_WORKSPACE_ROOT_STR}/world_model.py {_WORKSPACE_ROOT_STR}/data_layer.py", "description": "Auto-default: evolved file sizes", "expected_outcome": "exit=0: line counts for evolved Python files"},
+        {"type": "shell", "command": f"find {_WORKSPACE_ROOT_STR} -maxdepth 1 -type f -name '*.py' | wc -l", "description": "Auto-default: count top-level .py files", "expected_outcome": "exit=0: count of top-level Python source files"},
+        {"type": "shell", "command": f"python3 -c \"import pathlib; d=pathlib.Path('{_WORKSPACE_ROOT_STR}/..'); [print(f.name) for f in d.iterdir() if f.name.startswith('hermes') or f.name.startswith('.hermes')]\\\"", "description": "Auto-default: sibling dirs check", "expected_outcome": "exit=0: listing of sibling directories matching 'hermes*' pattern"},
     ]
     is_fallback = result.get("fallback", False)
     if not (act and isinstance(act, dict) and act.get("type")):
@@ -1930,11 +1930,17 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     ]
     _action_idx = tick_count % len(_state_check_commands)
     _action = dict(_state_check_commands[_action_idx])
-    # The git_commit action requires modified state files; skip if nothing to commit
+    # Set expected outcome for prediction feedback — specific per action
     if _action["type"] == "git_commit":
-        _action["expected_outcome"] = "git commit of evolve state files (may be empty if no changes)"
+        _action["expected_outcome"] = "exit=0: auto-sync commit of evolve state files (may be 'nothing to commit')"
+    elif "Goals" in _action.get("command", ""):
+        _action["expected_outcome"] = "exit=0: list of current goals with their statuses and priorities"
+    elif "Self Model" in _action.get("command", ""):
+        _action["expected_outcome"] = "exit=0: self-model evolution state with cycle count and top weaknesses"
+    elif "Daemon" in _action.get("command", ""):
+        _action["expected_outcome"] = "exit=0: daemon health stats with cycle counts and durations"
     else:
-        _action["expected_outcome"] = "Command output showing current system state"
+        _action["expected_outcome"] = "exit=0: state-check command output"
 
     return {
         "fallback": True,
