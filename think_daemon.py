@@ -752,7 +752,7 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
 def _prune_self_model(
     sm: Dict[str, Any],
     daemon_state: Optional[Dict[str, Any]] = None,
-) -> int:
+) -> int:  # Returns count of removed entries
     """Remove stale/duplicate entries from self-model to keep prompts clean.
 
     The daemon accumulates noise over many cycles: old weaknesses that refer
@@ -1425,10 +1425,20 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 except Exception as e:
                     logger.warning("Failed to save world model: %s", e)
     # ── Self-model pruning: remove stale/duplicate entries ──
+    _prune_count = 0
     try:
-        _prune_self_model(sm, daemon_state=state.get("daemon_state"))
+        _prune_count = _prune_self_model(sm, daemon_state=state.get("daemon_state"))
     except Exception as e:
         logger.warning("Self-model pruning failed (non-blocking): %s", e)
+    if _prune_count > 0:
+        tl.setdefault("past", {}).setdefault("events", []).append({
+            "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
+            "type": "auto_maintenance",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "summary": f"Auto-pruned {_prune_count} stale/duplicate entries from self-model",
+            "impact": "Clears fixations on resolved issues (think_daemon structure, data layer, orientation injection)",
+        })
+        tl["past"]["events"] = tl["past"]["events"][-50:]
 
     # ── Update orientation with latest insight ──
     insight = result.get("insight", "")
