@@ -590,7 +590,13 @@ class WorldModel:
                     (prev_avg * (total_verified - 1) + 0.5) / total_verified, 4
                 )
 
-                self._update_calibration(pred.get("confidence", 0.5), 0.5)
+                # NOTE: deliberately do NOT call _update_calibration() here.
+                # Auto-verified predictions always get error=0.5 (uncertain),
+                # which would pollute the calibration buckets with a systematic
+                # bias — every entry in a given confidence bucket would show
+                # error=0.5 regardless of whether the system was actually correct.
+                # Calibration data should only reflect predictions where the
+                # actual outcome was observed by the system (via verify_prediction).
                 self._add_to_error_history(0.5)
                 verified_count += 1
 
