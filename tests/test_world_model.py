@@ -1418,7 +1418,9 @@ class TestPredictActionOutcome:
         assert result["success_probability"] <= 0.5
         assert result["risk_level"] == "high"
         assert result["predicted_outcome"] is not None
-        assert "likely to fail" in result["predicted_outcome"]
+        # predicted_outcome now contains actual output text of most similar action;
+        # the meta-description moved to prediction_rationale.
+        assert "likely to fail" in result["prediction_rationale"]
 
     def test_risk_level_medium(self):
         """Mixed outcomes → medium risk."""
@@ -1458,15 +1460,18 @@ class TestPredictActionOutcome:
         assert write_result["risk_level"] == "high"
 
     def test_predicted_outcome_format(self):
-        """predicted_outcome string should contain type, label, stats."""
+        """prediction_rationale should contain type, label, stats."""
         wm = WorldModel()
         wm.record_action_complete("git_commit", "fix: typo", "exit=0: committed", "ok")
         wm.record_action_complete("git_commit", "feat: add", "exit=0: committed", "ok")
         result = wm.predict_action_outcome("git_commit", "fix: bug")
         assert result["predicted_outcome"] is not None
-        assert "data-driven" in result["predicted_outcome"]
-        assert "git_commit" in result["predicted_outcome"]
-        assert "success" in result["predicted_outcome"].lower()
+        # predicted_outcome now contains actual output text (most similar action's output)
+        assert "committed" in result["predicted_outcome"]
+        # The meta-description moved to prediction_rationale
+        assert "data-driven" in result["prediction_rationale"]
+        assert "git_commit" in result["prediction_rationale"]
+        assert "success" in result["prediction_rationale"].lower()
 
     def test_similar_actions_returned(self):
         """Similar past actions should appear in the result."""

@@ -1536,7 +1536,47 @@ class WorldModel:
 
         # ── Generate predicted outcome string ──
         if result["sample_count"] >= 1:
-            # Build a summary prediction from historical pattern
+            # TWO output fields:
+            #
+            #   predicted_outcome — the ACTUAL predicted output text the system
+            #       expects to see after executing this action.  Used as the
+            #       expected_outcome in action triples for error calculation.
+            #       It should look like real command output so that
+            #       _compute_prediction_error produces MEANINGFUL errors
+            #       (text similarity vs actual output).
+            #
+            #   prediction_rationale — human-readable explanation of the
+            #       prediction, including success probability and most-similar
+            #       past action.  Used for LLM context and debugging.
+            #
+            # Previously these were conflated into one field, producing a
+            # meta-description that shared no bigrams with real output,
+            # guaranteeing high prediction error (~0.5) even when the action
+            # succeeded exactly as similar past ones had.
+
+            # Build predicted outcome from most similar past action's actual output
+            if result["similar_actions"]:
+                best = result["similar_actions"][0]
+                # Use the most similar past action's outcome, truncated
+                outcome_text = (best.get("outcome", "") or "").strip()
+                if outcome_text:
+                    result["predicted_outcome"] = outcome_text[:100]
+                else:
+                    result["predicted_outcome"] = f"{action_type}: expected success"
+            else:
+                # Generic prediction based on action type
+                if action_type == "shell":
+                    result["predicted_outcome"] = "exit=0: command output"
+                elif action_type == "write_file":
+                    result["predicted_outcome"] = "Wrote file successfully"
+                elif action_type == "git_commit":
+                    result["predicted_outcome"] = "exit=0: committed"
+                elif action_type == "install_package":
+                    result["predicted_outcome"] = "exit=0: installed"
+                else:
+                    result["predicted_outcome"] = f"{action_type}: success"
+
+            # Build meta-description rationale for context / debugging
             if success_prob >= 0.7:
                 label = "likely to succeed"
             elif success_prob >= 0.4:
@@ -1544,21 +1584,18 @@ class WorldModel:
             else:
                 label = "likely to fail"
 
-            pred_parts = [
+            rationale_parts = [
                 f"[data-driven] {action_type} action: {label} ",
                 f"(success probability {success_prob:.0%}, "
                 f"n={count}, avg_err={avg_err:.2f})",
             ]
-
-            # Add evidence from most similar past action if found
             if result["similar_actions"]:
                 best = result["similar_actions"][0]
-                pred_parts.append(
+                rationale_parts.append(
                     f" | Most similar: \"{best['description'][:50]}\" "
                     f"→ \"{best['outcome'][:50]}\" [err={best['error']:.2f}]"
                 )
-
-            result["predicted_outcome"] = "".join(pred_parts)
+            result["prediction_rationale"] = "".join(rationale_parts)
 
         return result
 
