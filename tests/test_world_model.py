@@ -1336,3 +1336,140 @@ class TestEdgeCases:
         suggestions = wm.generate_improvement_suggestions()
         priorities = [s["priority"] for s in suggestions]
         assert priorities == sorted(priorities)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  predict_action_outcome — data-driven prediction
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestPredictActionOutcome:
+    """Test predict_action_outcome — data-driven outcome prediction."""
+
+    def test_no_data_returns_defaults(self):
+        """No historical data for action type → returns default with None predicted_outcome."""
+        wm = WorldModel()
+        result = wm.predict_action_outcome("shell", "run some command")
+        assert result["predicted_outcome"] is None
+        assert result["confidence"] == 0.0
+        assert result["sample_count"] == 0
+        assert result["avg_error"] is None
+        assert result["risk_level"] == "unknown"
+        assert result["success_probability"] == 0.5
+
+    def test_data_but_low_sample_count_blends(self):
+        """Fewer than 3 samples → blends success_probability toward neutral (0.5)."""
+        wm = WorldModel()
+        tid = wm.record_action("shell", "list files", "should list dir")
+        wm.complete_action(tid, "exit=0: file1.txt")
+        result = wm.predict_action_outcome("shell", "list files again")
+        assert result["sample_count"] == 1
+        assert result["avg_error"] is not None
+        # With 1 sample at low error: raw=~0.85, blend=(0.85*0.33+0.5*0.67)=0.62
+        assert 0.4 <= result["success_probability"] <= 0.75
+        assert result["confidence"] > 0.0
+        assert result["risk_level"] in ("low", "medium")
+
+    def test_good_data_high_confidence(self):
+        """Many successful actions → high success probability, low risk."""
+        wm = WorldModel()
+        for i in range(5):
+            tid = wm.record_action("write_file", f"write file {i}", "should succeed")
+            wm.complete_action(tid, f"Wrote file_{i}.py (10 bytes)")
+        result = wm.predict_action_outcome("write_file", "write new file")
+        assert result["sample_count"] == 5
+        assert result["success_probability"] >= 0.7
+        assert result["risk_level"] == "low"
+        assert result["confidence"] > 0.0
+
+    def test_poor_data_high_risk(self):
+        """Many failed actions → low success probability, high risk."""
+        wm = WorldModel()
+        for i in range(5):
+            tid = wm.record_action("deploy", f"deploy v{i}", "should succeed")
+            wm.complete_action(tid, "exit=1: deployment failed")
+        result = wm.predict_action_outcome("deploy", "deploy new version")
+        assert result["sample_count"] == 5
+        assert result["success_probability"] <= 0.5
+        assert result["risk_level"] == "high"
+        assert result["predicted_outcome"] is not None
+        assert "likely to fail" in result["predicted_outcome"]
+
+    def test_risk_level_medium(self):
+        """Mixed outcomes → medium risk."""
+        wm = WorldModel()
+        for i in range(4):
+            outcome = "exit=0: ok" if i % 2 == 0 else "exit=1: fail"
+            expected = "should work" if i % 2 == 0 else "should succeed"
+            tid = wm.record_action("shell", f"mixed op {i}", expected)
+            wm.complete_action(tid, outcome)
+        result = wm.predict_action_outcome("shell", "another mixed op")
+        assert result["risk_level"] in ("low", "medium")
+        # With 2/4 success, avg_err ~0.5 → success_prob ~0.5 → at least medium
+        assert result["success_probability"] >= 0.3
+
+    def test_unknown_action_type_returns_defaults(self):
+        """Unknown action type → no crash, returns defaults."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "test", "exit=0: ok", "ok")
+        result = wm.predict_action_outcome("nonexistent_type", "anything")
+        assert result["predicted_outcome"] is None
+        assert result["sample_count"] == 0
+        assert result["risk_level"] == "unknown"
+
+    def test_different_types_have_independent_stats(self):
+        """Different action types should have independent predictions."""
+        wm = WorldModel()
+        # shell: all successful
+        wm.record_action_complete("shell", "ok1", "exit=0: done", "expected ok")
+        wm.record_action_complete("shell", "ok2", "exit=0: done", "expected ok")
+        # write_file: all failed
+        wm.record_action_complete("write_file", "fail1", "exit=1: perm denied", "expected ok")
+        wm.record_action_complete("write_file", "fail2", "exit=1: disk full", "expected ok")
+        shell_result = wm.predict_action_outcome("shell", "test")
+        write_result = wm.predict_action_outcome("write_file", "test")
+        assert shell_result["success_probability"] > write_result["success_probability"]
+        assert shell_result["risk_level"] == "low"
+        assert write_result["risk_level"] == "high"
+
+    def test_predicted_outcome_format(self):
+        """predicted_outcome string should contain type, label, stats."""
+        wm = WorldModel()
+        wm.record_action_complete("git_commit", "fix: typo", "exit=0: committed", "ok")
+        wm.record_action_complete("git_commit", "feat: add", "exit=0: committed", "ok")
+        result = wm.predict_action_outcome("git_commit", "fix: bug")
+        assert result["predicted_outcome"] is not None
+        assert "data-driven" in result["predicted_outcome"]
+        assert "git_commit" in result["predicted_outcome"]
+        assert "success" in result["predicted_outcome"].lower()
+
+    def test_similar_actions_returned(self):
+        """Similar past actions should appear in the result."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "deploy to production", "exit=0: done", "ok")
+        wm.record_action_complete("shell", "deploy to staging", "exit=1: failed", "ok")
+        wm.record_action_complete("write_file", "write readme", "Wrote readme.md", "ok")
+        result = wm.predict_action_outcome("shell", "deploy to staging")
+        assert len(result["similar_actions"]) >= 1
+        # The similar actions should be shell type (not write_file)
+        for sa in result["similar_actions"]:
+            assert "deploy" in sa["description"].lower()
+
+    def test_similar_actions_empty_for_unmatched_type(self):
+        """No similar actions when description has no keyword overlap."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "deploy app", "exit=0: ok", "ok")
+        result = wm.predict_action_outcome("shell", "xyzzy_qwerty")
+        # No keyword overlap
+        assert result["similar_actions"] == []
+
+    def test_predict_action_outcome_edge_cases(self):
+        """Edge cases: empty description, very long description."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "test", "exit=0: ok", "expected")
+        # Empty description — should not crash
+        result_empty = wm.predict_action_outcome("shell", "")
+        assert result_empty is not None
+        # Very long description — should not crash
+        result_long = wm.predict_action_outcome("shell", "a" * 5000)
+        assert result_long is not None
