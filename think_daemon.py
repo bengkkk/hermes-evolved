@@ -1409,6 +1409,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             # then to action type + description.
             expected = act.get("expected_outcome")
             expected_source = "llm"  # default: LLM provided it
+            llm_confidence = None
             if not expected:
                 # Try data-driven prediction from historical action triples
                 try:
@@ -1416,6 +1417,8 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     if pred.get("predicted_outcome"):
                         expected = pred["predicted_outcome"]
                         expected_source = "world_model"
+                        # Pass the world model's own confidence for calibration
+                        llm_confidence = pred.get("confidence", 0.55)
                         logger.info(
                             "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d)",
                             atype, expected[:60], pred.get("confidence", 0), pred.get("sample_count", 0),
@@ -1425,7 +1428,8 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             if not expected:
                 expected = f"{atype}: {desc[:100]}" if desc else atype
                 expected_source = "fallback"
-            triple_id = wm.record_action(atype, desc or atype, expected, expected_source)
+            triple_id = wm.record_action(atype, desc or atype, expected, expected_source,
+                                         prediction_confidence=llm_confidence)
 
             # ── Proactive risk assessment: check action guidance ──
             try:

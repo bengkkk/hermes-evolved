@@ -315,6 +315,7 @@ class WorldModel:
         action_description: str,
         expected_outcome: str = "",
         expected_source: str = "llm",
+        prediction_confidence: Optional[float] = None,
     ) -> str:
         """Record an action BEFORE execution, returning the triple ID.
 
@@ -328,17 +329,34 @@ class WorldModel:
             expected_source: Where the prediction came from — ``\"llm\"`` (LLM-generated),
                 ``\"world_model\"`` (data-driven from historical triples),
                 or ``\"fallback\"`` (type+description default).
+            prediction_confidence: Optional confidence level (0.0–1.0) for this
+                prediction. When set, this value is used to populate the calibration
+                curve via ``_update_calibration`` when the action is completed.
+                If not provided, a default is derived from ``expected_source``:
+                ``\"world_model\"`` → 0.55, ``\"llm\"`` → 0.65, ``\"fallback\"`` → 0.3.
 
         Returns:
             Triple ID to pass to :meth:`complete_action`.
         """
         triple_id = _unique_id("act")
+        # Derive default confidence from source if not explicitly provided
+        if prediction_confidence is not None:
+            conf = max(0.0, min(1.0, prediction_confidence))
+        elif expected_source == "world_model":
+            conf = 0.55
+        elif expected_source == "llm":
+            conf = 0.65
+        elif expected_source == "fallback":
+            conf = 0.3
+        else:
+            conf = 0.5  # unknown source
         triple: Dict[str, Any] = {
             "id": triple_id,
             "action_type": action_type,
             "action_description": action_description,
             "expected_outcome": expected_outcome or "unknown",
             "expected_source": expected_source,
+            "prediction_confidence": conf,
             "actual_outcome": None,  # filled in by complete_action
             "prediction_error": None,
             "timestamp": now_iso(),
@@ -357,6 +375,9 @@ class WorldModel:
         """Record the actual outcome of a previously-recorded action.
 
         Calculates prediction error between expected and actual outcome.
+        Also updates the calibration curve from the action triple's
+        prediction confidence, so action-level outcomes feed into
+        the system's confidence calibration (not just macro predictions).
 
         Args:
             triple_id: The ID returned by :meth:`record_action`.
@@ -377,6 +398,10 @@ class WorldModel:
 
                 self._add_to_error_history(error)
                 self._update_accuracy_stats()
+                # Feed action triple into calibration curve using stored confidence
+                confidence = triple.get("prediction_confidence")
+                if confidence is not None:
+                    self._update_calibration(confidence, error)
                 return error
         return None
 
@@ -387,6 +412,7 @@ class WorldModel:
         action_output: str,
         expected_outcome: str = "",
         expected_source: str = "llm",
+        prediction_confidence: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Convenience: record and complete an action in one call.
 
@@ -397,7 +423,10 @@ class WorldModel:
         For the full predict→observe→compare cycle, use
         :meth:`record_action` + :meth:`complete_action` instead.
         """
-        triple_id = self.record_action(action_type, action_description, expected_outcome, expected_source)
+        triple_id = self.record_action(
+            action_type, action_description, expected_outcome,
+            expected_source, prediction_confidence,
+        )
         error = self.complete_action(triple_id, action_output)
         return {
             "id": triple_id,
