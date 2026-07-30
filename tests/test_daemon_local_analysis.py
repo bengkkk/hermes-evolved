@@ -127,7 +127,11 @@ class TestLocalAnalysis:
 
         # Safe nulls for LLM-only fields
         assert result["prediction"] is None
-        assert result["action"] is None
+        # action is non-None in fallback mode — _local_analysis produces
+        # a rotating state-check command to keep collecting data
+        assert result["action"] is not None
+        assert "type" in result["action"]
+        assert result["action"]["type"] == "shell" or result["action"]["type"] == "write_file" or result["action"]["type"] == "git_commit"
         assert result["commitment"] is None
         assert result["outcome_to_record"] is None
         assert result["new_plan"] is None

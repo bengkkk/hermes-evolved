@@ -1425,23 +1425,51 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             if not expected:
                 # Try data-driven prediction from historical action triples
                 try:
-                    pred = wm.predict_action_outcome(atype, desc)
+                    # Build parameters dict for more precise matching
+                    action_params = {}
+                    if atype == "shell" and act.get("command"):
+                        action_params["command"] = act["command"]
+                    elif atype == "write_file":
+                        if act.get("path"):
+                            action_params["path"] = act["path"]
+                        if act.get("content"):
+                            action_params["content"] = act["content"]
+                    elif atype == "git_commit" and act.get("message"):
+                        action_params["message"] = act["message"]
+                    elif atype == "install_package" and act.get("package"):
+                        action_params["package"] = act["package"]
+                    pred = wm.predict_action_outcome(atype, desc, parameters=action_params)
                     if pred.get("predicted_outcome"):
                         expected = pred["predicted_outcome"]
                         expected_source = "world_model"
                         # Pass the world model's own confidence for calibration
                         llm_confidence = pred.get("confidence", 0.55)
                         logger.info(
-                            "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d)",
+                            "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d, params_match=%s)",
                             atype, expected[:60], pred.get("confidence", 0), pred.get("sample_count", 0),
+                            pred.get("parameters_match", False),
                         )
                 except Exception as e:
                     logger.debug("Data-driven prediction failed (non-blocking): %s", e)
             if not expected:
                 expected = f"{atype}: {desc[:100]}" if desc else atype
                 expected_source = "fallback"
+            # Build parameters dict for record_action (same as above)
+            action_params_r = {}
+            if atype == "shell" and act.get("command"):
+                action_params_r["command"] = act["command"]
+            elif atype == "write_file":
+                if act.get("path"):
+                    action_params_r["path"] = act["path"]
+                if act.get("content"):
+                    action_params_r["content"] = act["content"]
+            elif atype == "git_commit" and act.get("message"):
+                action_params_r["message"] = act["message"]
+            elif atype == "install_package" and act.get("package"):
+                action_params_r["package"] = act["package"]
             triple_id = wm.record_action(atype, desc or atype, expected, expected_source,
-                                         prediction_confidence=llm_confidence)
+                                         prediction_confidence=llm_confidence,
+                                         parameters=action_params_r)
 
             # ── Proactive risk assessment: check action guidance ──
             try:

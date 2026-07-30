@@ -86,7 +86,7 @@ def _unique_id(prefix: str) -> str:
 
 
 _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
-    "version": 4,
+    "version": 5,
     "action_triples": [],       # List[ActionTriple]
     "predictions": [],          # List[Prediction]
     "prediction_accuracy": {    # Running statistics
@@ -316,6 +316,7 @@ class WorldModel:
         expected_outcome: str = "",
         expected_source: str = "llm",
         prediction_confidence: Optional[float] = None,
+        parameters: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Record an action BEFORE execution, returning the triple ID.
 
@@ -326,14 +327,21 @@ class WorldModel:
             action_type: ``write_file`` | ``shell`` | ``git_commit`` | ``install_package``
             action_description: Human-readable description of what the action does.
             expected_outcome: What the system expects will happen (from LLM prediction).
-            expected_source: Where the prediction came from — ``\"llm\"`` (LLM-generated),
-                ``\"world_model\"`` (data-driven from historical triples),
-                or ``\"fallback\"`` (type+description default).
+            expected_source: Where the prediction came from — ``"llm"`` (LLM-generated),
+                ``"world_model"`` (data-driven from historical triples),
+                or ``"fallback"`` (type+description default).
             prediction_confidence: Optional confidence level (0.0–1.0) for this
                 prediction. When set, this value is used to populate the calibration
                 curve via ``_update_calibration`` when the action is completed.
                 If not provided, a default is derived from ``expected_source``:
-                ``\"world_model\"`` → 0.55, ``\"llm\"`` → 0.65, ``\"fallback\"`` → 0.3.
+                ``"world_model"`` → 0.55, ``"llm"`` → 0.65, ``"fallback"`` → 0.3.
+            parameters: Optional dict of the actual action payload —
+                e.g. ``{"command": "ls -la"}`` for shell actions,
+                ``{"path": "/path/to/file.py", "content": "..."}`` for write_file,
+                ``{"message": "fix: bug"}`` for git_commit.
+                Stored alongside the description so the data-driven predictor
+                (predict_action_outcome) can match on actual action parameters,
+                not just high-level descriptions.
 
         Returns:
             Triple ID to pass to :meth:`complete_action`.
@@ -354,6 +362,7 @@ class WorldModel:
             "id": triple_id,
             "action_type": action_type,
             "action_description": action_description,
+            "action_parameters": dict(parameters) if parameters else {},
             "expected_outcome": expected_outcome or "unknown",
             "expected_source": expected_source,
             "prediction_confidence": conf,
@@ -1480,17 +1489,21 @@ class WorldModel:
         self,
         action_type: str,
         description: str = "",
+        parameters: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Predict the outcome of a proposed action using historical data.
 
         Generates a data-driven prediction based on per-type accuracy statistics,
-        similar past actions (keyword-matched), and recent trends.  This is the
-        world model's own predictive capability, independent of the LLM's
-        ``expected_outcome`` field.
+        similar past actions (keyword-matched on description + parameters),
+        and recent trends.  This is the world model's own predictive capability,
+        independent of the LLM's ``expected_outcome`` field.
 
         Args:
-            action_type: The action type (``\"shell\"``, ``\"write_file\"``, etc.).
+            action_type: The action type (``"shell"``, ``"write_file"``, etc.).
             description: Action description for similarity matching.
+            parameters: Optional dict of the actual action payload (command, path, etc.).
+                When provided, tokens from these parameters are combined with
+                description tokens for more precise similarity matching.
 
         Returns:
             A dict with:
@@ -1500,7 +1513,8 @@ class WorldModel:
               - ``avg_error``: Historical average prediction error for this type.
               - ``sample_count``: Number of historical samples used.
               - ``similar_actions``: Up to 3 descriptions of similar past actions.
-              - ``risk_level``: ``\"low\"``, ``\"medium\"``, or ``\"high\"``.
+              - ``risk_level``: ``"low"``, ``"medium"``, or ``"high"``.
+              - ``parameters_match``: Whether action parameters were used in matching.
         """
         result: Dict[str, Any] = {
             "predicted_outcome": None,
@@ -1510,6 +1524,7 @@ class WorldModel:
             "sample_count": 0,
             "similar_actions": [],
             "risk_level": "unknown",
+            "parameters_match": False,
         }
 
         per_type = self.get_per_type_accuracy()
@@ -1549,24 +1564,46 @@ class WorldModel:
         else:
             result["risk_level"] = "high"
 
-        # ── Similar past actions (keyword-matched) ──
+        # ── Similar past actions (keyword-matched on description + parameters) ──
+        # Extract tokens from both description and parameters for richer matching
+        query_tokens: set = set()
         if description:
             desc_lower = description.lower()
-            desc_tokens = set(re.findall(r"[a-z0-9]+", desc_lower))
-            scored: List[tuple[float, str]] = []
+            query_tokens = set(re.findall(r"[a-z0-9]+", desc_lower))
+        if parameters:
+            # Extract tokens from parameter values (commands, paths, messages, etc.)
+            for pkey, pval in parameters.items():
+                if isinstance(pval, str) and pval.strip():
+                    pval_lower = pval.lower()
+                    param_tokens = set(re.findall(r"[a-z0-9_/.@-]+", pval_lower))
+                    query_tokens |= param_tokens
+
+        scored: List[tuple[float, str]] = []
+        if query_tokens:
             for t in self.data.get("action_triples", []):
                 if t.get("action_type") != action_type or not t.get("completed"):
                     continue
+                # Build past tokens from description + stored parameters
                 past_desc = (t.get("action_description", "") or "").lower()
                 past_tokens = set(re.findall(r"[a-z0-9]+", past_desc))
-                if desc_tokens and past_tokens:
-                    overlap = len(desc_tokens & past_tokens)
-                    union = len(desc_tokens | past_tokens)
+                # Also extract from stored parameters if available
+                past_params = t.get("action_parameters")
+                if past_params and isinstance(past_params, dict):
+                    for pval in past_params.values():
+                        if isinstance(pval, str) and pval.strip():
+                            pval_l = pval.lower()
+                            past_tokens |= set(re.findall(r"[a-z0-9_/.@-]+", pval_l))
+                if past_tokens:
+                    overlap = len(query_tokens & past_tokens)
+                    union = len(query_tokens | past_tokens)
                     similarity = overlap / max(union, 1)
                     if similarity > 0.2:
                         err = t.get("prediction_error", 0.5)
                         actual = (t.get("actual_outcome", "") or "")[:80]
                         scored.append((similarity, past_desc[:60], err, actual))
+                        # Mark that we matched based on parameters if parameters were provided
+                        if parameters and not result["parameters_match"]:
+                            result["parameters_match"] = True
 
             # Sort by similarity, take top 3
             scored.sort(key=lambda x: x[0], reverse=True)
