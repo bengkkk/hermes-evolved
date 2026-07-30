@@ -1229,10 +1229,18 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     is_fallback = result.get("fallback", False)
     if not (act and isinstance(act, dict) and act.get("type")):
         tick = ds.get("tick_count", 0)
-        if tick >= 10 and not is_fallback:
+        if tick >= 10:
             idx = tick % len(_ROTATING_AUTOS)
             act = dict(_ROTATING_AUTOS[idx])
-            logger.info("Auto-default action (tick %d → auto[%d]: %s)", tick, idx, act["description"])
+            if is_fallback:
+                # In fallback mode, take exploratory actions anyway — collecting
+                # diverse data is valuable even without LLM guidance, and the
+                # rotating actions are designed to be low-risk exploration.
+                act["description"] = f"Exploratory: {act['description']}"
+            logger.info(
+                "Auto-default action (tick %d → auto[%d]: %s)",
+                tick, idx, act["description"],
+            )
     
     # Clean stale "no action" weaknesses when actions ARE being executed
     caps = sm.setdefault("capabilities", {})
@@ -1586,7 +1594,9 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
       - A basic self-model update noting the LLM outage.
       - A suggested focus for the next cycle (re-attempt LLM reflection).
       - No predictions (we can't predict without an LLM).
-      - No actions (we can't decide what to do without an LLM).
+      - Actions are delegated to the rotating auto-default mechanism in
+        _apply_insights (exploratory ls, git log, world-model stats),
+        which continues to collect data even when LLM is unavailable.
     """
     wm: WorldModel = state.get("world_model", load_world_model())
     sm: dict = state.get("self_model", load_self_model())
