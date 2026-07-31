@@ -113,6 +113,47 @@ def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
     return _llm_max_retries, _llm_attempt_timeout
 
 
+# ── Placeholder-plan guard ────────────────────────────────────────
+# The LLM occasionally emits plans with empty placeholder steps
+# (e.g. goal "Test", steps "Step A"/"Step B", verification "V").
+# Once persisted, such a plan re-enters the prompt every cycle as the
+# active plan, driving a deliberation fixation loop: the daemon keeps
+# promising to "execute Test steps A and B" even though the steps carry
+# no actionable content. This guard rejects placeholder plans at
+# creation time, mirroring the existing _STALE_PROMISE_PREFIXES filter
+# for commitments.
+_PLACEHOLDER_DESC_RE = re.compile(
+    r"^(step|s)[\s_\-]*[a-z0-9]+$", re.IGNORECASE
+)
+_PLACEHOLDER_VERIFY_RE = re.compile(
+    r"^(v|n/?a|none|verify|verification|todo|tbd)$", re.IGNORECASE
+)
+
+
+def _is_placeholder_step(step: Dict[str, Any]) -> bool:
+    """Detect a plan step with no actionable content.
+
+    A step is a placeholder when its description is empty, trivially
+    short, or a generic "Step N" / "S1" label, or when its verification
+    is empty / a bare "V" / "n/a". Placeholder steps cannot be executed
+    or verified, so plans consisting of them only waste cycles.
+    """
+    desc = (step.get("description") or "").strip()
+    verify = (step.get("verification") or "").strip()
+    if not desc:
+        return True
+    if len(desc) < 4:
+        return True
+    if _PLACEHOLDER_DESC_RE.match(desc):
+        return True
+    if not verify:
+        return True
+    if _PLACEHOLDER_VERIFY_RE.match(verify):
+        return True
+    return False
+
+
+
 # ═════════════════════════════════════════════════════════════════
 #  State helpers (delegated to data_layer for the heavy lifting)
 # ═════════════════════════════════════════════════════════════════
@@ -1311,20 +1352,41 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         has_active = any(p.get("status") == "active" for p in tl.get("future", {}).get("plans", []))
         if not has_active:
             from agent.self_evolve import create_plan as _cp, record_event as _re
-            steps_data = []
-            for i, s in enumerate(np["steps"]):
-                steps_data.append({
-                    "id": f"step_{i + 1}",
-                    "description": s.get("description", ""),
-                    "verification": s.get("verification", ""),
-                    "status": "pending",
-                    "blocked_by": None,
-                    "assigned_to": "user",
-                    "completed_at": None,
-                    "note": None,
-                })
-            plan_id = _cp(np["goal"], steps_data)
-            _re("milestone", f"Created plan: {np['goal']}", f"Plan {plan_id} with {len(steps_data)} steps")
+            # ── Placeholder-plan guard (see _is_placeholder_step) ──
+            # Filter out steps with no actionable content so a junk plan
+            # (e.g. "Test" with steps "Step A"/"Step B", verification "V")
+            # never becomes the active plan and traps the daemon in a
+            # deliberation fixation loop.
+            real_steps = [
+                s for s in np["steps"]
+                if isinstance(s, dict) and not _is_placeholder_step(s)
+            ]
+            if not real_steps:
+                logger.info(
+                    "Rejected placeholder plan %r — all %d steps are empty/generic",
+                    np.get("goal"), len(np["steps"]),
+                )
+                _re(
+                    "observation",
+                    f"Rejected placeholder plan: {np.get('goal')}",
+                    "All proposed steps were empty or generic placeholders "
+                    "(e.g. 'Step A', verification 'V'); no active plan created.",
+                )
+            else:
+                steps_data = []
+                for i, s in enumerate(real_steps):
+                    steps_data.append({
+                        "id": f"step_{i + 1}",
+                        "description": s.get("description", ""),
+                        "verification": s.get("verification", ""),
+                        "status": "pending",
+                        "blocked_by": None,
+                        "assigned_to": "user",
+                        "completed_at": None,
+                        "note": None,
+                    })
+                plan_id = _cp(np["goal"], steps_data)
+                _re("milestone", f"Created plan: {np['goal']}", f"Plan {plan_id} with {len(steps_data)} steps")
 
     # ── Update self model ──
     su = result.get("self_model_update", {})

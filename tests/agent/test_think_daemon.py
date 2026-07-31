@@ -1571,3 +1571,152 @@ class TestShellPreflightValidation:
         td = evolve_env["module"]
         out = td._execute_shell_action("exit 3")
         assert out.startswith("exit=3:")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Placeholder-plan guard (prevents deliberation fixation loops)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestPlaceholderPlanGuard:
+    """The daemon must never persist a plan whose steps carry no
+    actionable content (e.g. goal 'Test', steps 'Step A'/'Step B',
+    verification 'V'). Such plans re-enter the prompt as the active
+    plan every cycle and trap the daemon in a fixation loop.
+    """
+
+    def test_is_placeholder_step_detects_generic_labels(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # Generic 'Step N' / 'S1' labels with bare 'V' verification
+        assert td._is_placeholder_step({"description": "Step A", "verification": "V"})
+        assert td._is_placeholder_step({"description": "Step 1", "verification": "Verify"})
+        assert td._is_placeholder_step({"description": "S1", "verification": "V"})
+        assert td._is_placeholder_step({"description": "step_2", "verification": "n/a"})
+        # Empty fields
+        assert td._is_placeholder_step({"description": "", "verification": ""})
+        assert td._is_placeholder_step({"description": "  ", "verification": ""})
+        assert td._is_placeholder_step({"description": "Run tests", "verification": ""})
+        # Trivially short description
+        assert td._is_placeholder_step({"description": "Do", "verification": "tests pass"})
+
+    def test_is_placeholder_step_accepts_actionable_steps(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert not td._is_placeholder_step({
+            "description": "Run the world-model test suite",
+            "verification": "401 tests pass",
+        })
+        assert not td._is_placeholder_step({
+            "description": "Implement predict-action-verify loop",
+            "verification": "world_model.py imports and unit tests green",
+        })
+
+    def test_placeholder_new_plan_rejected_and_not_persisted(self, evolve_env: Dict) -> None:
+        """A plan whose steps are all placeholders must be rejected with an
+        observation event, and no active plan may exist afterwards.
+        """
+        td = evolve_env["module"]
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": {
+                "goal": "Test",
+                "steps": [
+                    {"description": "Step A", "verification": "V"},
+                    {"description": "Step B", "verification": "V"},
+                ],
+            },
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": WorldModel() if "WorldModel" in globals() else None,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+        if state["world_model"] is None:
+            from world_model import WorldModel
+            state["world_model"] = WorldModel()
+
+        td._apply_insights(result, state)
+
+        # No active plan must have been created
+        from data_layer import get_active_plan
+        assert get_active_plan() is None
+        # The rejection must be recorded as an observation event
+        tl = td.load_timeline()
+        events = tl.get("past", {}).get("events", [])
+        assert any("Rejected placeholder plan" in (e.get("summary") or "") for e in events)
+
+    def test_actionable_new_plan_still_created(self, evolve_env: Dict) -> None:
+        """Plans with real, verifiable steps must still be created."""
+        td = evolve_env["module"]
+        from world_model import WorldModel
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": {
+                "goal": "Calibrate world model",
+                "steps": [
+                    {"description": "Run the world-model test suite", "verification": "all tests pass"},
+                    {"description": "Collect five more shell action triples", "verification": "per-type count >= 5"},
+                ],
+            },
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": WorldModel(),
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+        td._apply_insights(result, state)
+
+        from data_layer import get_active_plan
+        plan = get_active_plan()
+        assert plan is not None
+        assert plan["goal"] == "Calibrate world model"
+        assert len(plan["steps"]) == 2
+        assert plan["steps"][0]["description"] == "Run the world-model test suite"
+

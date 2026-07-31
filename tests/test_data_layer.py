@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
@@ -894,6 +895,42 @@ class TestPlans:
         pid = create_plan("Empty plan")
         active = get_active_plan()
         assert active["progress"] == "0 steps"
+
+    def test_create_plan_does_not_mutate_module_default(self, evolve_env: Dict) -> None:
+        """Creating a plan must never leak into the module-level default.
+
+        Regression for the 2026-07-31 incident: ``_load_timeline_dict``
+        returned a shallow copy of ``_DEFAULT_TIMELINE_DICT``, so
+        ``create_plan`` appended the new plan into the shared default's
+        ``future.plans`` list. Every subsequent test/daemon cycle that
+        loaded a fresh (or missing) timeline then saw the leaked plan as
+        the active plan — producing spurious "active plan" states and
+        cross-test contamination (e.g. TestPlans failing when run after
+        test_think_daemon.py, and the daemon's auto-created "Complete
+        Gap 8" plan appearing in unrelated timelines).
+        """
+        import data_layer as dl_mod
+        before = copy.deepcopy(dl_mod._DEFAULT_TIMELINE_DICT)
+        assert before["future"]["plans"] == []
+
+        pid = create_plan("Leak test", [
+            {"description": "Do something real", "verification": "verify it works"},
+        ])
+        assert pid.startswith("plan_")
+
+        # The module-level default must remain pristine — the new plan
+        # lives only in the evolve-dir timeline.json, not in the default.
+        after = dl_mod._DEFAULT_TIMELINE_DICT
+        assert after["future"]["plans"] == [], (
+            "create_plan mutated the module-level default; "
+            "a later fresh load would see a phantom active plan"
+        )
+        # And a fresh load with a NEW evolve dir sees no active plan.
+        # (evolve_env isolation means the file we wrote lives in the
+        # current temp evolve dir; the point here is the default is clean.)
+        assert dl_mod.get_active_plan() is not None  # file-backed plan
+        assert after["future"]["plans"] == before["future"]["plans"]
+
 
 
 # ═══════════════════════════════════════════════════════════════════════

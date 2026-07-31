@@ -777,7 +777,7 @@ class Memory:
         target = path or cls.storage_path()
         data = _read_json(target)
         if isinstance(data, dict):
-            merged = dict(_DEFAULT_MEMORY)
+            merged = copy.deepcopy(_DEFAULT_MEMORY)
             merged.update(data)
             for section in ("episodic", "semantic", "procedural"):
                 if section in data and isinstance(data[section], list):
@@ -1061,7 +1061,7 @@ class Goals:
         target = path or cls.storage_path()
         data = _read_json(target)
         if isinstance(data, dict):
-            merged = dict(_DEFAULT_GOALS)
+            merged = copy.deepcopy(_DEFAULT_GOALS)
             merged.update(data)
             if "goals" in data and isinstance(data["goals"], list):
                 merged["goals"] = data["goals"]
@@ -1120,8 +1120,8 @@ def _load_timeline_dict() -> Dict[str, Any]:
     path = _resolve_evolve_dir() / "timeline.json"
     data = _read_json(path)
     if not isinstance(data, dict):
-        return dict(_DEFAULT_TIMELINE_DICT)
-    merged = dict(_DEFAULT_TIMELINE_DICT)
+        return copy.deepcopy(_DEFAULT_TIMELINE_DICT)
+    merged = copy.deepcopy(_DEFAULT_TIMELINE_DICT)
     for section in ("past", "present", "future"):
         if section in data and isinstance(data[section], dict):
             merged[section].update(data[section])
