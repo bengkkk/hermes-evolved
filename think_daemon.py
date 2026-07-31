@@ -1416,41 +1416,59 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             wm = state.get("world_model")
             if wm is None:
                 wm = load_world_model()
-            # Estimate expected outcome: use LLM's prediction if provided,
-            # otherwise fall back to data-driven prediction from world model,
-            # then to action type + description.
+            # Estimate expected outcome: ALWAYS compute data-driven prediction
+            # regardless of whether the LLM provided one.  The LLM's expected
+            # outcomes are often vague ("should list") or echo meta-context
+            # ("[data-driven] shell action: uncertain outcome...") which
+            # produces 0.5 prediction error even when the action succeeds.
+            # The data-driven predictor generates concrete outcomes like
+            # "exit=0: files" from similar past actions, which enable
+            # meaningful error tracking.
             expected = act.get("expected_outcome")
             expected_source = "llm"  # default: LLM provided it
             llm_confidence = None
-            if not expected:
-                # Try data-driven prediction from historical action triples
-                try:
-                    # Build parameters dict for more precise matching
-                    action_params = {}
-                    if atype == "shell" and act.get("command"):
-                        action_params["command"] = act["command"]
-                    elif atype == "write_file":
-                        if act.get("path"):
-                            action_params["path"] = act["path"]
-                        if act.get("content"):
-                            action_params["content"] = act["content"]
-                    elif atype == "git_commit" and act.get("message"):
-                        action_params["message"] = act["message"]
-                    elif atype == "install_package" and act.get("package"):
-                        action_params["package"] = act["package"]
-                    pred = wm.predict_action_outcome(atype, desc, parameters=action_params)
-                    if pred.get("predicted_outcome"):
-                        expected = pred["predicted_outcome"]
+            try:
+                # ── Always compute data-driven prediction ──
+                action_params = {}
+                if atype == "shell" and act.get("command"):
+                    action_params["command"] = act["command"]
+                elif atype == "write_file":
+                    if act.get("path"):
+                        action_params["path"] = act["path"]
+                    if act.get("content"):
+                        action_params["content"] = act["content"]
+                elif atype == "git_commit" and act.get("message"):
+                    action_params["message"] = act["message"]
+                elif atype == "install_package" and act.get("package"):
+                    action_params["package"] = act["package"]
+                pred = wm.predict_action_outcome(atype, desc, parameters=action_params)
+                if pred.get("predicted_outcome"):
+                    data_driven_outcome = pred["predicted_outcome"]
+                    data_driven_confidence = pred.get("confidence", 0.55)
+                    prefer_data = False
+                    if not expected:
+                        # No LLM expected: use data-driven
+                        prefer_data = True
+                    elif expected.strip().startswith("[data-driven]"):
+                        # LLM echoed meta-context as expected: use data-driven instead
+                        prefer_data = True
+                    elif expected.strip().startswith("should "):
+                        # Vague "should <verb>" predictions are less specific
+                        # than data-driven ones; prefer data-driven
+                        prefer_data = True
+                    if prefer_data:
+                        expected = data_driven_outcome
                         expected_source = "world_model"
-                        # Pass the world model's own confidence for calibration
-                        llm_confidence = pred.get("confidence", 0.55)
+                        llm_confidence = data_driven_confidence
                         logger.info(
-                            "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d, params_match=%s)",
+                            "Data-driven expected outcome for %s: %s (conf=%.2f, n=%d, params_match=%s, "
+                            "overrode LLM: '%s')",
                             atype, expected[:60], pred.get("confidence", 0), pred.get("sample_count", 0),
                             pred.get("parameters_match", False),
+                            (act.get("expected_outcome") or '')[:40],
                         )
-                except Exception as e:
-                    logger.debug("Data-driven prediction failed (non-blocking): %s", e)
+            except Exception as e:
+                logger.debug("Data-driven prediction failed (non-blocking): %s", e)
             if not expected:
                 expected = f"{atype}: {desc[:100]}" if desc else atype
                 expected_source = "fallback"
