@@ -204,6 +204,12 @@ explicitly instead of only learning of completion after the fact.
 - **Graceful stop** — `daemon_state.status == "shutdown"` checked after each
   cycle; `evolve_daemon.sh stop` SIGTERMs the holder and clears the lock.
 - **Fixation protection** — pre-cycle pruning + action dedup gate.
+- **Evidence-based self-model resolution** — `_prune_self_model` also clears
+  weaknesses/unknowns/commitments about *documented subjects* (source file
+  exists + reference doc exists — e.g. think_daemon.py + this doc) regardless
+  of phrasing, and `_apply_insights` refuses to re-add them. This replaced the
+  regex-whack-a-mole that let new phrasings of the resolved think_daemon.py
+  structure read survive for many cycles.
 - **Code-drift visibility** — stale daemon processes surface via the
   `code_drift` marker + launcher `status`; `evolve_daemon.sh restart`
   loads the latest logic.

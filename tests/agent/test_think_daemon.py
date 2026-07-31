@@ -1451,6 +1451,105 @@ class TestPruneSelfModel:
         assert len(sm["capabilities"]["unknown_areas"]) == 1
         assert len(sm["commitments"]["promised_features"]) == 1
 
+    # ── Evidence-based resolution (documented subjects) ─────────────
+
+    def test_evidence_based_resolves_new_phrasings(self, evolve_env: Dict) -> None:
+        """Entries restating established facts are pruned regardless of phrasing.
+
+        The canonical case: the think_daemon.py path/structure/read was
+        executed (cycle 293) and documented in docs/think_daemon_loop.md,
+        yet new LLM phrasings of "unknown" about it evaded every hardcoded
+        pattern.  Evidence-based resolution clears any phrasing.
+        """
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "I keep noting LLM unavailability instead of forcing the pending think_daemon.py read to the top of every cycle.",
+                    "Still prone to producing orientation summaries without executing pending steps; must treat shell/write actions as first-class outputs every cycle.",
+                ],
+                "unknown_areas": [
+                    "Exact path, length, and core-loop structure of think_daemon.py.",
+                    "think_daemon.py path, line count, and core-loop structure still unresolved until this cycle's action runs.",
+                    "A genuinely unresolved unknown area",
+                ],
+            },
+            "commitments": {
+                "promised_features": [
+                    "Execute the think_daemon.py read in this immediate cycle and document the core loop within the next 2 cycles.",
+                    "Ship the widget refactor by Friday",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 263})
+        # 1 weakness + 2 unknowns + 1 commitment resolved by evidence
+        assert removed == 4
+        assert sm["capabilities"]["weaknesses"] == [
+            "Still prone to producing orientation summaries without executing pending steps; must treat shell/write actions as first-class outputs every cycle.",
+        ]
+        assert sm["capabilities"]["unknown_areas"] == [
+            "A genuinely unresolved unknown area",
+        ]
+        assert sm["commitments"]["promised_features"] == [
+            "Ship the widget refactor by Friday",
+        ]
+
+    def test_evidence_based_gate_below_tick_threshold(self, evolve_env: Dict) -> None:
+        """Below the tick threshold, evidence-based resolution is skipped."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [],
+                "unknown_areas": [
+                    "Exact path, length, and core-loop structure of think_daemon.py.",
+                ],
+            },
+            "commitments": {"promised_features": []},
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 3})
+        assert removed == 0
+        assert len(sm["capabilities"]["unknown_areas"]) == 1
+
+    def test_evidence_based_keeps_design_questions(self, evolve_env: Dict) -> None:
+        """Design questions that merely mention a file are NOT resolved."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [],
+                "unknown_areas": [
+                    "What new capability should the daemon add next for self-directed evolution?",
+                    "How can the world model reduce prediction error for shell actions?",
+                ],
+            },
+            "commitments": {"promised_features": []},
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 263})
+        assert removed == 0
+        assert len(sm["capabilities"]["unknown_areas"]) == 2
+
+    def test_subject_is_resolved_predicate(self, evolve_env: Dict) -> None:
+        """The predicate keys on evidence + knowledge keywords, not wording."""
+        td = evolve_env["module"]
+        assert td._subject_is_resolved(
+            "Exact path, length, and core-loop structure of think_daemon.py."
+        )
+        assert td._subject_is_resolved(
+            "think_daemon.py path, line count, and core-loop structure still unresolved until this cycle's action runs."
+        )
+        assert td._subject_is_resolved(
+            "exact structure of world_model.py data and its prediction API"
+        )
+        # Design questions / unrelated text are NOT resolved
+        assert not td._subject_is_resolved(
+            "What new capability should the daemon add next for self-directed evolution?"
+        )
+        assert not td._subject_is_resolved(
+            "Ship the widget refactor by Friday"
+        )
+        assert not td._subject_is_resolved(
+            "A genuinely unresolved unknown area"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Action deduplication gate (break LLM fixation loops)
@@ -1613,6 +1712,76 @@ class TestActionDedupGate:
         ds_after = updates.get("daemon_state", {})
         last_output = ds_after.get("last_action_output", "")
         assert isinstance(last_output, str), f"Expected string output, got: {type(last_output)}"
+
+    def test_resolved_subject_not_reappended(self, evolve_env: Dict) -> None:
+        """_apply_insights refuses to re-add entries about documented subjects.
+
+        The class-level half of evidence-based resolution: even when the
+        LLM re-reports the think_daemon.py structure as an unknown /
+        weakness / commitment, the append path must drop it.  The prune
+        alone would only clean it up next cycle — but the self-model is
+        fed back into the LLM prompt, so blocking at append time stops the
+        fixation loop from re-seeding itself.
+        """
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        result = {
+            "action": None,
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {
+                "weakness": "I keep noting LLM unavailability instead of forcing the pending think_daemon.py read to the top of every cycle.",
+                "unknown": "Exact path, length, and core-loop structure of think_daemon.py.",
+                "new_commitment": "Execute the think_daemon.py read in this immediate cycle and document the core loop within the next 2 cycles.",
+            },
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        sm_out = updates["self_model"]
+        assert sm_out["capabilities"]["weaknesses"] == []
+        assert sm_out["capabilities"]["unknown_areas"] == []
+        assert sm_out["commitments"].get("promised_features", []) == []
 
 
 # ═══════════════════════════════════════════════════════════════════

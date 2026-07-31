@@ -1205,6 +1205,62 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ── Evidence-based subject resolution (Gap 8) ──────────────────────
+# The pattern-based prunes below are whack-a-mole: every new LLM phrasing
+# of an already-resolved topic needs a new regex.  The canonical case:
+# "Exact path, length, and core-loop structure of think_daemon.py."
+# evaded every hardcoded unknown_areas pattern for many cycles even
+# though the file had been read (4280 lines) and documented
+# (docs/think_daemon_loop.md).  This predicate resolves entries by
+# checking the EVIDENCE on disk — the subject's source file exists AND a
+# reference doc exists that maps it — instead of the wording, so ANY
+# phrasing about the established facts of a documented subject is pruned
+# (and, in _apply_insights, blocked from being re-added in the first
+# place).  The loop reference is verified against HEAD each time it is
+# committed (see git log: "docs(daemon): core-loop navigation map
+# verified at HEAD ..."), so doc existence is a trustworthy signal.
+_DOCUMENTED_SUBJECTS: tuple = (
+    # (subject tokens, source file, reference doc)
+    (
+        ("think_daemon.py", "think_daemon", "daemon loop", "daemon's loop",
+         "core-loop", "core loop", "coreloop"),
+        "think_daemon.py",
+        "docs/think_daemon_loop.md",
+    ),
+    (
+        ("world_model.py", "world model", "world-model"),
+        "world_model.py",
+        "docs/think_daemon_loop.md",
+    ),
+)
+_RESOLVED_FACT_KEYWORDS = re.compile(
+    r"path|locat|line count|structure|internal|loop|read|outline|unresolved",
+    re.IGNORECASE,
+)
+
+
+def _subject_is_resolved(text: str) -> bool:
+    """True when *text* restates facts of a subject that are now established.
+
+    A subject counts as documented when its source file exists in the
+    workspace AND a reference doc exists that maps it.  To stay
+    conservative, only entries that ALSO use knowledge keywords (path,
+    structure, read, ...) are resolved — a future design question that
+    merely mentions the file is left alone.
+    """
+    t = text.lower()
+    for tokens, src, doc in _DOCUMENTED_SUBJECTS:
+        if not any(tok in t for tok in tokens):
+            continue
+        if not (_WORKSPACE_ROOT / src).exists():
+            continue
+        if not (_WORKSPACE_ROOT / doc).exists():
+            continue
+        if _RESOLVED_FACT_KEYWORDS.search(t):
+            return True
+    return False
+
+
 def _prune_self_model(
     sm: Dict[str, Any],
     daemon_state: Optional[Dict[str, Any]] = None,
@@ -1235,6 +1291,39 @@ def _prune_self_model(
     """
     caps = sm.setdefault("capabilities", {})
     removed = 0
+
+    # ── 0a. Evidence-based resolution of documented subjects ──
+    # Entries about a subject whose facts are now established (e.g. the
+    # think_daemon.py path/structure/read) are stale regardless of their
+    # exact phrasing — the pattern rules below only match older wordings,
+    # so new phrasings of the same resolved topic kept surviving.  Gated
+    # on the same health-aware tick threshold as the pattern rules so
+    # early daemon cycles (which may run before the docs exist) are not
+    # over-pruned.
+    if daemon_state is not None and daemon_state.get("tick_count", 0) >= 10:
+        for _key in ("weaknesses", "unknown_areas"):
+            _entries = caps.get(_key, [])
+            _resolved = [e for e in _entries if _subject_is_resolved(e)]
+            if _resolved:
+                caps[_key] = [e for e in _entries if not _subject_is_resolved(e)]
+                removed += len(_resolved)
+                logger.info(
+                    "Resolved %d self-model %s by evidence "
+                    "(source + reference doc exist): %r",
+                    len(_resolved), _key, _resolved,
+                )
+        _commits = sm.setdefault("commitments", {})
+        _pf = _commits.get("promised_features", [])
+        _resolved_pf = [c for c in _pf if _subject_is_resolved(c)]
+        if _resolved_pf:
+            _commits["promised_features"] = [
+                c for c in _pf if not _subject_is_resolved(c)
+            ]
+            removed += len(_resolved_pf)
+            logger.info(
+                "Resolved %d self-model promised_features by evidence: %r",
+                len(_resolved_pf), _resolved_pf,
+            )
 
     # ── 0. Remove stale weaknesses whose root cause is resolved ──
     # Uses daemon health data to detect resolved issues, keeping the
@@ -1819,21 +1908,21 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             return False
 
         weakness = su.get("weakness")
-        if weakness and isinstance(weakness, str):
+        if weakness and isinstance(weakness, str) and not _subject_is_resolved(weakness):
             caps.setdefault("weaknesses", [])
             if not _is_near_duplicate(weakness, caps["weaknesses"]):
                 caps["weaknesses"].append(weakness)
                 caps["weaknesses"] = caps["weaknesses"][-10:]
 
         unknown = su.get("unknown")
-        if unknown and isinstance(unknown, str):
+        if unknown and isinstance(unknown, str) and not _subject_is_resolved(unknown):
             caps.setdefault("unknown_areas", [])
             if not _is_near_duplicate(unknown, caps["unknown_areas"]):
                 caps["unknown_areas"].append(unknown)
                 caps["unknown_areas"] = caps["unknown_areas"][-10:]
 
         new_commit = su.get("new_commitment")
-        if new_commit and isinstance(new_commit, str):
+        if new_commit and isinstance(new_commit, str) and not _subject_is_resolved(new_commit):
             commits = sm.setdefault("commitments", {})
             commits.setdefault("promised_features", [])
             if not _is_near_duplicate(new_commit, commits["promised_features"]):
