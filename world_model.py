@@ -1874,10 +1874,63 @@ class WorldModel:
         return get_evolve_dir() / "world_model.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
-        """Persist to disk as JSON (atomic write)."""
+        """Persist to disk as JSON (atomic write).
+
+        Conflict-aware: when saving to the default storage path, any action
+        triples or predictions present on disk but missing from this instance
+        (e.g. recorded concurrently by the daemon while a session held a stale
+        copy) are merged in before writing — a stale in-memory model can never
+        destroy newer recorded data. Explicit paths (tests, exports) are
+        written verbatim.
+        """
         target = path or self.storage_path()
+        if path is None:
+            self._merge_concurrent_records()
         safe_write_json(target, self.data)
         return target
+
+    def _merge_concurrent_records(self) -> None:
+        """Merge newer on-disk records into this model before saving.
+
+        Guards against the observed failure mode (2026-07-31): a session
+        holding a stale copy of the world model saved over data the daemon
+        had recorded meanwhile, destroying 17 action triples and 6 macro
+        predictions. Union-merge by ID keeps every writer's records.
+        """
+        on_disk = safe_read_json(self.storage_path())
+        if not isinstance(on_disk, dict):
+            return
+
+        # Merge action triples by id (dedupe, keep newest overall order)
+        merged = list(self.data.get("action_triples", []))
+        known = {t.get("id") for t in merged if t.get("id")}
+        added = 0
+        for t in on_disk.get("action_triples", []):
+            tid = t.get("id")
+            if tid and tid not in known:
+                merged.append(t)
+                known.add(tid)
+                added += 1
+        if added:
+            merged.sort(key=lambda t: t.get("timestamp", ""))
+            self.data["action_triples"] = merged[-200:]
+            # Recompute derived stats so calibration reflects the union
+            self._update_accuracy_stats()
+            self._update_per_type_accuracy()
+
+        # Merge macro predictions by id
+        merged_preds = list(self.data.get("predictions", []))
+        known_p = {p.get("id") for p in merged_preds if p.get("id")}
+        p_added = 0
+        for p in on_disk.get("predictions", []):
+            pid = p.get("id")
+            if pid and pid not in known_p:
+                merged_preds.append(p)
+                known_p.add(pid)
+                p_added += 1
+        if p_added:
+            merged_preds.sort(key=lambda p: p.get("timestamp", ""))
+            self.data["predictions"] = merged_preds[-100:]
 
     def _save(self) -> None:
         """Internal save — convenience wrapper."""

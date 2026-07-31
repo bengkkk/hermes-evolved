@@ -43,13 +43,21 @@ from typing import Any, Dict, List, Optional, Union
 logger = logging.getLogger(__name__)
 
 # ── Default storage paths ─────────────────────────────────────────
-# Respects HERMES_HOME for profile awareness, with explicit override
-_EVOLVE_DIR = Path(
-    os.environ.get(
-        "HERMES_EVOLVE_DIR",
-        os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
-    )
-) / "evolve"
+# Respects HERMES_HOME for profile awareness, with explicit override.
+# Resolved LAZILY (per call) — not frozen at import time — so that
+# HERMES_HOME / HERMES_EVOLVE_DIR changes after import take effect.
+# This is what makes the test suite's per-test HERMES_HOME isolation
+# (tests/conftest.py _hermetic_environment) actually work: without it,
+# data_layer cached the real evolve dir at import and file-backed
+# operations inside tests silently wrote to the live daemon's data
+# (2026-07-31 incident: a test run clobbered world_model.json).
+def _resolve_evolve_dir() -> Path:
+    return Path(
+        os.environ.get(
+            "HERMES_EVOLVE_DIR",
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+        )
+    ) / "evolve"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -58,8 +66,9 @@ _EVOLVE_DIR = Path(
 
 def get_evolve_dir() -> Path:
     """Return the evolve data directory (created on first access)."""
-    _EVOLVE_DIR.mkdir(parents=True, exist_ok=True)
-    return _EVOLVE_DIR
+    d = _resolve_evolve_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def safe_read_json(path: Union[Path, str], default: Any = None) -> Any:
@@ -252,7 +261,7 @@ class Timeline:
         separate filenames prevents accidental corruption when both APIs
         are active in the same data directory.
         """
-        return _EVOLVE_DIR / "timeline_events.json"
+        return _resolve_evolve_dir() / "timeline_events.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         """Persist all events as a versioned JSON dict.
@@ -476,7 +485,7 @@ class SelfModel:
 
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "self_model.json"
+        return _resolve_evolve_dir() / "self_model.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         """Persist to disk as JSON (atomic write)."""
@@ -540,7 +549,7 @@ class Orientation:
     # Persistence
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "orientation.json"
+        return _resolve_evolve_dir() / "orientation.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         target = path or self.storage_path()
@@ -756,7 +765,7 @@ class Memory:
 
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "memory.json"
+        return _resolve_evolve_dir() / "memory.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         target = path or self.storage_path()
@@ -1040,7 +1049,7 @@ class Goals:
 
     @staticmethod
     def storage_path() -> Path:
-        return _EVOLVE_DIR / "goals.json"
+        return _resolve_evolve_dir() / "goals.json"
 
     def save(self, path: Optional[Path] = None) -> Path:
         target = path or self.storage_path()
@@ -1108,7 +1117,7 @@ def save_timeline_dict(data: Dict[str, Any]) -> None:
 
 def _load_timeline_dict() -> Dict[str, Any]:
     """Load the dict-format timeline (past/present/future)."""
-    path = _EVOLVE_DIR / "timeline.json"
+    path = _resolve_evolve_dir() / "timeline.json"
     data = _read_json(path)
     if not isinstance(data, dict):
         return dict(_DEFAULT_TIMELINE_DICT)
@@ -1124,7 +1133,7 @@ def _load_timeline_dict() -> Dict[str, Any]:
 
 def _save_timeline_dict(data: Dict[str, Any]) -> None:
     """Save the dict-format timeline."""
-    safe_write_json(_EVOLVE_DIR / "timeline.json", data)
+    safe_write_json(_resolve_evolve_dir() / "timeline.json", data)
 
 
 # ── Dict-format timeline event helpers ──────────────────────────────

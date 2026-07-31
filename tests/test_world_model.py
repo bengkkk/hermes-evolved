@@ -1155,7 +1155,7 @@ class TestPersistence:
     def test_storage_path_uses_evolve_dir(self, monkeypatch, tmp_path):
         """Storage path should be under evolve directory."""
         import data_layer
-        monkeypatch.setattr(data_layer, '_EVOLVE_DIR', tmp_path)
+        monkeypatch.setattr(data_layer, '_resolve_evolve_dir', lambda: tmp_path)
         path = WorldModel.storage_path()
         assert "world_model.json" in str(path)
 
@@ -1173,6 +1173,43 @@ class TestPersistence:
         wm2 = WorldModel.load(tmp_path / "wm.json")
         pta = wm2.get_per_type_accuracy()
         assert "shell" in pta
+
+    def test_save_default_path_merges_concurrent_records(self, monkeypatch, tmp_path):
+        """A stale in-memory model must not destroy newer on-disk records.
+
+        Regression test for the 2026-07-31 data-loss incident: a session
+        holding a stale copy of the world model saved over data the daemon
+        had recorded meanwhile, destroying 17 triples and 6 predictions.
+        Save-to-default-path must union-merge by record id instead.
+        """
+        import data_layer
+        monkeypatch.setattr(data_layer, "_resolve_evolve_dir", lambda: tmp_path)
+
+        # Writer 1 records one triple and saves
+        wm1 = WorldModel()
+        wm1.record_action_complete("shell", "alpha action", "exit=0: done", "ok")
+        wm1.save()
+
+        # Writer 2 holds a stale model (never saw alpha), records its own
+        # triple, and saves — the merge must keep BOTH triples.
+        wm2 = WorldModel()
+        wm2.record_action_complete("shell", "beta action", "exit=0: done", "ok")
+        wm2.save()
+
+        wm3 = WorldModel.load()
+        descs = {t["action_description"] for t in wm3.data["action_triples"]}
+        assert "alpha action" in descs
+        assert "beta action" in descs
+        assert len(wm3.data["action_triples"]) == 2
+
+    def test_save_explicit_path_writes_verbatim(self, tmp_path):
+        """Explicit paths (tests, exports) are not merge-affected."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "explicit", "exit=0", "ok")
+        path = tmp_path / "explicit.json"
+        wm.save(path)
+        data = json.loads(path.read_text())
+        assert len(data["action_triples"]) == 1
 
 
 # ══════════════════════════════════════════════════════════════════════
