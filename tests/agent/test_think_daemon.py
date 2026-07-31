@@ -1745,12 +1745,14 @@ class TestLlmRetryPolicy:
 
     def test_extended_outage_probe_cycle(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
-        # Every 4th cycle (depth % 4 == 0): a bounded 30s probe so
+        # Every 4th cycle (depth % 4 == 0): a bounded 90s probe so
         # recovery is still detected within 4 cycles of the provider
-        # coming back.
-        assert td._llm_retry_policy(4) == (1, 30.0)
-        assert td._llm_retry_policy(8) == (1, 30.0)
-        assert td._llm_retry_policy(12) == (1, 30.0)
+        # coming back. 90s (not 30s) so the auxiliary client's internal
+        # transport timeout + one retry fit inside the cap; healthy
+        # opencode-go latencies have been observed up to 31s.
+        assert td._llm_retry_policy(4) == (1, 90.0)
+        assert td._llm_retry_policy(8) == (1, 90.0)
+        assert td._llm_retry_policy(12) == (1, 90.0)
 
     def test_setter_applies_policy_to_globals(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]

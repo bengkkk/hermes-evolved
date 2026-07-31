@@ -75,7 +75,7 @@ last-20 `cycle_history`). The cycle body:
    | 1            | 1 attempt × 60 s  | warm outage                        |
    | 2            | 1 attempt × 45 s  | deep outage, one probe             |
    | ≥3, skip     | **0 attempts**    | extended outage: straight to local analysis, no dead time |
-   | ≥3, probe    | 1 attempt × 30 s  | every 4th cycle, so recovery is detected within 4 cycles |
+   | ≥3, probe    | 1 attempt × 90 s  | every 4th cycle, so recovery is detected within 4 cycles. Cap raised 30 s → 90 s (2026-07-31): the auxiliary client's internal transport timeout (~30 s) + one in-client retry must fit inside it; a 30 s cap failed probes on endpoints that were merely slow (healthy opencode-go latencies observed at 31 s) |
 
    Each failed probe costs ~45–60 s of dead time (auxiliary client's
    internal retry + fallback stages), so during a multi-cycle outage probes
