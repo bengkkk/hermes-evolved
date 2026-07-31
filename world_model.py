@@ -202,14 +202,20 @@ def _compute_prediction_error(
         return 0.15
 
     # ── Mutual exit=0 success heuristic ──
-    # When BOTH expected and actual start with "exit=0", the command
-    # succeeded in both views.  The specific output after "exit=0: "
-    # (e.g. "files" vs "23" for an ls command) is typically truncated
-    # or differs due to nondeterministic output — the prediction was
-    # semantically correct at the success/failure level.
+    # When BOTH expected and actual agree the command exited 0, the
+    # prediction was correct at the success/failure level.  The specific
+    # output after "exit=0: " (e.g. "files" vs "23" for an ls command)
+    # is typically truncated or differs due to nondeterministic output —
+    # the prediction was semantically correct at the success/failure level.
+    # The expected side is often a descriptive sentence ("git commit
+    # succeeds with exit=0, creating commit") rather than a literal
+    # "exit=0: ..." prefix, so match the exit=0 marker anywhere in the
+    # expected string instead of requiring a prefix.
     # Score low (0.15) instead of falling through to bigram comparison
     # which would produce high error from non-overlapping content tokens.
-    if e_lower.startswith("exit=0") and a_lower.startswith("exit=0"):
+    if re.search(r"exit\s*[=:]\s*0\b", e_lower) and re.search(
+        r"exit\s*[=:]\s*0\b", a_lower
+    ):
         return 0.15
 
     # ── Exit-code observation (ground truth for command success/failure) ──

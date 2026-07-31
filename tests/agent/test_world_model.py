@@ -76,6 +76,45 @@ class TestComputePredictionError:
         # Shares "file" and "storage" tokens → moderate overlap
         assert 0.3 < error < 0.8, f"Expected 0.3–0.8, got {error}"
 
+    def test_mutual_exit0_descriptive_expected(self) -> None:
+        # Expected is a descriptive sentence containing the exit=0 marker,
+        # not a literal "exit=0: ..." prefix.  Actual confirms exit=0 →
+        # the prediction succeeded at the success/failure level.
+        # Regression: this used to fall through to content comparison and
+        # score a successful git commit as error 0.5.
+        err = _compute_prediction_error(
+            "git commit succeeds with exit=0, creating commit",
+            "exit=0: [evolve/real-thinking 829f6af8e] fix(world_model): "
+            "cap stored action-parameter payloads, 2 files changed, "
+            "47 insertions(+), 1 deletion(-)",
+        )
+        assert err <= 0.2, f"Expected ≤ 0.2 for successful commit, got {err}"
+
+    def test_mutual_exit0_marker_in_sentence(self) -> None:
+        err = _compute_prediction_error(
+            "command should exit=0 and list files",
+            "exit=0: file1.txt  file2.txt",
+        )
+        assert err <= 0.2, f"Expected ≤ 0.2, got {err}"
+
+    def test_mutual_exit0_requires_actual_zero(self) -> None:
+        # Expected mentions exit=0 but the actual command FAILED (exit=1):
+        # the mutual-success heuristic must NOT fire here.
+        err = _compute_prediction_error(
+            "git commit succeeds with exit=0, creating commit",
+            "exit=1: build failure — dependency not found",
+        )
+        assert err >= 0.3, f"Expected ≥ 0.3 for failed commit, got {err}"
+
+    def test_mutual_exit0_requires_expected_zero(self) -> None:
+        # Expected predicts failure (exit=1) but actual exited 0: content
+        # comparison should apply, not the mutual-success shortcut.
+        err = _compute_prediction_error(
+            "git commit fails with exit=1: nothing to commit",
+            "exit=0: committed successfully",
+        )
+        assert err >= 0.3, f"Expected ≥ 0.3, got {err}"
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Action triple lifecycle
