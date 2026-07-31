@@ -1466,3 +1466,108 @@ class TestLlmRetryPolicy:
         assert applied == (2, 90.0)
         assert td._llm_max_retries == 2
         assert td._llm_attempt_timeout == 90.0
+
+
+class TestShellPreflightValidation:
+    """Pre-flight shell command validation (``_validate_shell_command``).
+
+    Catches the two observed generation-defect classes — unbalanced
+    quotes and uncompilable embedded ``python3 -c`` code — that
+    previously burned a wasted subprocess call and polluted world-model
+    calibration with prediction errors that were actually command
+    generation defects, not world-model misses.
+
+    ``_execute_shell_action`` must block defective commands WITHOUT
+    spawning a subprocess, returning an explicit ``exit=-1: PRE-FLIGHT
+    BLOCKED: <reason>`` outcome, while still running well-formed
+    commands normally.
+    """
+
+    def test_plain_command_passes(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._validate_shell_command("ls -la") is None
+        assert td._validate_shell_command("echo hello world") is None
+        assert td._validate_shell_command("git log --oneline -3") is None
+
+    def test_balanced_quotes_pass(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._validate_shell_command("echo 'single quoted'") is None
+        assert td._validate_shell_command('echo "double quoted"') is None
+        assert td._validate_shell_command('echo "mixed \'nested\' quotes"') is None
+        assert td._validate_shell_command("echo 'a' && echo \"b\"") is None
+
+    def test_unbalanced_single_quote_detected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._validate_shell_command("echo 'unterminated") == (
+            "unbalanced single quote"
+        )
+
+    def test_unbalanced_double_quote_detected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._validate_shell_command('echo "unterminated') == (
+            "unbalanced double quote"
+        )
+
+    def test_escaped_quote_inside_double_quotes_is_balanced(self, evolve_env: Dict) -> None:
+        # A backslash-escaped quote inside a double-quoted region must not
+        # terminate the region (this is the exact failure mode of the
+        # observed 0.85-error triple: the generator escaped the closing
+        # quote, leaving the string unterminated).
+        td = evolve_env["module"]
+        # This one is genuinely balanced: the escaped quote is consumed
+        assert td._validate_shell_command('echo "it\\"s fine"') is None
+
+    def test_generated_python_c_quote_escape_detected(self, evolve_env: Dict) -> None:
+        # Reproduction of the observed failure: python3 -c "..." whose
+        # trailing quote was escaped by the generator — the double-quoted
+        # region never closes.
+        td = evolve_env["module"]
+        cmd = 'python3 -c "import pathlib; print(\'x\')\\"'
+        defect = td._validate_shell_command(cmd)
+        assert defect is not None
+        assert "unbalanced" in defect
+
+    def test_embedded_python_compiles_passes(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._validate_shell_command("python3 -c \"print('hi')\"") is None
+        assert (
+            td._validate_shell_command(
+                "python -c 'import sys; print(sys.version_info[0])'"
+            )
+            is None
+        )
+
+    def test_embedded_python_syntax_error_detected(self, evolve_env: Dict) -> None:
+        # Reproduction of the observed second failure class: a `for` loop
+        # after `;` in a one-liner is a Python SyntaxError.
+        td = evolve_env["module"]
+        cmd = 'python3 -c "import sys; for x in [1,2]: print(x)"'
+        defect = td._validate_shell_command(cmd)
+        assert defect is not None
+        assert "does not compile" in defect
+
+    def test_execute_blocks_defective_command_without_subprocess(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        td = evolve_env["module"]
+        # Prove the subprocess is never spawned for a defective command
+        import subprocess
+
+        def _boom(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("subprocess.run must not be called for a defective command")
+
+        monkeypatch.setattr(subprocess, "run", _boom)
+        out = td._execute_shell_action("echo 'unterminated")
+        assert out.startswith("exit=-1:")
+        assert "PRE-FLIGHT BLOCKED" in out
+
+    def test_execute_runs_valid_command(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        out = td._execute_shell_action("echo preflight-ok")
+        assert out.startswith("exit=0:")
+        assert "preflight-ok" in out
+
+    def test_execute_reports_real_failure_exit_code(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        out = td._execute_shell_action("exit 3")
+        assert out.startswith("exit=3:")

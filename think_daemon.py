@@ -1638,9 +1638,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             elif atype == "shell":
                 acmd = act.get("command", "")
                 if acmd:
-                    r = subprocess.run(acmd, shell=True, capture_output=True, text=True, timeout=60)
-                    rv = (r.stdout[:400] + "\n" + r.stderr[:200])[:500]
-                    action_output = f"exit={r.returncode}: {rv}"
+                    action_output = _execute_shell_action(acmd)
                     _add_ep("action", "Shell: " + acmd[:60], action_output)
             elif atype == "git_commit":
                 amsg = act.get("message", "")
@@ -2710,6 +2708,97 @@ async def run_one_cycle() -> Dict[str, Any]:
     ds["cycle_stats"] = cs
     save_daemon_state(ds)
     return result
+
+
+# ═════════════════════════════════════════════════════════════════
+#  Pre-flight shell command validation (Gap 6 calibration hygiene)
+# ═════════════════════════════════════════════════════════════════
+
+def _validate_shell_command(command: str) -> Optional[str]:
+    """Pre-flight validation of a generated shell command.
+
+    Returns ``None`` if the command is safe to run, or a human-readable
+    defect description if it should NOT be executed.
+
+    Catches two observed generation-defect classes that previously
+    burned a wasted subprocess call and recorded a high world-model
+    prediction error that was NOT a genuine world-model failure — the
+    error was in the generated COMMAND, not in the prediction about the
+    world:
+
+      1. Unbalanced quotes (e.g. a ``python3 -c "..."`` command whose
+         closing quote was escaped by the generator) → shell syntax
+         error at execution time (``exit=2``).
+      2. Embedded ``python3 -c "<code>"`` whose ``<code>`` does not
+         compile (e.g. a ``for`` loop after ``;`` in a one-liner) →
+         Python SyntaxError at execution time (``exit=1``).
+
+    Blocking these pre-flight means the subprocess is never spawned and
+    the world-model outcome records an explicit ``PRE-FLIGHT BLOCKED:
+    <reason>`` that the discrepancy extractor can learn from, instead of
+    a cryptic shell error.
+    """
+    if not command or not command.strip():
+        return None
+
+    # ── 1. Quote balance (shell-aware: backslash escapes inside double quotes) ──
+    in_single = in_double = False
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and in_double:
+            i += 2  # skip escaped char
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+        elif in_double:
+            if ch == '"':
+                in_double = False
+        else:
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+        i += 1
+    if in_single:
+        return "unbalanced single quote"
+    if in_double:
+        return "unbalanced double quote"
+
+    # ── 2. Embedded `python3 -c "<code>"` must compile ──
+    m = re.search(r"python(?:3)?\s+-c\s+([\"'])(.*?)\1", command, re.DOTALL)
+    if m:
+        code = m.group(2)
+        # Undo common shell-level escaping so compile() sees the real code
+        code = code.replace('\\"', '"').replace("\\'", "'")
+        try:
+            compile(code, "<generated-shell-python>", "exec")
+        except SyntaxError as e:
+            return f"embedded python3 -c does not compile: {e.msg}"
+    return None
+
+
+def _execute_shell_action(command: str, timeout: int = 60) -> str:
+    """Run a shell action with pre-flight validation.
+
+    Returns the world-model outcome string in the canonical
+    ``"exit=<code>: <output>"`` format. If the command fails pre-flight
+    validation, NO subprocess is spawned and the outcome is
+    ``"exit=-1: PRE-FLIGHT BLOCKED: <reason>"``.
+    """
+    import subprocess
+
+    defect = _validate_shell_command(command)
+    if defect:
+        logger.warning(
+            "Shell action blocked pre-flight: %s | cmd: %.120s", defect, command
+        )
+        return f"exit=-1: PRE-FLIGHT BLOCKED: {defect}"
+    r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+    rv = (r.stdout[:400] + "\n" + r.stderr[:200])[:500]
+    return f"exit={r.returncode}: {rv}"
 
 
 async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[str, Any]:
