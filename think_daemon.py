@@ -1935,14 +1935,19 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     error_history = wm.data.get("prediction_accuracy", {}).get("error_history", [])
 
     # ── Compute trend ──
-    trend_str = "stable"
-    if len(error_history) >= 4:
-        recent_avg = sum(error_history[-3:]) / 3
-        older_avg = sum(error_history[:3]) / 3
-        if recent_avg < older_avg * 0.8:
-            trend_str = "improving"
-        elif recent_avg > older_avg * 1.2:
-            trend_str = "degrading"
+    # Single source of truth: delegate to the world model's canonical trend
+    # computation (split-half additive comparison).  The previous local
+    # heuristic (last-3 vs first-3 with a multiplicative threshold) was
+    # spike-sensitive: a single 0.5 outlier in the last three samples flipped
+    # the verdict to "degrading" while the world model's own trend said
+    # "stable", producing self-contradictory insights and false alarms that
+    # sent the system chasing non-existent degradation.
+    _trend_labels = {
+        "↑ worsening": "degrading",
+        "↓ improving": "improving",
+        "→ stable": "stable",
+    }
+    trend_str = _trend_labels.get(wm._compute_error_trend(), "stable")
 
     # ── Cycle count from daemon state ──
     ds = state.get("daemon_state", {})

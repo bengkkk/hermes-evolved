@@ -193,6 +193,25 @@ class TestLocalAnalysis:
         insight = result["insight"]
         assert "degrading" in insight
 
+    def test_insight_trend_stable_despite_single_spike(self):
+        """A single 0.5 spike in an otherwise-stable series must NOT flip to 'degrading'.
+
+        Regression test: the old last-3-vs-first-3 multiplicative heuristic
+        flagged 'degrading' on one late 0.5 outlier while the world model's
+        canonical split-half trend said 'stable'.  The local analysis must
+        agree with the world model — a single outlier is noise, not a trend.
+        """
+        wm = _make_wm_with_triples(count=15, error_val=0.15)
+        error_history = [0.15] * 16 + [0.5]  # 17 entries, one late spike
+        wm.data["prediction_accuracy"]["error_history"] = error_history
+        wm._update_accuracy_stats()
+        state = _make_state(wm)
+        result = _local_analysis(state)
+
+        insight = result["insight"]
+        assert "degrading" not in insight
+        assert "stable" in insight
+
     def test_confidence_with_high_error(self):
         """Confidence should be lower when avg prediction error is high."""
         wm = _make_wm_with_triples(count=8, error_val=0.8)
