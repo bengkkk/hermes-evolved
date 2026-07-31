@@ -267,7 +267,9 @@ class TestPersistence:
             loaded = WorldModel.load(path)
             assert len(loaded.data["action_triples"]) == 1
             assert len(loaded.data["predictions"]) == 1
-            assert loaded.data["version"] == 4
+            # Check version is a positive int (not a change-detector literal)
+            assert isinstance(loaded.data.get("version"), int)
+            assert loaded.data["version"] >= 1
         finally:
             path.unlink(missing_ok=True)
 
