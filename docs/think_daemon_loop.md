@@ -33,8 +33,12 @@ last-20 `cycle_history`). The cycle body:
 
 1. **Load state** — timeline, self-model, orientation, world model.
 2. **Auto-verify expired predictions** — `world_model.verify_expired_predictions()`
-   compares old predictions against what actually happened, learning from
-   discrepancies (non-blocking on failure).
+   first checks each expired prediction against the action-triple record
+   (`verify_prediction_via_evidence`: topic-token match on actual outcomes);
+   predictions the system's own actions demonstrably fulfilled (or
+   contradicted) are scored 0.15 / 0.85 and fed into calibration. Only
+   when no evidence exists does it fall back to "timeframe expired — no
+   confirmation" (error 0.5, calibration-neutral).
 3. **Auto-create initial plan** if none exists (Gap 8 bootstrap; best-effort).
 4. **Pre-cycle self-model pruning** — remove stale/duplicate weaknesses
    *before* building the prompt so the LLM never re-fixates on stale entries.

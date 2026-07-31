@@ -104,6 +104,26 @@ _DEFAULT_WORLD_MODEL: Dict[str, Any] = {
     "per_type_accuracy": {},     # Action-type → stats for calibration
 }
 
+# Words that carry no predictive content in a prediction sentence.
+# Used by _extract_topic_tokens to identify the DISTINCTIVE terms of a
+# prediction — the terms we search for in action-triple evidence when
+# auto-verifying whether the prediction was actually fulfilled.
+_PREDICTION_STOPWORDS: frozenset = frozenset("""
+will would shall should can could may might must this that these those
+which what when where while who whom whose with from under over into onto
+through about after before between during without within across against
+along among around at by for in of on to up down off out beyond upon via
+near than then there their them they its it's its it are was were been
+being have has had do does did doing get got gets make made makes use
+used uses using one two three four first second next last new now way
+part etc least reveal reveals revealed return returns returned allow
+allows allowed advance advances advanced complete completes completed
+execute executes executed perform performs performed continue continues
+continued result results resulted our ourself ourselves your yourself
+yourselves themselves itself not no nor also just more most some such
+only very each other another every any both all both
+""".split())
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Error calculation
@@ -538,6 +558,149 @@ class WorldModel:
                 return error
         return None
 
+    # ── Evidence-based verification (Gap 6 learning loop) ─────────
+
+    @staticmethod
+    def _extract_topic_tokens(text: str) -> List[str]:
+        """Extract the distinctive topic terms of a prediction sentence.
+
+        Filters out function words and weak prediction verbs (the
+        stopword set), leaving the terms that identify WHAT the
+        prediction is about — paths, filenames, and content words.
+        These are the terms we search for in action-triple evidence.
+        """
+        tokens: set = set()
+        for m in re.finditer(r"[a-z0-9_./\\-]+", (text or "").lower()):
+            tok = m.group(0)
+            if tok in _PREDICTION_STOPWORDS:
+                continue
+            if tok.isdigit():
+                continue
+            # Keep paths/filenames regardless of length; require ≥4 chars otherwise
+            if len(tok) < 4 and "/" not in tok and "." not in tok and "\\" not in tok:
+                continue
+            tokens.add(tok)
+        return sorted(tokens)
+
+    def _find_prediction_evidence(
+        self, pred_text: str
+    ) -> Optional[Tuple[str, List[str]]]:
+        """Search recorded action triples for evidence about a prediction.
+
+        A triple counts as evidence when at least 2 of the prediction's
+        topic tokens appear in its description/expected/actual fields.
+        Returns ``(lowercased_evidence_blob, matched_tokens)`` for the
+        triple with the most token matches, or None when no triple
+        provides meaningful evidence.
+
+        This is how the system closes the learning loop on its own:
+        predictions about what its actions will achieve are checked
+        against what those actions actually produced — without needing
+        an LLM or human to adjudicate.
+        """
+        tokens = self._extract_topic_tokens(pred_text)
+        if len(tokens) < 2:
+            return None  # Not enough to match on
+        best: Optional[Tuple[str, List[str]]] = None
+        for triple in self.data.get("action_triples", []):
+            blob = " ".join(
+                str(triple.get(k, ""))
+                for k in ("actual_outcome", "action_description", "expected_outcome")
+            ).lower()
+            matched = [tok for tok in tokens if tok in blob]
+            if len(matched) >= 2 and (best is None or len(matched) > len(best[1])):
+                best = (blob, matched)
+        return best
+
+    @staticmethod
+    def _score_evidence_blob(blob_l: str) -> Optional[float]:
+        """Score an evidence blob as fulfilled (0.15) or contradicted (0.85).
+
+        Returns None when the evidence is ambiguous (both success and
+        failure markers present, or neither) — callers fall back to the
+        uncertain (0.5) path in that case.
+
+        Informational non-events (\"nothing to commit\", \"already up to
+        date\", ...) are treated as ambiguous: the predicted action did
+        not occur, but nothing failed either.
+        """
+        informational = bool(re.search(
+            r"(nothing to commit|working tree clean|already up.to.date|"
+            r"no changes|nothing changed|nothing to do|"
+            r"0 files changed|0 insertions|0 deletions|"
+            r"requirement already satisfied|already installed)",
+            blob_l,
+        ))
+        if informational:
+            return None
+        has_fail = bool(
+            re.search(r"\b(error|failed|failure|traceback|permission denied|unable)\b", blob_l)
+            or re.search(r"exit=[1-9]", blob_l)
+        )
+        has_succ = bool(re.search(
+            r"(exit=0|found|wrote|created|passed|succeeded|completed|opened|listed)",
+            blob_l,
+        ))
+        if has_fail and not has_succ:
+            return 0.85
+        if has_succ and not has_fail:
+            return 0.15
+        return None  # mixed or silent evidence — uncertain
+
+    def verify_prediction_via_evidence(self, pred_id: str) -> Optional[float]:
+        """Verify a prediction using evidence from recorded action triples.
+
+        If the prediction's topic terms appear in the outcomes of at
+        least one recorded action, the prediction is marked verified
+        with error 0.15 (fulfilled) or 0.85 (contradicted by failure
+        markers).  Statistics, calibration, and error history are
+        updated exactly as in :meth:`verify_prediction`.
+
+        Returns the error score, or None when no evidence was found or
+        the evidence was ambiguous (the prediction is left unverified
+        for the caller to handle, e.g. via timeout-based auto-verification).
+        """
+        for pred in self.data.get("predictions", []):
+            if pred.get("id") != pred_id or pred.get("verified"):
+                continue
+            evidence = self._find_prediction_evidence(pred.get("text", ""))
+            if evidence is None:
+                return None
+            blob_l, matched = evidence
+            error = self._score_evidence_blob(blob_l)
+            if error is None:
+                return None
+            pred["verified"] = True
+            pred["actual"] = (
+                "fulfilled — action evidence found"
+                if error <= 0.3
+                else "contradicted — action evidence shows failure"
+            )
+            pred["verification_note"] = (
+                f"Auto-verified via action-triple evidence "
+                f"(matched: {', '.join(matched)})"
+            )
+            pred["verified_at"] = now_iso()
+            pred["error"] = error
+
+            acc = self.data.setdefault("prediction_accuracy", {})
+            acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
+            if error <= 0.3:
+                acc["correct_predictions"] = acc.get("correct_predictions", 0) + 1
+            else:
+                acc["incorrect_predictions"] = acc.get("incorrect_predictions", 0) + 1
+
+            total_verified = acc.get("verified_predictions", 1)
+            prev_avg = acc.get("avg_prediction_error", 0.0)
+            acc["avg_prediction_error"] = round(
+                (prev_avg * (total_verified - 1) + error) / total_verified, 4
+            )
+
+            self._update_calibration(pred.get("confidence", 0.5), error)
+            self._add_to_error_history(error)
+            return error
+        return None
+
     # ── Auto-verification of expired predictions ──────────────────
 
     @staticmethod
@@ -601,10 +764,18 @@ class WorldModel:
     def verify_expired_predictions(self) -> int:
         """Auto-verify predictions whose timeframe has expired.
 
-        Checks all unverified predictions against the current time.
-        If a prediction has a timeframe that has passed, it is
-        auto-verified with outcome ``"timeframe expired — no confirmation"``
-        and error 0.5 (uncertain — could be right or wrong).
+        Two-stage verification for every expired, unverified prediction:
+
+        1. **Evidence stage** — ``verify_prediction_via_evidence`` searches
+           the world model's own action triples for the prediction's topic
+           terms.  If the predicted event demonstrably happened (or was
+           contradicted by failure markers), the prediction is scored
+           0.15 / 0.85 and fed into calibration — a real observation,
+           exactly like a manual verification.
+        2. **Fallback stage** — if no evidence exists, the prediction is
+           auto-verified with outcome ``\"timeframe expired — no
+           confirmation\"`` and error 0.5 (uncertain), which does NOT
+           pollute the calibration curve.
 
         Predictions without a parseable timeframe are left alone.
 
@@ -649,7 +820,12 @@ class WorldModel:
             # for a full hour, accumulating unverified predictions that masked real trends.
             grace = max(days * 0.1, 1.0 / 144.0)  # at least ~10 min
             if elapsed_days >= days + grace:
-                # Timeframe has expired — auto-verify as uncertain
+                # Stage 1: try to find evidence in recorded action triples.
+                evidence_error = self.verify_prediction_via_evidence(pred.get("id", ""))
+                if evidence_error is not None:
+                    verified_count += 1
+                    continue
+                # Stage 2: no evidence — auto-verify as uncertain
                 pred["verified"] = True
                 pred["actual"] = "timeframe expired — no confirmation"
                 pred["error"] = 0.5

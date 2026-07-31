@@ -901,6 +901,140 @@ class TestVerifyExpiredPredictions:
         assert count == 1  # Only the expired one
 
 
+class TestEvidenceBasedVerification:
+    """Expired predictions are checked against action-triple evidence before
+    being defaulted to 'unconfirmed' — the system learns from what its own
+    actions actually produced instead of discarding every expiry as unknown."""
+
+    @staticmethod
+    def _age_prediction(wm: WorldModel, pid: str, days: float = 30.0) -> None:
+        from datetime import datetime, timezone, timedelta
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = (
+                    datetime.now(timezone.utc) - timedelta(days=days)
+                ).isoformat()
+
+    def test_expired_prediction_with_success_evidence_fulfilled(self) -> None:
+        wm = WorldModel()
+        # Action triple: a search that actually found think_daemon.py
+        wm.record_action_complete(
+            "shell",
+            "Search the filesystem globally for think_daemon.py",
+            "exit=0: /opt/hermes-evolved/think_daemon.py\n/workspace/hermes-evolved/",
+            "find think_daemon.py",
+        )
+        acc_before = sum(b["count"] for b in wm.data["prediction_accuracy"]["calibration_buckets"])
+        pid = wm.record_prediction(
+            "A global find for think_daemon.py will return a usable path",
+            "1 day", 0.7, "test",
+        )
+        self._age_prediction(wm, pid)
+        count = wm.verify_expired_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        assert pred["verified"] is True
+        assert pred["error"] == 0.15
+        assert "evidence" in pred["verification_note"]
+        acc = wm.data["prediction_accuracy"]
+        assert acc["correct_predictions"] == 1
+        assert acc["incorrect_predictions"] == 0
+        # Calibration was fed a real observation (exactly one new bucket hit
+        # on top of the action triple's own entry)
+        total_bucket_hits = sum(b["count"] for b in acc["calibration_buckets"])
+        assert total_bucket_hits == acc_before + 1
+
+    def test_expired_prediction_with_failure_evidence_contradicted(self) -> None:
+        wm = WorldModel()
+        wm.record_action_complete(
+            "shell",
+            "Search for think_daemon.py in workspace",
+            "error: permission denied accessing /workspace/hermes-evolved",
+            "find think_daemon.py",
+        )
+        pid = wm.record_prediction(
+            "A search for think_daemon.py will succeed",
+            "1 day", 0.6, "test",
+        )
+        self._age_prediction(wm, pid)
+        count = wm.verify_expired_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        assert pred["verified"] is True
+        assert pred["error"] == 0.85
+        acc = wm.data["prediction_accuracy"]
+        assert acc["incorrect_predictions"] == 1
+        assert acc["correct_predictions"] == 0
+
+    def test_expired_prediction_without_evidence_stays_unconfirmed(self) -> None:
+        wm = WorldModel()
+        # No action triples recorded at all
+        pid = wm.record_prediction(
+            "The weather on mars will be clear next week",
+            "1 day", 0.5, "test",
+        )
+        self._age_prediction(wm, pid)
+        count = wm.verify_expired_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        assert pred["error"] == 0.5
+        assert "no confirmation" in pred["actual"]
+        acc = wm.data["prediction_accuracy"]
+        assert acc["correct_predictions"] == 0
+        assert acc["incorrect_predictions"] == 0
+        # Uncertain auto-verifications do not pollute calibration
+        total_bucket_hits = sum(b["count"] for b in acc["calibration_buckets"])
+        assert total_bucket_hits == 0
+
+    def test_single_token_match_is_not_evidence(self) -> None:
+        wm = WorldModel()
+        # Evidence mentions think_daemon.py, but only ONE topic token matches
+        # (the rest of the prediction is about something else entirely).
+        wm.record_action_complete(
+            "shell",
+            "List workspace contents",
+            "exit=0: think_daemon.py\nworld_model.py\ndata_layer.py",
+            "list files",
+        )
+        pid = wm.record_prediction(
+            "The banana harvest in brazil will double by august",
+            "1 day", 0.5, "test",
+        )
+        # Give it topic tokens that mostly don't appear anywhere
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["text"] = "think_daemon.py will grow a banana tree by august"
+        self._age_prediction(wm, pid)
+        count = wm.verify_expired_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        # think_daemon.py matches, but banana/august/tree do not → 1 token < 2
+        assert pred["error"] == 0.5
+
+    def test_extract_topic_tokens_filters_stopwords(self) -> None:
+        tokens = WorldModel._extract_topic_tokens(
+            "A global find for think_daemon.py will return a usable path"
+        )
+        assert "think_daemon.py" in tokens
+        assert "global" in tokens
+        assert "usable" in tokens
+        assert "path" in tokens
+        # Stopwords and function words are excluded
+        assert "will" not in tokens
+        assert "for" not in tokens
+        assert "a" not in tokens
+
+    def test_verify_prediction_via_evidence_leaves_unverified_when_no_evidence(self) -> None:
+        wm = WorldModel()
+        pid = wm.record_prediction(
+            "The system will reach fifty cycles tomorrow",
+            "1 day", 0.6, "test",
+        )
+        result = wm.verify_prediction_via_evidence(pid)
+        assert result is None
+        assert wm.data["predictions"][0]["verified"] is False
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═══════════════════════════════════════════════════════════════════
