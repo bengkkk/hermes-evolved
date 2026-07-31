@@ -1034,6 +1034,27 @@ def _prune_self_model(
                 "Think daemon structure and goal integration are established. The source has been read, and goal lifecycle code (new_goal, goal_action, _reconcile_goals_with_world) is already in think_daemon.py.",
             ))
 
+        # Pattern 9: Test-plan completion — the historical "Test steps A/B"
+        # plan (locate think_daemon.py, run the world-model test harness) is
+        # verifiably complete (memory: "Test plan A/B complete; commit
+        # 829f6af8e"; harness = tests/test_world_model.py + test_think_daemon.py,
+        # all passing). Weaknesses that still reference the plan as pending,
+        # or that are pinned to the file-location event ("immediately after
+        # locating the file"), are stale and drive the same fixation loop as
+        # Pattern 8.
+        if daemon_state.get("tick_count", 0) >= 10:
+            stale_patterns.append((
+                r"test plan persists until"
+                r"|pending test plan"
+                r"|until tests? pass"
+                r"|until (?:both )?test steps? (?:are |is |pass)"
+                r"|test steps? (?:this cycle|immediately|to completion)"
+                r"|immediately after locating the file"
+                r"|test execution this cycle"
+                r"|test run this cycle",
+                "Test plan A/B is complete (commit 829f6af8e); the world-model test harness is known and passing",
+            ))
+
         for pattern, reason in stale_patterns:
             weaknesses = caps.get("weaknesses", [])
             before = len(weaknesses)
@@ -1156,6 +1177,35 @@ def _prune_self_model(
                 original_len, len(commits["promised_features"]), total_removed,
             )
 
+    # ── 2b. Health-aware stale commitments ──
+    # Promised features that reference verifiably-completed work only add
+    # prompt noise and reinforce fixation loops (the LLM re-echoes stale
+    # commitments it sees in the self-model). The "Test steps A/B" plan is
+    # complete (commit 829f6af8e) and think_daemon.py is located, so any
+    # commitment still promising to run those steps is stale.
+    if daemon_state is not None and daemon_state.get("tick_count", 0) >= 10:
+        pf = commits.get("promised_features", [])
+        if pf:
+            stale_pf_pattern = (
+                r"test steps? (?:a and b|a/b|a & b|this cycle|immediately|to completion|pending)"
+                r"|pending test steps?"
+                r"|test plan"
+                r"|as soon as think_daemon\.py (?:is|has been) located"
+            )
+            before_pf = len(pf)
+            commits["promised_features"] = [
+                c for c in pf
+                if not re.search(stale_pf_pattern, c, re.IGNORECASE)
+            ]
+            pf_removed = before_pf - len(commits["promised_features"])
+            if pf_removed > 0:
+                removed += pf_removed
+                logger.info(
+                    "Removed %d stale commitment(s) referencing the completed "
+                    "Test plan / think_daemon location — %r",
+                    pf_removed, stale_pf_pattern,
+                )
+
     # ── 3. Health-aware stale detection for unknown_areas ──
     # Uses the same daemon health data as weaknesses pruning above.
     if daemon_state is not None:
@@ -1213,6 +1263,19 @@ def _prune_self_model(
                     r"|how goal lifecycle can be integrated into the daemon.*loop"
                     r"|detailed internal structure of think_daemon",
                     "Think daemon structure and goal integration are established. The source has been read; new_goal, goal_action, and _reconcile_goals_with_world already implement the goal lifecycle in think_daemon.py.",
+                ))
+                # Sub-pattern: think_daemon.py location + world-model test
+                # harness — both resolved. The script is at the repo root
+                # (the daemon itself runs it) and the harness is
+                # tests/test_world_model.py + tests/agent/test_think_daemon.py,
+                # all passing. Unknowns still claiming these are unresolved
+                # ("being resolved this cycle") are stale.
+                u_patterns.append((
+                    r"location of think_daemon\.py"
+                    r"|exact test harness for world-model predictions"
+                    r"|test harness invocation"
+                    r"|until script inspection completes",
+                    "think_daemon.py is located at the repo root and the world-model test harness is known and passing",
                 ))
 
             for pattern, reason in u_patterns:

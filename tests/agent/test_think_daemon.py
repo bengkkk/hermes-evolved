@@ -1168,6 +1168,107 @@ class TestPruneSelfModel:
         assert removed == 1
         assert len(sm["capabilities"]["weaknesses"]) == 1
 
+    # ── Health-aware (daemon_state) pruning ──────────────────────────
+    # The stale patterns are gated on daemon health data (tick_count,
+    # last_output.fallback). These tests exercise that branch, which the
+    # earlier tests above never hit.
+
+    def test_health_aware_removes_test_plan_weaknesses(
+        self, evolve_env: Dict
+    ) -> None:
+        """Test-plan weakness class is pruned once the plan is complete."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Still at risk of re-planning instead of executing; mitigations must force at least one inspect/run action per cycle until Tests pass.",
+                    "Deliberation-to-action latency on the Test plan persists until execution completes",
+                    "Still prone to producing orientation summaries without executing pending steps; must treat shell/write actions as first-class outputs every cycle.",
+                    "Repeated planning without execution on the pending Test plan; must maintain action-first discipline until both Test steps are complete.",
+                    "Risk of pausing to deliberate immediately after locating the file; next move must be immediate test execution.",
+                    "Deliberation-to-action latency still recurring; mitigation: forced shell inspection plus test run this cycle",
+                    "Still prone to re-planning; must keep concrete inspect/run actions first in every cycle until Test steps pass.",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 263})
+        assert removed == 6, "Expected all 6 Test-plan weaknesses removed"
+        remaining = sm["capabilities"]["weaknesses"]
+        assert len(remaining) == 1
+        assert "orientation summaries" in remaining[0]
+
+    def test_health_aware_removes_think_daemon_location_unknowns(
+        self, evolve_env: Dict
+    ) -> None:
+        """Unknowns about think_daemon.py location / test harness are stale."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [],
+                "unknown_areas": [
+                    "Location of think_daemon.py and the exact test harness for world-model predictions.",
+                    "Location of think_daemon.py (being resolved this cycle).",
+                    "Exact test harness for world-model predictions still unknown until script inspection completes.",
+                    "Exact test harness invocation",
+                    "A genuinely unresolved unknown area",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 263})
+        assert removed == 4
+        assert sm["capabilities"]["unknown_areas"] == [
+            "A genuinely unresolved unknown area"
+        ]
+
+    def test_health_aware_removes_stale_test_plan_commitments(
+        self, evolve_env: Dict
+    ) -> None:
+        """Commitments promising to run the completed Test plan are pruned."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {"weaknesses": [], "unknown_areas": []},
+            "commitments": {
+                "promised_features": [
+                    "Locate think_daemon.py and run the two Test steps this cycle, using /proc and filesystem inspection instead of ps.",
+                    "Complete Step A inspection and Step B execution of the Test plan before any further planning.",
+                    "Run both pending Test steps as soon as think_daemon.py is located, without adding another planning-only cycle.",
+                    "As soon as the shell result reveals the script path, run the two pending Test steps in the same working session without re-planning.",
+                    "Ship the widget refactor by Friday",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 263})
+        assert removed == 4
+        assert sm["commitments"]["promised_features"] == [
+            "Ship the widget refactor by Friday"
+        ]
+
+    def test_health_aware_gate_below_tick_threshold(
+        self, evolve_env: Dict
+    ) -> None:
+        """Below the tick threshold, Test-plan entries are NOT pruned."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Deliberation-to-action latency on the Test plan persists until execution completes",
+                ],
+                "unknown_areas": [
+                    "Location of think_daemon.py (being resolved this cycle).",
+                ],
+            },
+            "commitments": {
+                "promised_features": [
+                    "Run the two Test steps this cycle",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 3})
+        assert removed == 0
+        assert len(sm["capabilities"]["weaknesses"]) == 1
+        assert len(sm["capabilities"]["unknown_areas"]) == 1
+        assert len(sm["commitments"]["promised_features"]) == 1
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Action deduplication gate (break LLM fixation loops)
