@@ -1626,6 +1626,33 @@ class TestLocalAnalysisStateCheckCommands:
         assert out.startswith("exit=0:"), f"daemon command failed: {out[:200]}"
 
 
+class TestRotatingAutoCommands:
+    """Every rotating auto-default command (module-level ``_ROTATING_AUTOS``)
+    must pass pre-flight validation and execute successfully (exit=0).
+
+    Regression: the sibling-dirs slot (index 5) used double-quoted
+    ``python3 -c "..."`` with the closing quote escaped by the generator,
+    leaving the shell string unterminated — recorded as a 0.85-error
+    world-model triple on 2026-07-31 (05:19) that was a command-generation
+    defect, not a world-model miss.  The pre-flight validator blocks it
+    today, but the slot silently no-oped on every rotation.  This guard
+    proves every rotation slot is healthy.
+    """
+
+    def test_all_rotating_auto_commands_valid_and_run(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        autos = td._ROTATING_AUTOS
+        # Invariant: the rotation actually rotates across several slots
+        assert len(autos) >= 3
+        for idx, auto in enumerate(autos):
+            assert auto["type"] == "shell"
+            cmd = auto["command"]
+            defect = td._validate_shell_command(cmd)
+            assert defect is None, f"auto[{idx}] defective: {defect} | {cmd}"
+            out = td._execute_shell_action(cmd)
+            assert out.startswith("exit=0:"), f"auto[{idx}] failed: {out[:200]} | {cmd}"
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Placeholder-plan guard (prevents deliberation fixation loops)
 # ═══════════════════════════════════════════════════════════════════

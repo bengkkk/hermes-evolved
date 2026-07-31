@@ -48,6 +48,28 @@ from world_model import WorldModel, load_world_model, save_world_model
 _WORKSPACE_ROOT: Path = Path(__file__).resolve().parent
 _WORKSPACE_ROOT_STR: str = str(_WORKSPACE_ROOT)
 
+# ── Rotating auto-default actions (module-level for guard testing) ──
+# Chosen by the cycle body when the LLM produced no action, to prevent
+# null-action drift.  Rotating commands prevent repeated "explore
+# workspace" spam: each tick picks the next action in sequence so the
+# system gathers diverse data instead of spamming the same ls command.
+#
+# INVARIANT (guard-tested in TestRotatingAutoCommands): every entry
+# must pass _validate_shell_command() and execute with exit=0.  The
+# sibling-dirs slot previously used double-quoted `python3 -c "..."`
+# whose closing quote was escaped by the generator, leaving the shell
+# string unterminated — recorded as a 0.85-error world-model triple on
+# 2026-07-31 that was a command-generation defect, not a world-model
+# miss.  It is now single-quoted like the world-model-stats slot.
+_ROTATING_AUTOS = [
+    {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: list workspace", "expected_outcome": "exit=0: directory listing of workspace files"},
+    {"type": "shell", "command": f"git -C {_WORKSPACE_ROOT_STR} log --oneline -3", "description": "Auto-default: recent git log", "expected_outcome": "exit=0: recent git log entries (may show 'fatal: not a git repository')"},
+    {"type": "shell", "command": "python3 -c 'from world_model import load_world_model; wm=load_world_model(); d=wm.data; print(len(d.get(\"action_triples\",[])), \"triples,\", len(d.get(\"predictions\",[])), \"preds\")'", "description": "Auto-default: world model stats", "expected_outcome": "exit=0: world model stats with triple and prediction counts"},
+    {"type": "shell", "command": f"wc -l {_WORKSPACE_ROOT_STR}/think_daemon.py {_WORKSPACE_ROOT_STR}/world_model.py {_WORKSPACE_ROOT_STR}/data_layer.py", "description": "Auto-default: evolved file sizes", "expected_outcome": "exit=0: line counts for evolved Python files"},
+    {"type": "shell", "command": f"find {_WORKSPACE_ROOT_STR} -maxdepth 1 -type f -name '*.py' | wc -l", "description": "Auto-default: count top-level .py files", "expected_outcome": "exit=0: count of top-level Python source files"},
+    {"type": "shell", "command": f"python3 -c 'import pathlib; d=pathlib.Path(\"{_WORKSPACE_ROOT_STR}/..\"); [print(f.name) for f in d.iterdir() if f.name.startswith(\"hermes\") or f.name.startswith(\".hermes\")]'", "description": "Auto-default: sibling dirs check", "expected_outcome": "exit=0: listing of sibling directories matching 'hermes*' pattern"},
+]
+
 # ── Paths (delegated to data_layer for the base directory) ──
 EVOLVE_DIR = get_evolve_dir()
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
@@ -1494,17 +1516,9 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # it chose not to. Auto-defaulting would pollute the world model
     # with synthetic action triples (spamming noisy "ls" entries).
     #
-    # Rotating commands to prevent repeated "explore workspace" spam:
-    # each tick, pick the next action in sequence, so the system gathers
-    # diverse data instead of spamming the same ls command.
-    _ROTATING_AUTOS = [
-        {"type": "shell", "command": f"ls {_WORKSPACE_ROOT_STR}/", "description": "Auto-default: list workspace", "expected_outcome": "exit=0: directory listing of workspace files"},
-        {"type": "shell", "command": f"git -C {_WORKSPACE_ROOT_STR} log --oneline -3", "description": "Auto-default: recent git log", "expected_outcome": "exit=0: recent git log entries (may show 'fatal: not a git repository')"},
-        {"type": "shell", "command": "python3 -c 'from world_model import load_world_model; wm=load_world_model(); d=wm.data; print(len(d.get(\"action_triples\",[])), \"triples,\", len(d.get(\"predictions\",[])), \"preds\")'", "description": "Auto-default: world model stats", "expected_outcome": "exit=0: world model stats with triple and prediction counts"},
-        {"type": "shell", "command": f"wc -l {_WORKSPACE_ROOT_STR}/think_daemon.py {_WORKSPACE_ROOT_STR}/world_model.py {_WORKSPACE_ROOT_STR}/data_layer.py", "description": "Auto-default: evolved file sizes", "expected_outcome": "exit=0: line counts for evolved Python files"},
-        {"type": "shell", "command": f"find {_WORKSPACE_ROOT_STR} -maxdepth 1 -type f -name '*.py' | wc -l", "description": "Auto-default: count top-level .py files", "expected_outcome": "exit=0: count of top-level Python source files"},
-        {"type": "shell", "command": f"python3 -c \"import pathlib; d=pathlib.Path('{_WORKSPACE_ROOT_STR}/..'); [print(f.name) for f in d.iterdir() if f.name.startswith('hermes') or f.name.startswith('.hermes')]\\\"", "description": "Auto-default: sibling dirs check", "expected_outcome": "exit=0: listing of sibling directories matching 'hermes*' pattern"},
-    ]
+    # _ROTATING_AUTOS is the module-level constant defined near the top
+    # of this file — every entry is guard-tested (TestRotatingAutoCommands)
+    # to pass pre-flight validation and execute with exit=0.
     is_fallback = result.get("fallback", False)
     if not (act and isinstance(act, dict) and act.get("type")):
         tick = ds.get("tick_count", 0)
