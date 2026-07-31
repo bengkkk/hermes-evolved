@@ -542,8 +542,11 @@ class WorldModel:
         }
         self.data.setdefault("predictions", []).append(pred)
         self.data["predictions"] = self.data["predictions"][-100:]
-        acc = self.data.setdefault("prediction_accuracy", {})
-        acc["total_predictions"] = acc.get("total_predictions", 0) + 1
+        # Keep accuracy counters consistent with the capped list: the
+        # incremental total_predictions counter would drift once old
+        # records age out of the 100-entry cap, breaking the
+        # verified == correct + incorrect + uncertain invariant.
+        self._reconcile_prediction_stats()
         return pred_id
 
     def verify_prediction(
@@ -571,6 +574,7 @@ class WorldModel:
                 error = _compute_prediction_error(pred.get("text", ""), actual_outcome)
                 pred["error"] = error
                 pred["verified_at"] = now_iso()
+                pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
 
                 # Update accuracy stats
                 acc = self.data.setdefault("prediction_accuracy", {})
@@ -733,6 +737,7 @@ class WorldModel:
             )
             pred["verified_at"] = now_iso()
             pred["error"] = error
+            pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
 
             acc = self.data.setdefault("prediction_accuracy", {})
             acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
@@ -885,6 +890,7 @@ class WorldModel:
                     f"expired {elapsed_days - days:.1f} days ago"
                 )
                 pred["verified_at"] = now_iso()
+                pred["outcome_class"] = "uncertain"  # 0.5 = neither correct nor incorrect
 
                 # Update accuracy stats
                 acc = self.data.setdefault("prediction_accuracy", {})
@@ -1207,6 +1213,62 @@ class WorldModel:
         # Also refresh per-type accuracy and discrepancy patterns whenever stats are recalculated
         self._update_per_type_accuracy()
         self._update_discrepancy_patterns()
+
+    def _reconcile_prediction_stats(self) -> None:
+        """Recompute prediction counters from the retained predictions list.
+
+        The verification paths increment ``verified_predictions`` /
+        ``correct_predictions`` / ``incorrect_predictions`` and the
+        running average incrementally, but the predictions list is
+        capped at 100 entries (see :meth:`record_prediction` and
+        :meth:`_merge_concurrent_records`).  Once records age out of
+        the cap, the incremental counters silently drift from the list
+        — e.g. a verified prediction that falls off the list still
+        counts toward ``verified_predictions`` forever, breaking the
+        ``verified == correct + incorrect + uncertain`` invariant.
+
+        Recomputing from the actual list restores the invariant.
+        Classification prefers the explicit ``outcome_class`` stamp
+        written by the verification paths; records written before the
+        stamp existed are classified by the same rules the verification
+        paths used (error <= 0.3 → correct; the expiry-fallback path
+        stamps error=0.5 with an "Auto-verified: timeframe ..." note →
+        uncertain; anything else verified → incorrect).
+
+        Called after every cap-trim (record, concurrent merge) and on
+        save so on-disk stats always match the retained list.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        preds = self.data.get("predictions", [])
+        verified = correct = incorrect = uncertain = 0
+        error_sum = 0.0
+        for p in preds:
+            if not p.get("verified") or p.get("error") is None:
+                continue
+            verified += 1
+            error_sum += p["error"]
+            cls = p.get("outcome_class")
+            if cls == "uncertain":
+                uncertain += 1
+            elif cls == "correct":
+                correct += 1
+            elif cls == "incorrect":
+                incorrect += 1
+            elif p["error"] <= 0.3:
+                correct += 1
+            elif str(p.get("verification_note", "")).startswith(
+                "Auto-verified: timeframe"
+            ):
+                uncertain += 1
+            else:
+                incorrect += 1
+        acc["total_predictions"] = len(preds)
+        acc["verified_predictions"] = verified
+        acc["correct_predictions"] = correct
+        acc["incorrect_predictions"] = incorrect
+        acc["avg_prediction_error"] = (
+            round(error_sum / verified, 4) if verified else 0.0
+        )
 
     def _add_to_error_history(self, error: float) -> None:
         """Append a prediction error to the rolling history for trend analysis.
@@ -1995,6 +2057,10 @@ class WorldModel:
         target = path or self.storage_path()
         if path is None:
             self._merge_concurrent_records()
+        # Reconcile before persisting so on-disk counters always match the
+        # retained predictions list (guards against stale counters from
+        # pre-fix data files or cap trims in other writers).
+        self._reconcile_prediction_stats()
         safe_write_json(target, self.data)
         return target
 
@@ -2040,6 +2106,8 @@ class WorldModel:
         if p_added:
             merged_preds.sort(key=lambda p: p.get("timestamp", ""))
             self.data["predictions"] = merged_preds[-100:]
+            # The cap may have trimmed records; keep counters consistent
+            self._reconcile_prediction_stats()
 
     def _save(self) -> None:
         """Internal save — convenience wrapper."""

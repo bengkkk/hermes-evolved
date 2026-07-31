@@ -627,6 +627,92 @@ class TestMacroPredictions:
         assert len(unverified) == 2  # first two not verified
 
 
+class TestPredictionStatsReconciliation:
+    """Counters must stay consistent when predictions age out of the 100 cap."""
+
+    def test_counters_reconcile_after_cap_trim(self):
+        """Verified predictions dropped by the 100-cap no longer count."""
+        wm = WorldModel()
+        # Fill past the cap; the first 50 will be trimmed away.
+        pids = []
+        for i in range(150):
+            pids.append(wm.record_prediction(f"pred {i}", "1 day", 0.8, ""))
+        assert len(wm.data["predictions"]) == 100
+        # The trimmed 50 were never verified — but simulate the drift:
+        # pre-fix, total_predictions would read 150.  Post-fix it must
+        # equal the retained list length.
+        acc = wm.data["prediction_accuracy"]
+        assert acc["total_predictions"] == 100
+        assert acc["verified_predictions"] == 0
+
+    def test_verified_prediction_trimmed_no_longer_counts(self):
+        """The key regression: a verified prediction that falls off the
+        cap must not keep inflating verified/correct counters."""
+        wm = WorldModel()
+        # Verify the first prediction, then push it out of the cap.
+        pid0 = wm.record_prediction("will work", "1 day", 0.8, "")
+        wm.verify_prediction(pid0, "exit=0: success")
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["incorrect_predictions"] == 1
+        # Now record 100 more — pid0 ages out of the retained list.
+        for i in range(100):
+            wm.record_prediction(f"filler {i}", None, 0.5, "")
+        assert len(wm.data["predictions"]) == 100
+        assert all(p["id"] != pid0 for p in wm.data["predictions"])
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 0
+        assert acc["incorrect_predictions"] == 0
+        assert acc["total_predictions"] == 100
+
+    def test_uncertain_expiry_classification_survives_reconcile(self):
+        """Auto-verified (uncertain) predictions stay out of correct/incorrect."""
+        from datetime import datetime, timezone, timedelta
+
+        wm = WorldModel()
+        pid = wm.record_prediction("long expired", "1 week", 0.8, "test")
+        for p in wm.data["predictions"]:
+            if p["id"] == pid:
+                p["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        wm.verify_expired_predictions()
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["correct_predictions"] == 0
+        assert acc["incorrect_predictions"] == 0
+        # Explicit class stamp present; reconcile preserves it
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        assert pred["outcome_class"] == "uncertain"
+        wm._reconcile_prediction_stats()
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["correct_predictions"] == 0
+        assert acc["incorrect_predictions"] == 0
+        assert acc["avg_prediction_error"] == 0.5
+
+    def test_legacy_records_without_stamp_classified_by_rules(self):
+        """Records written before outcome_class existed are inferred correctly."""
+        wm = WorldModel()
+        pid = wm.record_prediction("will work", "1 day", 0.8, "")
+        wm.verify_prediction(pid, "exit=0: success")  # error 0.5 → incorrect
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        # Simulate a legacy record: drop the stamp entirely
+        del pred["outcome_class"]
+        # Also add a legacy uncertain record (expiry-style note, no stamp)
+        pid2 = wm.record_prediction("expired thing", "1 week", 0.7, "")
+        p2 = next(p for p in wm.data["predictions"] if p["id"] == pid2)
+        p2["verified"] = True
+        p2["error"] = 0.5
+        p2["verification_note"] = "Auto-verified: timeframe '1 week' (7 days) expired 3.0 days ago"
+        p2["verified_at"] = "2026-07-31T00:00:00+00:00"
+        wm._reconcile_prediction_stats()
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 2
+        assert acc["incorrect_predictions"] == 1  # the 0.5 manual one
+        assert acc["correct_predictions"] == 0
+        # uncertain (expiry note) contributes to neither counter
+        assert acc["verified_predictions"] == acc["correct_predictions"] + acc["incorrect_predictions"] + 1
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Expired prediction auto-verification
 # ══════════════════════════════════════════════════════════════════════
