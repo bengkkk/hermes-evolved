@@ -396,6 +396,55 @@ class TestDaemonState:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Code-drift detection
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCodeDriftDetection:
+    """_git_head / _check_code_drift flag stale daemon processes."""
+
+    def test_git_head_returns_short_sha(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        head = td._git_head()
+        # The workspace is a git repo, so a 7+ char short SHA is expected.
+        # In an exotic non-git checkout this may be None — that is allowed.
+        if head is not None:
+            assert len(head) >= 7
+            assert all(c in "0123456789abcdef" for c in head)
+
+    def test_no_drift_when_startup_head_matches(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        head = td._git_head()
+        if head is None:
+            import pytest as _pt
+            _pt.skip("workspace is not a git checkout")
+        ds = {"startup_head": head}
+        assert td._check_code_drift(ds) is False
+        assert "code_drift" not in ds
+
+    def test_drift_detected_when_startup_head_stale(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        head = td._git_head()
+        if head is None:
+            import pytest as _pt
+            _pt.skip("workspace is not a git checkout")
+        # Simulate a daemon that started on an older commit.
+        stale = "0" * len(head)
+        ds = {"startup_head": stale}
+        assert td._check_code_drift(ds) is True
+        drift = ds.get("code_drift")
+        assert drift is not None
+        assert drift["startup_head"] == stale
+        assert drift["current_head"] == head
+        assert "detected_at" in drift
+
+    def test_no_drift_without_startup_head(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ds = {}  # legacy state, no startup_head recorded
+        assert td._check_code_drift(ds) is False
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Timeline persistence
 # ═══════════════════════════════════════════════════════════════════
 

@@ -224,6 +224,61 @@ def _print_cycle_stats() -> None:
             print(f"    [{ts}] {c['status']} ({dur}s): {err}")
 
 
+# ── Code-drift detection ──────────────────────────────────────────
+# The daemon is a long-lived process: code fixes committed to the repo
+# are only picked up after a restart.  A daemon started before a fix is
+# committed keeps running the OLD code, silently.  Observed 2026-07-31:
+# the daemon started at 16:20 ran the pre-guard plan auto-create logic,
+# so cycle 269 re-created a duplicate active plan that the guard fix
+# (committed 17:05) was meant to block.  This check records the startup
+# HEAD and warns when the repo moves on, so a stale process is visible
+# instead of silently acting on outdated logic.
+
+def _git_head() -> Optional[str]:
+    """Return the current git HEAD short hash, or None if unavailable."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(_WORKSPACE_ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _check_code_drift(ds: Dict[str, Any]) -> bool:
+    """Detect when the repo code moved past the daemon's startup HEAD.
+
+    Compares the HEAD recorded at daemon start (``startup_head`` in the
+    daemon state) against the current repo HEAD.  On drift, logs a
+    warning and records a ``code_drift`` block in daemon state so the
+    staleness is visible in logs and state, not just in its side effects.
+
+    Returns True when drift was detected.
+    """
+    startup_head = ds.get("startup_head")
+    if not startup_head:
+        return False
+    current_head = _git_head()
+    if current_head and current_head != startup_head:
+        logger.warning(
+            "CODE DRIFT: daemon started at HEAD %s but repo is now at %s — "
+            "restart to load the latest logic (guard, world-model, etc.)",
+            startup_head, current_head,
+        )
+        ds["code_drift"] = {
+            "startup_head": startup_head,
+            "current_head": current_head,
+            "detected_at": datetime.now(timezone.utc).isoformat(),
+        }
+        save_daemon_state(ds)
+        return True
+    return False
+
+
 # ── PID lock ─────────────────────────────────────────────────────
 
 def _acquire_daemon_lock() -> bool:
@@ -3263,6 +3318,7 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
         ds = load_daemon_state()
         ds["interval_seconds"] = interval_seconds
         ds["status"] = "running"
+        ds["startup_head"] = _git_head()  # baseline for code-drift detection
         save_daemon_state(ds)
 
         cycle = 0
@@ -3290,6 +3346,9 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
                 break
 
             try:
+                # Code-drift check: warn if the repo moved past this
+                # process's loaded code (stale daemon runs outdated logic).
+                _check_code_drift(load_daemon_state())
                 await run_one_cycle()
             except Exception as e:
                 logger.error("Cycle failed unexpectedly: %s", e, exc_info=True)
