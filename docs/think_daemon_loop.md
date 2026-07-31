@@ -292,11 +292,6 @@ same way.
 
 ## Verified gap candidates (for future cycles)
 
-- **Cron `--once` vs 200 s timeout**: a `--once` cycle launched *from a
-  cron job* can be interrupted at the 3-minute cron hard limit (200 s
-  cycle + startup/teardown > 180 s). The persistent daemon
-  (`evolve_daemon.sh`, interval 900) is unaffected; only cron-launched
-  single cycles hit this.
 - **LLM outage depth**: `consecutive_fallback_cycles` reached 7 on
   2026-07-31 (19:26) — the 0-attempt tier + every-4th-cycle probe is
   active by design; recovery detection is expected within 4 cycles of the
@@ -321,6 +316,17 @@ same way.
 
 ## Resolved gaps
 
+- **Cron `--once` vs 200 s timeout** (fixed 2026-07-31): a `--once` cycle
+  launched *from a cron job* could be interrupted at the 3-minute cron
+  hard limit (200 s cycle + startup/teardown > 180 s). `main()` now
+  applies a wall-clock budget (`--budget`, default 170 s) to `--once`
+  runs via `_apply_cycle_budget()`; `_llm_retry_policy()` clamps its
+  retry budget so the worst-case LLM phase fits the remaining wall clock
+  (healthy 2×90 s shrinks to a single 90 s attempt), leaving room for
+  local analysis + action execution before the kill. The persistent
+  daemon passes no budget and is byte-for-byte unaffected. Regression
+  tests in `tests/test_daemon_local_analysis.py`
+  (`TestLlmRetryPolicyBudget`).
 - **`git add -A` breadth** (fixed 2026-07-31): the `git_commit` executor
   staged *everything* uncommitted in the workspace repo, so any stray
   change in the hermes-agent tree (build artifacts, website edits,

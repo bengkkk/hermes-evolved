@@ -148,10 +148,39 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
+# Wall-clock cap for a single cycle (seconds). None = unlimited (persistent
+# daemon mode). Set by main() for --once runs so a cron-launched single
+# cycle fits inside the 3-minute cron hard limit instead of being killed
+# mid-flight (see docs/think_daemon_loop.md, "Cron --once vs 200s timeout").
+_cycle_budget_seconds: Optional[float] = None
 
 
-def _llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
-    """Choose the LLM retry budget from the outage depth.
+def _clamp_retry_budget(
+    retries: int, timeout: float, budget_seconds: Optional[float]
+) -> tuple:
+    """Shrink ``(retries, timeout)`` so the LLM phase fits a wall-clock budget.
+
+    Reserves 20% of the budget for the rest of the cycle that runs after the
+    LLM call (local analysis on fallback, action execution, world-model
+    persistence). Outer retries are reduced first (each costs up to
+    ``timeout``); if even a single attempt exceeds the cap, the per-attempt
+    timeout is shrunk instead. ``budget_seconds=None`` or ``timeout<=0``
+    (the extended-outage skip tier) passes through unchanged.
+    """
+    if budget_seconds is None or timeout <= 0:
+        return retries, timeout
+    llm_cap = budget_seconds * 0.8
+    max_attempts = max(1, int(llm_cap // timeout))
+    retries = min(retries, max_attempts - 1)
+    if timeout > llm_cap:
+        timeout = llm_cap
+    return retries, timeout
+
+
+def _llm_retry_policy(
+    consecutive_fallback_cycles: int, budget_seconds: Optional[float] = None
+) -> tuple:
+    """Choose the LLM retry budget from the outage depth (and wall-clock cap).
 
     Returns ``(max_retries, per_attempt_timeout_seconds)``:
     - Healthy (0 consecutive fallbacks): full budget — 2 retries × 90 s
@@ -175,22 +204,40 @@ def _llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
     with no chance of a different outcome. Skipping turns those cycles into
     pure data collection, while the periodic probe keeps the daemon from
     staying blind forever after the provider recovers.
+
+    ``budget_seconds`` (when set) additionally clamps the result via
+    ``_clamp_retry_budget`` so the worst-case LLM phase fits the wall-clock
+    budget of the current run — used by ``--once`` so cron-launched single
+    cycles survive the 3-minute cron hard limit (the persistent daemon
+    passes None and is unaffected).
     """
     if consecutive_fallback_cycles <= 0:
-        return 2, 90.0
-    if consecutive_fallback_cycles == 1:
-        return 1, 60.0
-    if consecutive_fallback_cycles == 2:
-        return 1, 45.0
-    if consecutive_fallback_cycles % 4 == 0:
+        retries, timeout = 2, 90.0
+    elif consecutive_fallback_cycles == 1:
+        retries, timeout = 1, 60.0
+    elif consecutive_fallback_cycles == 2:
+        retries, timeout = 1, 45.0
+    elif consecutive_fallback_cycles % 4 == 0:
         # Probe cycle: bounded probe so recovery is detected within 4 cycles.
         # 90s (not 30s): the auxiliary client's internal transport timeout
         # (~30s) + its one in-client retry (~30s) must fit inside the cap,
         # and healthy opencode-go latencies have been observed at 31s. A 30s
         # cap failed probes on endpoints that were merely slow, extending
         # outage blindness by another 4 cycles.
-        return 1, 90.0
-    return 0, 0.0
+        retries, timeout = 1, 90.0
+    else:
+        retries, timeout = 0, 0.0
+    return _clamp_retry_budget(retries, timeout, budget_seconds)
+
+
+def _apply_cycle_budget(budget_seconds: float) -> None:
+    """Set the wall-clock cap for the current run (``--once`` mode).
+
+    ``budget_seconds <= 0`` disables the clamp (unlimited). Affects only the
+    retry policy applied by ``_set_llm_retry_policy`` on the next cycle.
+    """
+    global _cycle_budget_seconds
+    _cycle_budget_seconds = budget_seconds if budget_seconds > 0 else None
 
 
 def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
@@ -201,7 +248,7 @@ def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
     """
     global _llm_max_retries, _llm_attempt_timeout
     _llm_max_retries, _llm_attempt_timeout = _llm_retry_policy(
-        consecutive_fallback_cycles
+        consecutive_fallback_cycles, _cycle_budget_seconds
     )
     return _llm_max_retries, _llm_attempt_timeout
 
@@ -4160,6 +4207,12 @@ def main():
     parser.add_argument("--interval", type=int, default=600, help="Seconds between thinking cycles (default: 600 = 10 min)")
     parser.add_argument("--cycles", type=int, default=0, help="Max cycles before exit (0 = unlimited)")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    parser.add_argument(
+        "--budget", type=float, default=170.0,
+        help="Wall-clock budget (s) for a --once cycle; 0 = unlimited. Defaults "
+             "to 170s so cron-launched single cycles fit the 3-minute cron hard "
+             "limit (ignored in persistent daemon mode).",
+    )
     parser.add_argument("--bootstrap", action="store_true", help="Initialize evolve data files with meaningful seed data (idempotent)")
     parser.add_argument("--status", action="store_true", help="Show system status snapshot (daemon health, world model stats, cycle reliability)")
     parser.add_argument("--verify", action="store_true", help="Run a no-LLM verification of the full predict→act→observe→learn cycle")
@@ -4203,6 +4256,10 @@ def main():
         if not _acquire_daemon_lock():
             print("Daemon lock held by another process — skipping concurrent --once run")
             sys.exit(0)
+        # Bound the LLM retry budget to the --once wall-clock budget so a
+        # cron-launched single cycle fits the 3-minute cron hard limit
+        # instead of being killed mid-flight (see docs/think_daemon_loop.md).
+        _apply_cycle_budget(args.budget)
         try:
             r = asyncio.run(run_one_cycle())
             status = r.get("status", "error")

@@ -540,3 +540,92 @@ class TestSelectStateCheckAction:
         assert result["action"]["type"] == "shell"
         assert "Self Model" in result["action"]["command"]
 
+
+# ── _llm_retry_policy wall-clock budget clamp ─────────────────────
+# Regression: a cron-launched ``--once`` cycle has a ~180 s hard limit
+# (3-minute cron interrupt), but the healthy retry budget (2 × 90 s) can
+# consume 270 s+ on the LLM call alone, killing the cycle mid-flight.
+# ``budget_seconds`` must clamp the policy so the worst-case LLM phase
+# fits the remaining wall clock. See docs/think_daemon_loop.md.
+
+class TestLlmRetryPolicyBudget:
+    """_llm_retry_policy / _set_llm_retry_policy / _apply_cycle_budget."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_budget(self):
+        """Ensure a clean module-level budget around each test."""
+        import think_daemon
+        saved = think_daemon._cycle_budget_seconds
+        yield
+        from think_daemon import _apply_cycle_budget
+        _apply_cycle_budget(saved if saved else 0)
+
+    def test_no_budget_preserves_existing_tiers(self) -> None:
+        """budget_seconds=None → exactly the pre-existing policy."""
+        from think_daemon import _llm_retry_policy
+
+        assert _llm_retry_policy(0) == (2, 90.0)      # healthy
+        assert _llm_retry_policy(1) == (1, 60.0)      # warm outage
+        assert _llm_retry_policy(2) == (1, 45.0)      # deep outage
+        assert _llm_retry_policy(3) == (0, 0.0)       # extended outage: skip
+        assert _llm_retry_policy(4) == (1, 90.0)      # every-4th probe
+        assert _llm_retry_policy(7) == (0, 0.0)       # non-probe skip
+
+    def test_default_budget_clamps_healthy_tier(self) -> None:
+        """170 s default budget → healthy tier (2×90) shrinks to a single
+        attempt so the worst-case LLM phase (90 s) fits inside 136 s
+        (170 s × 0.8, reserving the rest for action execution)."""
+        from think_daemon import _llm_retry_policy
+
+        retries, timeout = _llm_retry_policy(0, budget_seconds=170.0)
+        assert retries == 0
+        assert (retries + 1) * timeout <= 170.0 * 0.8
+
+    def test_budget_leaves_comfortable_tiers_unchanged(self) -> None:
+        """Tiers that already fit the cap pass through untouched."""
+        from think_daemon import _llm_retry_policy
+
+        # warm outage: 2 × 60 = 120 ≤ 136
+        assert _llm_retry_policy(1, budget_seconds=170.0) == (1, 60.0)
+        # deep outage: 2 × 45 = 90 ≤ 136
+        assert _llm_retry_policy(2, budget_seconds=170.0) == (1, 45.0)
+        # extended-outage skip tier is never resurrected by a budget
+        assert _llm_retry_policy(3, budget_seconds=170.0) == (0, 0.0)
+
+    def test_tight_budget_shrinks_attempt_timeout(self) -> None:
+        """When even one attempt overflows the cap, the per-attempt timeout
+        is shrunk (never zero) instead of allowing an over-budget call."""
+        from think_daemon import _llm_retry_policy
+
+        retries, timeout = _llm_retry_policy(0, budget_seconds=60.0)
+        assert retries == 0
+        assert 0 < timeout <= 60.0 * 0.8
+        assert (retries + 1) * timeout <= 60.0 * 0.8
+
+    def test_set_policy_honors_module_budget(self) -> None:
+        """_set_llm_retry_policy applies _cycle_budget_seconds when set."""
+        from think_daemon import _apply_cycle_budget, _set_llm_retry_policy
+
+        _apply_cycle_budget(170.0)
+        retries, timeout = _set_llm_retry_policy(0)
+        assert retries == 0
+        assert timeout == 90.0
+
+        # Disabled (0) → full healthy budget again
+        _apply_cycle_budget(0)
+        assert _set_llm_retry_policy(0) == (2, 90.0)
+
+    def test_apply_cycle_budget_semantics(self) -> None:
+        """<=0 disables the clamp; positive values set it; None default."""
+        import think_daemon
+        from think_daemon import _apply_cycle_budget
+
+        assert think_daemon._cycle_budget_seconds is None
+        _apply_cycle_budget(170.0)
+        assert think_daemon._cycle_budget_seconds == 170.0
+        _apply_cycle_budget(0)
+        assert think_daemon._cycle_budget_seconds is None
+        _apply_cycle_budget(-5)
+        assert think_daemon._cycle_budget_seconds is None
+
+
