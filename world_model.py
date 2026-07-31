@@ -236,14 +236,24 @@ def _compute_prediction_error(
     # Content-based heuristics for outputs that lack an explicit exit=
     # marker.  These are less reliable than exit code but better than
     # pure string similarity.
+    # Zero-count failure phrases ('0 failed', '0 errors') are success
+    # signals - pytest-style runners report 'N passed, 0 failed' as a
+    # clean pass - so neutralize them before keyword scanning.  This
+    # mirrors the normalization in _score_evidence_blob so both
+    # prediction-error paths treat zero failure counts consistently.
+    a_keywords = re.sub(
+        r'\b0\s+(failed|failure|failures|error|errors)\b',
+        ' zero_failures ',
+        a_lower,
+    )
     tool_failure = bool(re.search(
         r'\b(traceback|error|failed|permission denied|not found|no such)\b',
-        a_lower,
+        a_keywords,
     ))
     tool_success = bool(re.search(
         r'\b(passed|succeeded|ok|complete|done)\b',
-        a_lower,
-    ))
+        a_keywords,
+    ) or ' zero_failures ' in a_keywords)
 
     # ── Content-based error: accumulate into a single variable ──
     # We'll apply the exit-code modifier at the end so that errors
@@ -644,9 +654,16 @@ class WorldModel:
         failure markers present, or neither) — callers fall back to the
         uncertain (0.5) path in that case.
 
-        Informational non-events (\"nothing to commit\", \"already up to
-        date\", ...) are treated as ambiguous: the predicted action did
+        Informational non-events ("nothing to commit", "already up to
+        date", ...) are treated as ambiguous: the predicted action did
         not occur, but nothing failed either.
+
+        Zero-count failure phrases ("0 failed", "0 failures",
+        "0 errors") are success signals, not failure markers — pytest-style
+        runners report "N passed, 0 failed" as a clean pass. They are
+        normalized before marker scanning so the mixed-evidence ambiguity
+        does not swallow fulfilled predictions whose outcome text carries
+        a failure count of zero.
         """
         informational = bool(re.search(
             r"(nothing to commit|working tree clean|already up.to.date|"
@@ -657,14 +674,24 @@ class WorldModel:
         ))
         if informational:
             return None
+        # Neutralize zero-count failure phrases before marker scanning:
+        # "556/556 passed, 0 failed" is a clean pass, not mixed evidence.
+        blob_norm = re.sub(
+            r"\b0\s+(failed|failure|failures|error|errors)\b",
+            " zero_failures ",
+            blob_l,
+        )
         has_fail = bool(
-            re.search(r"\b(error|failed|failure|traceback|permission denied|unable)\b", blob_l)
-            or re.search(r"exit=[1-9]", blob_l)
+            re.search(
+                r"\b(error|failed|failure|traceback|permission denied|unable)\b",
+                blob_norm,
+            )
+            or re.search(r"exit=[1-9]", blob_norm)
         )
         has_succ = bool(re.search(
             r"(exit=0|found|wrote|created|passed|succeeded|completed|opened|listed)",
-            blob_l,
-        ))
+            blob_norm,
+        ) or " zero_failures " in blob_norm)
         if has_fail and not has_succ:
             return 0.85
         if has_succ and not has_fail:

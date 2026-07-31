@@ -1073,6 +1073,32 @@ class TestEvidenceBasedVerification:
         assert result is None
         assert wm.data["predictions"][0]["verified"] is False
 
+    # ── Zero-count failure outcomes are success, not mixed evidence ──
+
+    def test_score_evidence_blob_zero_failed_is_success(self) -> None:
+        """'N passed, 0 failed' is a clean pass, not mixed evidence."""
+        assert WorldModel._score_evidence_blob(
+            "556/556 tests passed, 0 failed, exit=0"
+        ) == 0.15
+
+    def test_score_evidence_blob_zero_failures_alone_is_success(self) -> None:
+        """A bare zero-count failure phrase still signals success."""
+        assert WorldModel._score_evidence_blob("0 failures") == 0.15
+
+    def test_score_evidence_blob_nonzero_failed_is_failure(self) -> None:
+        """A non-zero failure count still scores as a failure."""
+        assert WorldModel._score_evidence_blob("2 failed, exit=1") == 0.85
+
+    def test_score_evidence_blob_traceback_is_failure(self) -> None:
+        """Lowercased failure markers are unchanged by the normalization."""
+        assert WorldModel._score_evidence_blob(
+            "traceback: permission denied"
+        ) == 0.85
+
+    def test_score_evidence_blob_mixed_counts_still_ambiguous(self) -> None:
+        """Genuinely mixed counts (some passed, some failed) stay uncertain."""
+        assert WorldModel._score_evidence_blob("10 passed, 2 failed") is None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  CLI entry point

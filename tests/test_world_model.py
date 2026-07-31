@@ -172,6 +172,22 @@ class TestComputePredictionError:
         # exit= not found, bigram is low → token level, no overlap → 1.0
         assert err == pytest.approx(1.0, abs=0.01)
 
+    def test_tool_zero_failed_is_success(self):
+        """'0 failed' is a success count, not a failure keyword."""
+        err = _compute_prediction_error(
+            "tests will pass", "556/556 tests passed, 0 failed, exit=0"
+        )
+        # 'passed' → tool_success ✓; '0 failed' neutralized → no failure
+        # keyword → 0.15, then exit=0 caps at 0.5 (min → stays 0.15)
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    def test_tool_nonzero_failed_is_failure(self):
+        """A non-zero failure count remains a failure keyword."""
+        err = _compute_prediction_error("tests will pass", "1 failed, exit=1")
+        # 'failed' → tool_failure ✓, no success keyword → 0.85,
+        # then exit=1 floors at 0.5 (max → stays 0.85)
+        assert err == pytest.approx(0.85, abs=0.01)
+
     def test_tool_both_succeeded_failed(self):
         """'succeeded' (success) and 'failed' (failure) — both true."""
         err = _compute_prediction_error("do something", "succeeded but also failed")
