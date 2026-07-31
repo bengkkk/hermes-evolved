@@ -3366,6 +3366,21 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
 #  Continuous loop (standalone daemon)
 # ═════════════════════════════════════════════════════════════════
 
+def _mark_startup(ds: Dict[str, Any], interval_seconds: int, head: Optional[str]) -> None:
+    """Stamp a fresh daemon start into state.
+
+    A process that just started is by definition running the code at
+    ``head``, so any ``code_drift`` block recorded by a previous
+    (now-dead) process is stale.  Leaving it would keep
+    ``daemon_state.json`` and launcher ``status`` claiming drift after
+    the daemon was restarted onto the current HEAD — clear it so the
+    marker only exists while the daemon is genuinely behind the repo.
+    """
+    ds["interval_seconds"] = interval_seconds
+    ds["status"] = "running"
+    ds["startup_head"] = head  # baseline for code-drift detection
+    ds.pop("code_drift", None)
+
 async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
     """Run the daemon loop.
 
@@ -3386,9 +3401,7 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
 
         # Initialize daemon state if needed
         ds = load_daemon_state()
-        ds["interval_seconds"] = interval_seconds
-        ds["status"] = "running"
-        ds["startup_head"] = _git_head()  # baseline for code-drift detection
+        _mark_startup(ds, interval_seconds, _git_head())
         save_daemon_state(ds)
 
         cycle = 0

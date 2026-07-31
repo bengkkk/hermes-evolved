@@ -13,7 +13,8 @@
 #
 # Usage:
 #   ./evolve_daemon.sh start [--interval SECONDS]   # default interval 900
-#   ./evolve_daemon.sh status                       # report current state
+#   ./evolve_daemon.sh restart [--interval SECONDS] # stop + start (loads new code)
+#   ./evolve_daemon.sh status                       # report current state + code drift
 #   ./evolve_daemon.sh stop                         # SIGTERM the running daemon
 #
 # Env: HERMES_HOME (default: $HOME/.hermes-evolved) selects the evolve dir.
@@ -46,16 +47,39 @@ _locked_pid() {
     cat "$LOCK_FILE" 2>/dev/null | tr -d '[:space:]'
 }
 
+_drift_line() {
+    # Surface code drift from daemon_state.json (written by
+    # _check_code_drift in think_daemon.py): the daemon is running code
+    # from an older commit than the repo.  Empty when there is no drift.
+    local state_file="$EVOLVE_DIR/daemon_state.json"
+    [ -f "$state_file" ] || { echo ""; return; }
+    .venv/bin/python3 - "$state_file" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        ds = json.load(f)
+except Exception:
+    sys.exit(0)
+cd = ds.get("code_drift") or {}
+if cd.get("startup_head") and cd.get("startup_head") != cd.get("current_head"):
+    print("  DRIFT: daemon running %s, repo at %s (detected %s)" % (
+        cd["startup_head"], cd["current_head"], (cd.get("detected_at") or "?")[:19]))
+    print("  hint: ./evolve_daemon.sh restart to load latest logic")
+PY
+}
+
 cmd_status() {
     local pid
     pid="$(_locked_pid)"
     if [ -n "$pid" ] && _pid_alive "$pid"; then
-        local started state
+        local started state drift
         started="$(stat -c '%y' "/proc/$pid" 2>/dev/null | cut -d. -f1)"
         state="$(awk '/^State:/{print $2 " " $3}' "/proc/$pid/status" 2>/dev/null)"
         echo "RUNNING: PID $pid (state: $state, started: $started)"
         echo "  cmd: $(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)"
         echo "  log: $EVOLVE_DIR/daemon.log (tail for cycle activity)"
+        drift="$(_drift_line)"
+        [ -n "$drift" ] && echo "$drift"
         return 0
     fi
     if [ -n "$pid" ]; then
@@ -120,6 +144,12 @@ cmd_stop() {
     rm -f "$LOCK_FILE"
 }
 
+cmd_restart() {
+    echo "=== restarting evolve daemon ==="
+    cmd_stop || true
+    cmd_start
+}
+
 case "${1:-status}" in
     start)
         # optional --interval N
@@ -128,6 +158,13 @@ case "${1:-status}" in
         fi
         cmd_start
         ;;
+    restart)
+        # optional --interval N (same handling as start)
+        if [ "${2:-}" = "--interval" ]; then
+            INTERVAL="${3:-900}"
+        fi
+        cmd_restart
+        ;;
     status)
         cmd_status
         ;;
@@ -135,7 +172,7 @@ case "${1:-status}" in
         cmd_stop
         ;;
     *)
-        echo "usage: $0 {start [--interval SECONDS] | status | stop}" >&2
+        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop}" >&2
         exit 2
         ;;
 esac

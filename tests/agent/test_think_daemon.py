@@ -443,6 +443,40 @@ class TestCodeDriftDetection:
         ds = {}  # legacy state, no startup_head recorded
         assert td._check_code_drift(ds) is False
 
+    def test_mark_startup_clears_stale_drift(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        head = td._git_head()
+        stale = "0" * (len(head) if head else 7)
+        # State left behind by a previous daemon that was restarted:
+        # startup_head is stale AND a code_drift block claims drift.
+        ds = {
+            "startup_head": stale,
+            "code_drift": {
+                "startup_head": stale,
+                "current_head": "fffffff",
+                "detected_at": "2026-07-31T18:04:20+00:00",
+            },
+        }
+        td._mark_startup(ds, 900, head)
+        assert ds["startup_head"] == head
+        assert ds["interval_seconds"] == 900
+        assert ds["status"] == "running"
+        # A fresh start runs the code at `head` — the stale drift marker
+        # must not linger and keep status/state claiming the daemon is
+        # behind the repo.
+        assert "code_drift" not in ds
+
+    def test_mark_startup_preserves_current_head_without_drift(
+        self, evolve_env: Dict
+    ) -> None:
+        td = evolve_env["module"]
+        head = td._git_head()
+        ds = {"startup_head": head, "interval_seconds": 600}
+        td._mark_startup(ds, 900, head)
+        assert ds["startup_head"] == head
+        assert ds["interval_seconds"] == 900
+        assert "code_drift" not in ds
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Timeline persistence
