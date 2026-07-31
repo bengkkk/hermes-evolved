@@ -2751,8 +2751,11 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # knows what happened during its absence.
     _consecutive_fallback = ds.get("consecutive_fallback_cycles", 0)
 
-    if raw is None:
-        logger.warning("LLM unavailable — falling back to local analysis")
+    if raw is None or not raw.strip():
+        logger.warning(
+            "LLM unavailable%s — falling back to local analysis",
+            " (empty response)" if raw is not None else "",
+        )
         ds["consecutive_fallback_cycles"] = _consecutive_fallback + 1
         parsed = _local_analysis(state)
         result["status"] = "ok"

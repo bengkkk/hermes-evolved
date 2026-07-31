@@ -15,6 +15,7 @@ Each test class runs in isolation with a temp evolve directory.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import io
 import json
@@ -1329,3 +1330,95 @@ class TestActionDedupGate:
         ds_after = updates.get("daemon_state", {})
         last_output = ds_after.get("last_action_output", "")
         assert isinstance(last_output, str), f"Expected string output, got: {type(last_output)}"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Cycle body: empty/whitespace LLM response → local fallback
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestCycleBodyEmptyLlmResponse:
+    """An empty/whitespace-only LLM response is an outage, not a parse error.
+
+    ``_call_llm`` can return ``""`` when the provider returns empty content
+    (e.g. dict-style responses default to ``content=""``).  Previously an
+    empty string fell through to ``_try_parse_json("")`` → ``parse_error``,
+    which returned early and skipped every state update — the cycle was
+    wasted even though the LLM was merely unavailable.  The cycle body must
+    treat empty/whitespace-only responses exactly like ``raw is None``:
+    local-analysis fallback, status ``ok``, consecutive-fallback tracking.
+    """
+
+    async def _run_cycle(self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch, raw: str) -> tuple:
+        td = evolve_env["module"]
+
+        async def _fake_llm(messages: list, task: str = "thinking") -> str:
+            return raw
+
+        monkeypatch.setattr(td, "_call_llm", _fake_llm)
+
+        result = {"status": "ok", "tick_duration": 0, "insight": None, "error": None}
+        ds = td.load_daemon_state()
+        ds.setdefault(
+            "cycle_stats",
+            {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
+             "avg_duration": 0.0, "max_duration": 0.0},
+        )
+
+        # Local-analysis fallback still executes a state-checking action via
+        # subprocess; mock it (same pattern as the action-dedup tests above)
+        # so the test is hermetic and deterministic.
+        import subprocess
+
+        original_run = subprocess.run
+
+        def _mock_run(*a, **kw):
+            return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+        try:
+            subprocess.run = _mock_run
+            result = await td._run_cycle_body(result, ds)
+        finally:
+            subprocess.run = original_run
+
+        return result, ds
+
+    def test_empty_response_falls_back_to_local_analysis(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch, ""))
+
+        assert result["status"] == "ok", (
+            f"Expected ok (fallback), got {result['status']}: {result.get('error')}"
+        )
+        assert result["llm_fallback"] is True
+        assert ds["consecutive_fallback_cycles"] == 1, (
+            "Empty response must count as a consecutive fallback cycle"
+        )
+        assert ds["tick_count"] == 1, "Cycle must advance tick_count (not return early)"
+        assert ds["status"] == "ok"
+        assert result.get("insight"), "Local-analysis insight should be produced"
+
+    def test_whitespace_only_response_falls_back(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        result, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch, "   \n\t  "))
+
+        assert result["status"] == "ok", (
+            f"Expected ok (fallback), got {result['status']}: {result.get('error')}"
+        )
+        assert result["llm_fallback"] is True
+        assert ds["consecutive_fallback_cycles"] == 1
+        assert ds["tick_count"] == 1
+
+    def test_non_json_text_still_parse_error(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-empty, non-JSON text is a genuine parse error — not a fallback."""
+        result, ds = asyncio.run(
+            self._run_cycle(evolve_env, monkeypatch, "I am sorry, I cannot do that.")
+        )
+
+        assert result["status"] == "parse_error"
+        assert result.get("llm_fallback") is not True
+        assert "Could not parse JSON" in (result.get("error") or "")
