@@ -861,6 +861,64 @@ class WorldModel:
 
         return verified_count
 
+    def verify_pending_predictions(self) -> int:
+        """Evidence-verify non-expired predictions that already have decisive evidence.
+
+        ``verify_expired_predictions`` only resolves predictions once their
+        timeframe has elapsed, and predictions reaching expiry without
+        evidence degrade to error 0.5 (uncertain) — which deliberately does
+        NOT feed calibration. But a prediction is often resolvable long
+        before expiry: the predicted event may already have happened (or
+        been contradicted) in recorded action triples. This method runs the
+        same evidence stage over predictions still within their timeframe,
+        so fulfilled/contradicted predictions become real calibration
+        observations immediately instead of lingering as "pending" until
+        they expire.
+
+        Expired predictions and predictions without decisive evidence are
+        left untouched — the former for ``verify_expired_predictions``, the
+        latter for a later cycle when more evidence has accumulated.
+
+        Returns:
+            Number of predictions resolved via evidence.
+        """
+        from datetime import timezone as _tz
+
+        now = datetime.now(_tz.utc)
+        verified_count = 0
+
+        for pred in self.data.get("predictions", []):
+            if pred.get("verified"):
+                continue
+
+            tf = pred.get("timeframe")
+            days = self._parse_timeframe_days(tf)
+            if days is None:
+                continue  # Can't determine timeframe — leave it
+
+            ts_str = pred.get("timestamp")
+            if not ts_str:
+                continue
+            try:
+                pred_time = datetime.fromisoformat(ts_str)
+            except (ValueError, TypeError):
+                continue
+
+            if pred_time > now:
+                continue  # Clock skew — leave for a later cycle
+
+            elapsed_days = (now - pred_time).total_seconds() / 86400.0
+            grace = max(days * 0.1, 1.0 / 144.0)  # same grace as expired path
+            if elapsed_days >= days + grace:
+                continue  # Expired — verify_expired_predictions owns this
+
+            # Within timeframe: resolve NOW if decisive evidence exists.
+            evidence_error = self.verify_prediction_via_evidence(pred.get("id", ""))
+            if evidence_error is not None:
+                verified_count += 1
+
+        return verified_count
+
     # ── Discrepancy analysis ──────────────────────────────────────
 
     def analyze_recent_discrepancies(self, count: int = 10) -> List[Dict[str, Any]]:

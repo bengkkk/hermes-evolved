@@ -2683,11 +2683,19 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "world_model": wm,
     }
 
-    # 1.75 Auto-verify expired predictions before the thinking cycle
+    # 1.75 Auto-verify predictions before the thinking cycle
     try:
         expired_count = wm.verify_expired_predictions()
         if expired_count > 0:
             logger.info("Auto-verified %d expired predictions", expired_count)
+        # Also resolve non-expired predictions that already have decisive
+        # action-triple evidence — learn as soon as evidence exists instead
+        # of waiting for timeframe expiry (which degrades to uncertain 0.5
+        # and never feeds calibration).
+        pending_count = wm.verify_pending_predictions()
+        if pending_count > 0:
+            logger.info("Evidence-verified %d pending predictions", pending_count)
+        if expired_count + pending_count > 0:
             # Save immediately so changes persist even if the LLM call fails
             # or the cycle returns early on parse errors (line 1986).
             wm.save()

@@ -714,6 +714,98 @@ class TestExpiredPredictions:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  Pending prediction evidence verification
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestPendingPredictions:
+    """verify_pending_predictions resolves non-expired predictions with evidence."""
+
+    def test_no_predictions_returns_zero(self):
+        wm = WorldModel()
+        assert wm.verify_pending_predictions() == 0
+
+    def test_unexpired_with_evidence_resolved(self):
+        """A fresh prediction with decisive action-triple evidence is resolved now."""
+        wm = WorldModel()
+        wm.record_action_complete(
+            "shell",
+            "locate think_daemon.py via filesystem search",
+            "exit=0: found /workspace/hermes-evolved/think_daemon.py",
+            "expect to find the daemon script",
+        )
+        wm.record_prediction(
+            "A filesystem search will reveal think_daemon.py under /workspace or /root",
+            "1 day",
+            0.8,
+            "test basis",
+        )
+        count = wm.verify_pending_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        assert pred["verified"] is True
+        assert pred["error"] == pytest.approx(0.15, abs=0.01)
+        # Evidence-resolved predictions are real observations → feed calibration
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["correct_predictions"] == 1
+        assert acc["calibration_buckets"][4]["count"] == 1  # confidence 0.8 → bucket 4
+
+    def test_contradicted_evidence_resolved_high_error(self):
+        """Evidence showing failure resolves the prediction with error 0.85."""
+        wm = WorldModel()
+        wm.record_action_complete(
+            "shell",
+            "compile the world model module",
+            "exit=1: SyntaxError in world_model.py line 42",
+            "expect clean compile",
+        )
+        wm.record_prediction(
+            "world_model.py will compile cleanly this cycle",
+            "1 day",
+            0.7,
+            "test",
+        )
+        count = wm.verify_pending_predictions()
+        assert count == 1
+        pred = wm.data["predictions"][0]
+        assert pred["verified"] is True
+        assert pred["error"] == pytest.approx(0.85, abs=0.01)
+
+    def test_unexpired_without_evidence_left_pending(self):
+        """No decisive evidence → prediction stays unverified for a later cycle."""
+        wm = WorldModel()
+        wm.record_prediction("The sky will turn green tomorrow", "1 day", 0.5, "test")
+        assert wm.verify_pending_predictions() == 0
+        assert len(wm.get_unverified_predictions()) == 1
+
+    def test_expired_left_for_expired_verifier(self):
+        """Expired predictions are not touched — verify_expired_predictions owns them."""
+        wm = WorldModel()
+        old_time = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        wm.data["predictions"].append({
+            "id": "pred_old",
+            "text": "old prediction about think_daemon.py",
+            "timeframe": "1 day",
+            "confidence": 0.5,
+            "basis": "",
+            "verified": False,
+            "timestamp": old_time,
+        })
+        wm.record_action_complete(
+            "shell",
+            "locate think_daemon.py",
+            "exit=0: found think_daemon.py",
+            "expect path",
+        )
+        assert wm.verify_pending_predictions() == 0
+        assert len(wm.get_unverified_predictions()) == 1
+        # The expired verifier still owns the old prediction
+        assert wm.verify_expired_predictions() == 1
+        assert len(wm.get_unverified_predictions()) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  Discrepancy pattern detection
 # ══════════════════════════════════════════════════════════════════════
 
