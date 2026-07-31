@@ -403,6 +403,34 @@ class TestActionTripleLifecycle:
         assert triples[0]["actual_outcome"] is None
         assert triples[0]["prediction_error"] is None
 
+    def test_record_action_truncates_large_parameter_values(self):
+        wm = WorldModel()
+        big_content = "x" * 5000
+        tid = wm.record_action(
+            "write_file",
+            "write large file",
+            "file written",
+            parameters={"path": "/tmp/big.txt", "content": big_content},
+        )
+        stored = wm.data["action_triples"][0]["action_parameters"]
+        # Content is capped; short values (path) pass through untouched.
+        assert stored["path"] == "/tmp/big.txt"
+        assert len(stored["content"]) < 400
+        assert stored["content"].endswith("...[truncated]")
+        # The stored prefix is still usable for token matching.
+        assert stored["content"].startswith("x" * 300)
+
+    def test_record_action_keeps_small_parameter_values(self):
+        wm = WorldModel()
+        tid = wm.record_action(
+            "shell",
+            "list dir",
+            "lists files",
+            parameters={"command": "ls -la /tmp"},
+        )
+        stored = wm.data["action_triples"][0]["action_parameters"]
+        assert stored["command"] == "ls -la /tmp"
+
     def test_complete_action_fills_triple(self):
         wm = WorldModel()
         tid = wm.record_action("write_file", "write config", "should succeed")

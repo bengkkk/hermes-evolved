@@ -68,6 +68,13 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Cap stored parameter values (e.g. write_file content, long shell commands)
+# so the world model data file stays bounded even when actions carry large
+# payloads. Only the leading chunk is needed for token-based similarity
+# matching in predict_action_outcome; the full payload is never reconstructed
+# from the triple.
+_MAX_PARAM_VALUE_LEN = 300
+
 # ── Schema ────────────────────────────────────────────────────────
 
 # Monotonically incrementing counter for unique IDs within the same timestamp
@@ -389,11 +396,22 @@ class WorldModel:
             conf = 0.3
         else:
             conf = 0.5  # unknown source
+
+        # Bound parameter payloads so world_model.json cannot grow without
+        # limit from large write_file content or long shell commands.
+        stored_params: Dict[str, Any] = {}
+        if parameters:
+            for pkey, pval in parameters.items():
+                if isinstance(pval, str) and len(pval) > _MAX_PARAM_VALUE_LEN:
+                    stored_params[pkey] = pval[:_MAX_PARAM_VALUE_LEN] + "...[truncated]"
+                else:
+                    stored_params[pkey] = pval
+
         triple: Dict[str, Any] = {
             "id": triple_id,
             "action_type": action_type,
             "action_description": action_description,
-            "action_parameters": dict(parameters) if parameters else {},
+            "action_parameters": stored_params,
             "expected_outcome": expected_outcome or "unknown",
             "expected_source": expected_source,
             "prediction_confidence": conf,
