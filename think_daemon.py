@@ -953,14 +953,21 @@ def _prune_self_model(
             w_lower = w.lower().strip()
             for existing in cleaned:
                 e_lower = existing.lower().strip()
-                # Exact or substring match
-                if w_lower == e_lower:
-                    is_dup = True
-                    break
+                # Substring with word-boundary check: "bug X" must NOT
+                # match as a substring of "bug X Y Z's variant" (prefix false positive).
                 if len(w_lower) >= 4 and len(e_lower) >= 4:
-                    if w_lower in e_lower or e_lower in w_lower:
-                        is_dup = True
-                        break
+                    if w_lower in e_lower:
+                        _idx = e_lower.index(w_lower)
+                        _end = _idx + len(w_lower)
+                        if _end >= len(e_lower) or not e_lower[_end].isalnum():
+                            is_dup = True
+                            break
+                    if e_lower in w_lower:
+                        _idx = w_lower.index(e_lower)
+                        _end = _idx + len(e_lower)
+                        if _end >= len(w_lower) or not w_lower[_end].isalnum():
+                            is_dup = True
+                            break
                 # Word overlap > 50%
                 _STOP = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
                                    "at", "to", "for", "of", "with", "by", "from", "is",
@@ -978,12 +985,71 @@ def _prune_self_model(
                 removed += 1
         caps["weaknesses"] = cleaned[-8:]  # cap at 8
 
-    # ── 2. Cap promised_features ──
+    # ── 2. Deduplicate + cap promised_features ──
     commits = sm.setdefault("commitments", {})
     pf: list = commits.get("promised_features", [])
-    if len(pf) > 8:
-        removed += len(pf) - 8
-        commits["promised_features"] = pf[-8:]
+    if pf:
+        original_len = len(pf)
+        # Near-duplicate detection using same word-overlap strategy as weaknesses.
+        # The LLM frequently produces semantically identical commitments with minor
+        # phrasing variations (e.g. "Read think_daemon.py and outline core loop" vs
+        # "Read think_daemon.py and produce an outline of its loop").  Without
+        # deduplication, these accumulate in the prompt and reinforce fixation loops.
+        cleaned_pf: list[str] = []
+        for c in pf:
+            is_dup = False
+            c_lower = c.lower().strip()
+            for existing in cleaned_pf:
+                e_lower = existing.lower().strip()
+                # Exact
+                if c_lower == e_lower:
+                    is_dup = True
+                    break
+                # Substring with word-boundary check: "Commitment 1" must NOT
+                # match as a substring of "Commitment 10" (prefix false positive).
+                # After the match position, the next char must be non-alphanumeric
+                # or end-of-string to be a true sub-phrase match.
+                if len(c_lower) >= 4 and len(e_lower) >= 4:
+                    if c_lower in e_lower:
+                        idx = e_lower.index(c_lower)
+                        end = idx + len(c_lower)
+                        if end >= len(e_lower) or not e_lower[end].isalnum():
+                            is_dup = True
+                            break
+                    if e_lower in c_lower:
+                        idx = c_lower.index(e_lower)
+                        end = idx + len(e_lower)
+                        if end >= len(c_lower) or not c_lower[end].isalnum():
+                            is_dup = True
+                            break
+                # Word overlap > 50%
+                _STOP_PF = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
+                                      "at", "to", "for", "of", "with", "by", "from", "is",
+                                      "it", "as", "be", "this", "that", "not", "no", "how"})
+                c_words = {w for w in re.findall(r"[a-z0-9]+", c_lower) if w not in _STOP_PF}
+                e_words = {w for w in re.findall(r"[a-z0-9]+", e_lower) if w not in _STOP_PF}
+                if c_words and e_words:
+                    overlap = len(c_words & e_words)
+                    if overlap / max(len(c_words), len(e_words)) > 0.5:
+                        is_dup = True
+                        break
+            if is_dup:
+                removed += 1
+            else:
+                cleaned_pf.append(c)
+        # Cap at 8 (most recent) — count any additional removals from capping
+        after_dedup = len(cleaned_pf)
+        if after_dedup > 8:
+            removed += after_dedup - 8
+            commits["promised_features"] = cleaned_pf[-8:]
+        else:
+            commits["promised_features"] = cleaned_pf
+        if removed > 0:
+            total_removed = original_len - len(commits["promised_features"])
+            logger.info(
+                "Deduplicated/capped commitments: %d → %d (%d removed)",
+                original_len, len(commits["promised_features"]), total_removed,
+            )
 
     # ── 3. Health-aware stale detection for unknown_areas ──
     # Uses the same daemon health data as weaknesses pruning above.
@@ -1071,10 +1137,20 @@ def _prune_self_model(
                 if u_lower == e_lower:
                     is_dup = True
                     break
+                # Substring with word-boundary check (same as weaknesses).
                 if len(u_lower) >= 4 and len(e_lower) >= 4:
-                    if u_lower in e_lower or e_lower in u_lower:
-                        is_dup = True
-                        break
+                    if u_lower in e_lower:
+                        _idx = e_lower.index(u_lower)
+                        _end = _idx + len(u_lower)
+                        if _end >= len(e_lower) or not e_lower[_end].isalnum():
+                            is_dup = True
+                            break
+                    if e_lower in u_lower:
+                        _idx = u_lower.index(e_lower)
+                        _end = _idx + len(e_lower)
+                        if _end >= len(u_lower) or not u_lower[_end].isalnum():
+                            is_dup = True
+                            break
                 # Word overlap > 50%
                 _STOP_U = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
                                      "at", "to", "for", "of", "with", "by", "from", "is",
