@@ -336,6 +336,84 @@ def _check_code_drift(ds: Dict[str, Any]) -> bool:
     return False
 
 
+# ── Code-drift auto-restart ─────────────────────────────────────
+# Detecting drift is only half the fix: a warning makes staleness
+# visible, but the daemon keeps acting on outdated logic until someone
+# restarts it by hand (observed 2026-07-31: cycle 269 re-created a
+# duplicate active plan because the daemon had been running the
+# pre-guard logic since 16:20, four hours past the 17:05 fix).  Since
+# the drift check runs at the top of every cycle, the daemon can hand
+# over to a fresh process itself: schedule a detached restart helper,
+# then exit cleanly.  The throttle prevents a restart loop when
+# commits land faster than the daemon can cycle.
+
+_DRIFT_RESTART_MIN_INTERVAL = 600  # seconds between auto-restarts
+_DRIFT_RESTART_SLEEP = 5           # seconds the helper waits for this process to exit
+
+
+def _schedule_drift_restart(ds: Dict[str, Any]) -> bool:
+    """Schedule a detached restart onto fresh code; True when scheduled.
+
+    Called after ``_check_code_drift`` returned True.  Records a
+    throttle timestamp, spawns a setsid'd helper that waits a few
+    seconds (letting this process exit and release the PID lock) then
+    runs ``evolve_daemon.sh restart``, and returns True so the caller
+    can stop the loop and exit instead of acting on stale code.
+
+    Returns False (and does nothing) when a restart happened too
+    recently (throttled), or when the launcher script is missing.
+    """
+    now = datetime.now(timezone.utc)
+    last = ds.get("last_auto_restart")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if (now - last_dt).total_seconds() < _DRIFT_RESTART_MIN_INTERVAL:
+                logger.warning(
+                    "Drift restart throttled: last auto-restart was %s "
+                    "(< %ds ago); continuing on current code for now",
+                    last, _DRIFT_RESTART_MIN_INTERVAL,
+                )
+                return False
+        except ValueError:
+            pass  # unparseable timestamp — don't let it block a restart
+
+    helper = _WORKSPACE_ROOT / "evolve_daemon.sh"
+    if not helper.exists():
+        logger.error("Cannot auto-restart on drift: %s missing", helper)
+        return False
+
+    ds["last_auto_restart"] = now.isoformat()
+    save_daemon_state(ds)
+
+    import subprocess
+    log_fh = None
+    try:
+        log_fh = open(str(EVOLVE_DIR / "daemon_launcher.log"), "ab")
+    except OSError:
+        pass  # helper output falls back to DEVNULL
+    try:
+        subprocess.Popen(
+            ["bash", "-c",
+             f"sleep {_DRIFT_RESTART_SLEEP} && exec \"$1\" restart",
+             "drift-restart-helper", str(helper)],
+            cwd=str(_WORKSPACE_ROOT),
+            start_new_session=True,  # setsid: survives this process's exit
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh or subprocess.DEVNULL,
+            stderr=log_fh or subprocess.DEVNULL,
+        )
+    finally:
+        if log_fh is not None:
+            log_fh.close()
+    logger.warning(
+        "Code drift detected — scheduled auto-restart in %ds "
+        "(helper will run evolve_daemon.sh restart); exiting this process",
+        _DRIFT_RESTART_SLEEP,
+    )
+    return True
+
+
 # ── PID lock ─────────────────────────────────────────────────────
 
 def _acquire_daemon_lock() -> bool:
@@ -3564,9 +3642,16 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
                 break
 
             try:
-                # Code-drift check: warn if the repo moved past this
-                # process's loaded code (stale daemon runs outdated logic).
-                _check_code_drift(load_daemon_state())
+                # Code-drift check: if the repo moved past this process's
+                # loaded code, hand over to a fresh daemon instead of
+                # silently running outdated logic (the pre-drift daemon
+                # re-created a duplicate plan on 2026-07-31 until it was
+                # manually restarted).  _schedule_drift_restart spawns a
+                # detached helper that restarts onto the new HEAD; we
+                # then exit without running this cycle on stale code.
+                if _check_code_drift(load_daemon_state()):
+                    if _schedule_drift_restart(load_daemon_state()):
+                        break
                 await run_one_cycle()
             except Exception as e:
                 logger.error("Cycle failed unexpectedly: %s", e, exc_info=True)

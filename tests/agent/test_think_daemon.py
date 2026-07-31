@@ -478,6 +478,63 @@ class TestCodeDriftDetection:
         assert "code_drift" not in ds
 
 
+class TestDriftAutoRestart:
+    """_schedule_drift_restart hands a stale daemon over to fresh code."""
+
+    def test_restart_scheduled_when_drifted(self, evolve_env: Dict) -> None:
+        from unittest.mock import patch as _patch
+
+        td = evolve_env["module"]
+        # A daemon that started long ago, so no throttle applies.
+        old = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        ds = {"startup_head": "0000000", "last_auto_restart": old}
+        with _patch("subprocess.Popen") as popen:
+            ok = td._schedule_drift_restart(ds)
+        assert ok is True
+        # Throttle timestamp recorded for the next check.
+        assert "last_auto_restart" in ds
+        # A detached helper was spawned to run evolve_daemon.sh restart.
+        assert popen.call_count == 1
+        argv = popen.call_args.args[0]
+        assert "restart" in argv[2]  # bash -c "<...restart...>"
+        assert argv[4] == str(td._WORKSPACE_ROOT / "evolve_daemon.sh")
+        kwargs = popen.call_args.kwargs
+        assert kwargs.get("start_new_session") is True  # setsid: detached
+        assert kwargs.get("stdin") is not None
+
+    def test_restart_throttled_when_recent(self, evolve_env: Dict) -> None:
+        from unittest.mock import patch as _patch
+
+        td = evolve_env["module"]
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=60)).isoformat()
+        ds = {"startup_head": "0000000", "last_auto_restart": recent}
+        with _patch("subprocess.Popen") as popen:
+            ok = td._schedule_drift_restart(ds)
+        assert ok is False
+        popen.assert_not_called()
+        # Throttle must not rewrite the recorded timestamp.
+        assert ds["last_auto_restart"] == recent
+
+    def test_restart_refused_without_launcher(self, evolve_env: Dict, tmp_path: Path) -> None:
+        from unittest.mock import patch as _patch
+
+        td = evolve_env["module"]
+        # Point the workspace root somewhere without evolve_daemon.sh.
+        bare_dir = tmp_path / "bare"
+        bare_dir.mkdir()
+        old_root = td._WORKSPACE_ROOT
+        td._WORKSPACE_ROOT = bare_dir
+        try:
+            ds = {"startup_head": "0000000"}
+            with _patch("subprocess.Popen") as popen:
+                ok = td._schedule_drift_restart(ds)
+            assert ok is False
+            popen.assert_not_called()
+            assert "last_auto_restart" not in ds
+        finally:
+            td._WORKSPACE_ROOT = old_root
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Timeline persistence
 # ═══════════════════════════════════════════════════════════════════
