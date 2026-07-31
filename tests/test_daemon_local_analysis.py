@@ -283,8 +283,30 @@ class TestLocalAnalysis:
         state = _make_state(wm, tick_count=3)
         result = _local_analysis(state)
 
-        # This should not raise
-        updates = _apply_insights(result, state)
+        # The fallback action type varies with the world model's per-type
+        # sample counts (data-driven selection) — it must be one of the
+        # supported rotation types.
+        assert result["action"]["type"] in ("shell", "git_commit", "write_file")
+
+        # Mock subprocess so _apply_insights never executes a REAL shell
+        # command or git commit against the workspace repo. Without this,
+        # a git_commit action (chosen when git_commit is the least-sampled
+        # type, e.g. a fresh world model) runs `git add -A && git commit`
+        # with cwd=_WORKSPACE_ROOT and sweeps uncommitted workspace changes
+        # into an "Auto-sync" commit. Observed 2026-07-31 17:52 UTC.
+        import subprocess
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            # This should not raise
+            updates = _apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
         assert "timeline" in updates
         assert "self_model" in updates
         assert "orientation" in updates
@@ -358,3 +380,104 @@ class TestLocalAnalysis:
         result = _local_analysis(state)
 
         assert "prediction" in result["insight"].lower() or "active" in result["insight"].lower()
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Data-driven fallback action selection
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestSelectStateCheckAction:
+    """_select_state_check_action must diversify the world model's
+    training data by preferring the least-sampled action type.
+
+    Regression target: the blind ``tick_count % 5`` rotation gave shell
+    3 of 5 slots, so shell accrued 52 of 77 triples while git_commit sat
+    at 11 — calibration is bounded by the least-sampled type.
+    """
+
+    # Same shape as the rotation slots in _local_analysis
+    _COMMANDS = [
+        {"type": "shell", "command": "echo goals", "description": "goals"},
+        {"type": "shell", "command": "echo self", "description": "self"},
+        {"type": "shell", "command": "echo daemon", "description": "daemon"},
+        {"type": "git_commit", "message": "sync", "description": "commit"},
+        {"type": "write_file", "path": "/tmp/x", "content": "y", "description": "write"},
+    ]
+
+    def _wm_with_counts(self, counts: Dict[str, int]) -> WorldModel:
+        """WorldModel with fabricated per-type sample counts."""
+        wm = WorldModel()
+        wm.data["per_type_accuracy"] = {
+            t: {"count": c, "avg_error": 0.2, "min_error": 0.15, "max_error": 0.25}
+            for t, c in counts.items()
+        }
+        return wm
+
+    def test_picks_least_sampled_type(self) -> None:
+        """git_commit (10 samples) is chosen over shell (50) and write_file (14)."""
+        from think_daemon import _select_state_check_action
+
+        wm = self._wm_with_counts({"shell": 50, "git_commit": 10, "write_file": 14})
+        for tick in range(6):
+            action = _select_state_check_action(wm, tick, self._COMMANDS)
+            assert action["type"] == "git_commit", (
+                f"tick {tick} picked {action['type']}, expected git_commit"
+            )
+
+    def test_rotates_through_tied_least_types(self) -> None:
+        """Tied least-sampled types are rotated through, not biased to one."""
+        from think_daemon import _select_state_check_action
+
+        wm = self._wm_with_counts({"shell": 50, "git_commit": 10, "write_file": 10})
+        picked = {
+            _select_state_check_action(wm, t, self._COMMANDS)["type"]
+            for t in range(8)
+        }
+        assert picked == {"git_commit", "write_file"}
+
+    def test_falls_back_to_rotation_without_data(self) -> None:
+        """No calibration data → plain tick rotation (old behavior)."""
+        from think_daemon import _select_state_check_action
+
+        wm = WorldModel()  # empty per_type_accuracy
+        # tick 4 -> slot 4 (write_file); tick 5 -> slot 0 (goals shell)
+        action = _select_state_check_action(wm, 4, self._COMMANDS)
+        assert action["type"] == "write_file"
+        action = _select_state_check_action(wm, 5, self._COMMANDS)
+        assert action["type"] == "shell"
+        assert "goals" in action["command"]
+
+    def test_returns_copy_not_reference(self) -> None:
+        """The returned dict is a copy; mutating it must not touch the catalog."""
+        from think_daemon import _select_state_check_action
+
+        wm = self._wm_with_counts({"shell": 50, "git_commit": 10, "write_file": 14})
+        action = _select_state_check_action(wm, 0, self._COMMANDS)
+        action["expected_outcome"] = "mutated"
+        assert "expected_outcome" not in self._COMMANDS[3]
+
+    def test_local_analysis_uses_data_driven_selection(self) -> None:
+        """_local_analysis with an imbalanced world model picks the
+        least-sampled type even when the tick would land on a shell slot."""
+        from think_daemon import _select_state_check_action  # noqa: F401  (import check)
+
+        wm = self._wm_with_counts({"shell": 50, "git_commit": 10, "write_file": 14})
+        state = _make_state(wm, tick_count=0)
+        result = _local_analysis(state)
+        assert result["action"]["type"] == "git_commit"
+
+    def test_local_analysis_empty_wm_keeps_rotation_semantics(self) -> None:
+        """Hermetic/fresh world model → rotation semantics preserved:
+        tick 4 (→5) hits slot 0 (goals), tick 5 (→6) slot 1 (self-model)."""
+        wm = WorldModel()
+        state = _make_state(wm, tick_count=4)
+        result = _local_analysis(state)
+        assert result["action"]["type"] == "shell"
+        assert "Goals" in result["action"]["command"] or "goals" in result["action"]["command"]
+
+        state = _make_state(wm, tick_count=5)
+        result = _local_analysis(state)
+        assert result["action"]["type"] == "shell"
+        assert "Self Model" in result["action"]["command"]
+

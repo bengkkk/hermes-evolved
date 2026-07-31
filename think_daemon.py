@@ -2135,6 +2135,74 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     return None
 
 
+def _select_state_check_action(
+    wm: WorldModel,
+    tick_count: int,
+    commands: list[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Pick the fallback state-check action for this cycle.
+
+    Data-driven selection: prefers the action type with the fewest
+    completed triples in the world model, so fallback cycles diversify
+    the world model's training data instead of monotonically re-sampling
+    whichever type the blind rotation lands on most often.  Observed
+    2026-07-31: the rotation gave shell 3 of 5 slots, so shell accrued
+    52 of 77 triples while git_commit sat at 11 — the model's
+    calibration is only as good as its least-sampled type.
+
+    Falls back to the plain ``tick_count % len(commands)`` rotation when
+    the world model has no calibration data yet (fresh install, hermetic
+    test env) or per-type stats are unavailable, preserving the existing
+    rotation semantics for those cases.
+
+    Args:
+        wm: The loaded world model (used only for per-type sample counts).
+        tick_count: Daemon tick number, used to rotate within a type and
+            to break ties between equally-sampled types.
+        commands: The candidate action dicts (``_state_check_commands``).
+
+    Returns:
+        A copy of the chosen action dict.
+    """
+    # Group commands by action type, preserving rotation order within type
+    type_slots: Dict[str, list[int]] = {}
+    for i, c in enumerate(commands):
+        type_slots.setdefault(str(c.get("type", "shell")), []).append(i)
+
+    per_type: Dict[str, Dict[str, Any]] = {}
+    try:
+        per_type = wm.get_per_type_accuracy() or {}
+    except Exception:
+        per_type = {}
+
+    def _count(t: str) -> int:
+        try:
+            return int(per_type.get(t, {}).get("count", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # Only consider types that actually appear in the rotation
+    known_types = [
+        t for t in ("shell", "git_commit", "write_file") if t in type_slots
+    ]
+    counts = {t: _count(t) for t in known_types}
+
+    if not known_types or all(c == 0 for c in counts.values()):
+        # No calibration data yet — plain rotation
+        idx = tick_count % len(commands)
+    else:
+        # Least-sampled type; rotate through ties so a balanced world
+        # model stays balanced instead of re-biasing toward the first
+        # type in priority order.
+        min_count = min(counts.values())
+        least_types = [t for t in known_types if counts[t] == min_count]
+        chosen_type = least_types[tick_count % len(least_types)]
+        slots = type_slots[chosen_type]
+        idx = slots[tick_count % len(slots)]
+
+    return dict(commands[idx])
+
+
 def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a useful thinking-cycle result from local data only, no LLM call.
 
@@ -2145,10 +2213,11 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
       - An insight summarising world-model health, data volume, and trends.
       - A basic self-model update noting the LLM outage.
       - A suggested focus for the next cycle (re-attempt LLM reflection).
-      - No predictions (we can't predict without an LLM).
-      - Actions are delegated to the rotating auto-default mechanism in
-        _apply_insights (exploratory ls, git log, world-model stats),
-        which continues to collect data even when LLM is unavailable.
+      - No standalone LLM predictions (the world model's data-driven
+        prediction path still produces expected outcomes for the action).
+      - A data-driven state-check action via _select_state_check_action
+        that prefers under-sampled action types, so fallback cycles keep
+        collecting data for the world model even when the LLM is down.
     """
     wm: WorldModel = state.get("world_model", load_world_model())
     sm: dict = state.get("self_model", load_self_model())
@@ -2271,8 +2340,10 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     # Instead of always returning None (which triggers the auto-default
     # shell-command rotation in _apply_insights), produce a state-checking
     # action that gathers diverse data for the world model.  The action
-    # rotates among different information-gathering commands based on
-    # tick count to avoid monotonous same-type triples.
+    # selection is data-driven (_select_state_check_action): it prefers
+    # the least-sampled action type so fallback cycles keep diversifying
+    # the world model's training data, falling back to plain tick
+    # rotation only when no calibration data exists yet.
     _action = None
     _ws = _WORKSPACE_ROOT_STR
     _evolve_path = str(EVOLVE_DIR)
@@ -2348,8 +2419,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             "description": "State check: write evolve state snapshot for diagnostics",
         },
     ]
-    _action_idx = tick_count % len(_state_check_commands)
-    _action = dict(_state_check_commands[_action_idx])
+    _action = _select_state_check_action(wm, tick_count, _state_check_commands)
     # Set expected outcome for prediction feedback — specific per action
     if _action["type"] == "git_commit":
         _action["expected_outcome"] = "exit=0: auto-sync commit of evolve state files (may be 'nothing to commit')"
