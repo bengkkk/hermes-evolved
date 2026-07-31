@@ -327,6 +327,65 @@ class TestLocalAnalysis:
                 f"{get_evolve_dir()}"
             )
 
+    def test_git_commit_stages_only_evolve_paths(self):
+        """git_commit executor must NOT run bare `git add -A` on the workspace root.
+
+        Regression test for a verified gap: the executor previously ran
+        ``git add -A`` with cwd=workspace root, staging EVERYTHING
+        uncommitted in the hermes-agent tree and sweeping unrelated
+        changes (build artifacts, website edits, half-finished work) into
+        the daemon's auto-sync commit under a misleading message.  It
+        must now stage only the evolve-owned paths
+        (``_EVOLVE_TRACKED_PATHS``), filtered to paths that exist.
+        """
+        from pathlib import Path as _Path
+
+        from think_daemon import _EVOLVE_TRACKED_PATHS, _apply_insights
+
+        wm = _make_wm_with_triples(count=5)
+        state = _make_state(wm, tick_count=3)
+        result = {
+            "fallback": True,  # skips the dedup gate; action executes as-is
+            "action": {
+                "type": "git_commit",
+                "message": "test: scoped auto-sync",
+                "description": "test git_commit scoping",
+            },
+        }
+
+        import subprocess
+
+        calls = []
+        original_run = subprocess.run
+        try:
+            def _mock_run(args, *a, **kw):
+                calls.append(list(args))
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            # This should not raise
+            _apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        # The staging call must be scoped: `git add -A -- <evolve paths>`.
+        add_calls = [c for c in calls if c[:2] == ["git", "add"]]
+        assert add_calls, "expected a git add invocation"
+        add_argv = add_calls[0]
+        assert add_argv[:4] == ["git", "add", "-A", "--"], add_argv
+        staged = add_argv[4:]
+        assert staged, "expected at least one staged path"
+        assert set(staged) <= set(_EVOLVE_TRACKED_PATHS), staged
+        # Every staged path must actually exist (missing pathspecs are filtered).
+        repo_root = _Path(__file__).resolve().parent.parent
+        for p in staged:
+            assert (repo_root / p).exists(), f"staged path does not exist: {p}"
+        # The commit call follows the add.
+        assert any(c[:2] == ["git", "commit"] for c in calls), calls
+        # The bare unscoped form must never appear.
+        assert ["git", "add", "-A"] not in calls, "bare git add -A is forbidden"
+
     def test_cyclic_analysis_includes_per_type_breakdown(self):
         """With two action types, the insight includes both type summaries."""
         wm = WorldModel()

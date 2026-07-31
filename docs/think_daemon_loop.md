@@ -201,13 +201,6 @@ same way.
 
 ## Verified gap candidates (for future cycles)
 
-- **`git add -A` breadth** (think_daemon.py line 1860): the `git_commit`
-  executor stages *everything* uncommitted in the workspace repo, then
-  commits it under the auto-sync message. A stray unrelated change in the
-  tree gets swept into the daemon's commit. Candidate fix: restrict the
-  add to known evolve paths (e.g. `docs/think_daemon_loop.md`,
-  `hermes-evolved/`, `think_daemon.py`, `world_model.py`) or `git add -u`
-  on already-tracked evolve files.
 - **Cron `--once` vs 200 s timeout**: a `--once` cycle launched *from a
   cron job* can be interrupted at the 3-minute cron hard limit (200 s
   cycle + startup/teardown > 180 s). The persistent daemon
@@ -217,3 +210,14 @@ same way.
   2026-07-31 — the 0-attempt tier + every-4th-cycle probe is active by
   design; recovery detection is expected within 4 cycles of the provider
   returning.
+
+## Resolved gaps
+
+- **`git add -A` breadth** (fixed 2026-07-31): the `git_commit` executor
+  staged *everything* uncommitted in the workspace repo, so any stray
+  change in the hermes-agent tree (build artifacts, website edits,
+  half-finished work) was swept into the daemon's auto-sync commit under
+  a misleading message. The executor now stages only `_EVOLVE_TRACKED_PATHS`
+  (the evolve-owned files), filtered to paths that exist; deletions are
+  intentionally not auto-staged. Regression-tested in
+  `tests/test_daemon_local_analysis.py`.

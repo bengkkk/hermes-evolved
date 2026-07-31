@@ -70,6 +70,43 @@ _ROTATING_AUTOS = [
     {"type": "shell", "command": f"python3 -c 'import pathlib; d=pathlib.Path(\"{_WORKSPACE_ROOT_STR}/..\"); [print(f.name) for f in d.iterdir() if f.name.startswith(\"hermes\") or f.name.startswith(\".hermes\")]'", "description": "Auto-default: sibling dirs check", "expected_outcome": "exit=0: listing of sibling directories matching 'hermes*' pattern"},
 ]
 
+# ── Evolve-owned paths for git_commit scoping ─────────────────────
+# The git_commit executor used to run `git add -A` with cwd=workspace
+# root, staging EVERYTHING uncommitted in the hermes-agent tree and
+# sweeping it into the daemon's auto-sync commit under a misleading
+# message.  Any stray change — a build artifact, a website doc touched
+# by another process, half-finished work in an unrelated directory —
+# got committed as "Auto-sync: evolve state snapshot".  The executor
+# now stages ONLY the files the evolve project owns (this list), so
+# the daemon's checkpoint commits cannot carry unrelated changes.
+# When adding a new evolve-owned file (module, test, script, doc),
+# add it here too.
+_EVOLVE_TRACKED_PATHS: list[str] = [
+    "think_daemon.py",
+    "world_model.py",
+    "data_layer.py",
+    "self_model.py",
+    "SelfModel.py",
+    "timeline.py",
+    "Timeline.py",
+    "agent/self_evolve.py",
+    "docs/think_daemon_loop.md",
+    "scripts/bootstrap_world_model.py",
+    "scripts/evolve_check.py",
+    "scripts/test_evolved.py",
+    "scripts/update_self_model.py",
+    "evolve_daemon.sh",
+    "Dockerfile.evolved",
+    "docker-compose.evolved.yml",
+    "tests/test_world_model.py",
+    "tests/test_data_layer.py",
+    "tests/test_daemon_local_analysis.py",
+    "tests/test_wm_self_bridge.py",
+    "tests/test_goal_reconciliation.py",
+    "tests/agent/test_think_daemon.py",
+    "tests/agent/test_world_model.py",
+]
+
 # ── Paths (delegated to data_layer for the base directory) ──
 EVOLVE_DIR = get_evolve_dir()
 TIMELINE_FILE = EVOLVE_DIR / "timeline.json"
@@ -1857,7 +1894,23 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             elif atype == "git_commit":
                 amsg = act.get("message", "")
                 if amsg:
-                    subprocess.run(["git", "add", "-A"], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
+                    # Stage ONLY evolve-owned paths (_EVOLVE_TRACKED_PATHS),
+                    # so a stray change anywhere else in the hermes-agent
+                    # tree cannot be swept into the daemon's auto-sync
+                    # commit.  Filter to paths that exist so `git add`
+                    # never errors on a missing pathspec; deleted evolve
+                    # files are intentionally not auto-staged (the agent
+                    # commits removals explicitly).
+                    _stage_paths = [
+                        p for p in _EVOLVE_TRACKED_PATHS
+                        if (_WORKSPACE_ROOT / p).exists()
+                    ]
+                    if _stage_paths:
+                        subprocess.run(
+                            ["git", "add", "-A", "--"] + _stage_paths,
+                            cwd=str(_WORKSPACE_ROOT), capture_output=True,
+                            text=True, timeout=30,
+                        )
                     r = subprocess.run(["git", "commit", "-m", amsg], cwd=str(_WORKSPACE_ROOT), capture_output=True, text=True, timeout=30)
                     rv = (r.stdout[:200] + "\n" + r.stderr[:100])[:250]
                     action_output = f"exit={r.returncode}: {rv}"
