@@ -1740,6 +1740,30 @@ def _prune_self_model(
     return removed
 
 
+def _action_params_from_act(act: Dict[str, Any], atype: str) -> Dict[str, Any]:
+    """Extract world-model action parameters from a daemon action dict.
+
+    Shared by the predict path (``predict_action_outcome``) and the record
+    path (``record_action``) so both derive parameters from the same action
+    shape.  If the two paths ever diverged, predictions would be computed
+    against different features than the ones recorded, silently degrading
+    world-model calibration without any visible error.
+    """
+    params: Dict[str, Any] = {}
+    if atype == "shell" and act.get("command"):
+        params["command"] = act["command"]
+    elif atype == "write_file":
+        if act.get("path"):
+            params["path"] = act["path"]
+        if act.get("content"):
+            params["content"] = act["content"]
+    elif atype == "git_commit" and act.get("message"):
+        params["message"] = act["message"]
+    elif atype == "install_package" and act.get("package"):
+        params["package"] = act["package"]
+    return params
+
+
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
     tl = state.get("timeline", load_timeline())
@@ -2078,18 +2102,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             llm_confidence = None
             try:
                 # ── Always compute data-driven prediction ──
-                action_params = {}
-                if atype == "shell" and act.get("command"):
-                    action_params["command"] = act["command"]
-                elif atype == "write_file":
-                    if act.get("path"):
-                        action_params["path"] = act["path"]
-                    if act.get("content"):
-                        action_params["content"] = act["content"]
-                elif atype == "git_commit" and act.get("message"):
-                    action_params["message"] = act["message"]
-                elif atype == "install_package" and act.get("package"):
-                    action_params["package"] = act["package"]
+                action_params = _action_params_from_act(act, atype)
                 pred = wm.predict_action_outcome(atype, desc, parameters=action_params)
                 if pred.get("predicted_outcome"):
                     data_driven_outcome = pred["predicted_outcome"]
@@ -2121,19 +2134,9 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             if not expected:
                 expected = f"{atype}: {desc[:100]}" if desc else atype
                 expected_source = "fallback"
-            # Build parameters dict for record_action (same as above)
-            action_params_r = {}
-            if atype == "shell" and act.get("command"):
-                action_params_r["command"] = act["command"]
-            elif atype == "write_file":
-                if act.get("path"):
-                    action_params_r["path"] = act["path"]
-                if act.get("content"):
-                    action_params_r["content"] = act["content"]
-            elif atype == "git_commit" and act.get("message"):
-                action_params_r["message"] = act["message"]
-            elif atype == "install_package" and act.get("package"):
-                action_params_r["package"] = act["package"]
+            # Build parameters dict for record_action (shared extractor,
+            # identical to the predict path above)
+            action_params_r = _action_params_from_act(act, atype)
             triple_id = wm.record_action(atype, desc or atype, expected, expected_source,
                                          prediction_confidence=llm_confidence,
                                          parameters=action_params_r)
