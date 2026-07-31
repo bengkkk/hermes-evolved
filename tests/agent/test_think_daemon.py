@@ -1573,6 +1573,59 @@ class TestShellPreflightValidation:
         assert out.startswith("exit=3:")
 
 
+class TestLocalAnalysisStateCheckCommands:
+    """The local-analysis fallback's rotating state-check commands must be
+    valid shell commands (pre-flight validation passes) and execute
+    successfully (``exit=0``).
+
+    Regression: the goals state-check one-liner used a statement-level
+    ``for`` loop after ``;`` — illegal Python in a single-line compound
+    statement — so every LLM-outage cycle that rotated onto the goals
+    command executed a command that could never work, recorded ``exit=1``
+    with a SyntaxError, and polluted the world model with a 0.6-error
+    triple that was a command-generation defect, not a world-model miss.
+    Observed 5x on 2026-07-31 (06:09-11:11 UTC) before the one-liner was
+    rewritten as a list comprehension.
+    """
+
+    def _action_for_tick(self, td: Any, tick_count: int) -> Dict[str, Any]:
+        """Return the local-analysis action for a daemon tick.
+
+        ``_local_analysis`` uses ``tick_count + 1`` for the rotation index,
+        so ``tick_count=4`` yields tick 5 -> slot 0 (goals check).
+        """
+        result = td._local_analysis({"daemon_state": {"tick_count": tick_count}})
+        return result["action"]
+
+    def test_goals_state_check_command_valid_and_runs(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        action = self._action_for_tick(td, 4)  # tick 5 -> slot 0 (goals)
+        assert action["type"] == "shell"
+        cmd = action["command"]
+        assert "Goals" in cmd
+        assert td._validate_shell_command(cmd) is None
+        out = td._execute_shell_action(cmd)
+        assert out.startswith("exit=0:"), f"goals command failed: {out[:200]}"
+
+    def test_self_model_state_check_command_valid_and_runs(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        action = self._action_for_tick(td, 5)  # tick 6 -> slot 1 (self-model)
+        assert action["type"] == "shell"
+        cmd = action["command"]
+        assert td._validate_shell_command(cmd) is None
+        out = td._execute_shell_action(cmd)
+        assert out.startswith("exit=0:"), f"self-model command failed: {out[:200]}"
+
+    def test_daemon_state_check_command_valid_and_runs(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        action = self._action_for_tick(td, 6)  # tick 7 -> slot 2 (daemon health)
+        assert action["type"] == "shell"
+        cmd = action["command"]
+        assert td._validate_shell_command(cmd) is None
+        out = td._execute_shell_action(cmd)
+        assert out.startswith("exit=0:"), f"daemon command failed: {out[:200]}"
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Placeholder-plan guard (prevents deliberation fixation loops)
 # ═══════════════════════════════════════════════════════════════════

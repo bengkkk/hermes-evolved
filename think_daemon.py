@@ -2147,8 +2147,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     _goals_cmd = (
         'python3 -c "import sys; sys.path.insert(0,\'' + _ws + '\'); '
         'from data_layer import Goals; g=Goals.load(); '
-        'for x in g.data.get(\'goals\',[]): '
-        "print(' [%s] P%s %s' % (x.get('status','?'), x.get('priority','?'), x.get('title','?')[:60]))"
+        "[print(' [%s] P%s %s' % (x.get('status','?'), x.get('priority','?'), x.get('title','?')[:60])) for x in g.data.get('goals',[])]"
         '"'
     )
     _self_model_cmd = (
