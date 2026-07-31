@@ -684,6 +684,48 @@ class TestBuildThinkingPrompt:
         assert "90% test coverage" in prompt or "Achieve" in prompt
         assert "Implement Gap 8" in prompt
 
+    def test_prompt_shows_goal_verification_criteria(self, evolve_env: Dict) -> None:
+        """Active goals surface verification_criteria + evidence in the prompt."""
+        td = evolve_env["module"]
+        state = self._make_state()
+        from data_layer import Goals
+        g = Goals()
+        g.propose(
+            "Gather more shell action samples for reliable calibration",
+            description="Need more shell samples for per-type calibration",
+            rationale="Calibration",
+            priority=1,
+            verification_criteria="Prediction error for shell drops below 0.3",
+        )
+        g.save()
+        prompt = td._build_thinking_prompt(state)
+        assert "Gather more shell action samples" in prompt
+        assert "Prediction error for shell drops below 0.3" in prompt
+
+    def test_goal_evidence_line(self, evolve_env: Dict) -> None:
+        """_format_goal_evidence mirrors the reconciler's title patterns."""
+        td = evolve_env["module"]
+        per_type = {"shell": {"count": 54, "avg_error": 0.21}}
+        acc = {"avg_triple_error": 0.20}
+        ev = td._format_goal_evidence(
+            {"title": "Gather more shell action samples"}, per_type, acc
+        )
+        assert "shell has 54" in ev
+        ev2 = td._format_goal_evidence(
+            {"title": "Investigate shell prediction failures"}, per_type, acc
+        )
+        assert "0.21" in ev2
+        ev3 = td._format_goal_evidence(
+            {"title": "Fix overconfidence at high confidence"}, {}, acc
+        )
+        assert "0.20" in ev3
+        assert td._format_goal_evidence({"title": "Unrelated goal"}, {}, {}) == ""
+        # Missing stats must not crash — degrades to a count of 0
+        ev4 = td._format_goal_evidence(
+            {"title": "Gather more write_file action samples"}, {}, {}
+        )
+        assert "write_file has 0" in ev4
+
     def test_prompt_shows_no_active_plan(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         state = self._make_state()

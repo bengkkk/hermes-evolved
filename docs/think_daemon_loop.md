@@ -173,10 +173,15 @@ never deletes from. Four touchpoints connect the cycle to the goal system:
 Design invariant: the LLM influences goals only through structured JSON
 fields; every write path (create/activate/complete) also has a no-LLM
 equivalent, so goal progress never depends on provider availability.
-Candidate next step (not yet implemented): per-cycle goal progress
-feedback — surface each active goal's verification criteria and recent
-evidence in the thinking prompt so LLM cycles report progress explicitly
-instead of relying only on reconcile/auto-activate.
+Per-cycle goal progress feedback (implemented 2026-07-31, HEAD after
+555370f0d): each goal shown in the thinking prompt now carries its
+`verification_criteria` (if set) plus a world-model evidence line.
+`_format_goal_evidence` mirrors the reconciler's title patterns
+("Gather more <type> action samples" → sample count, "Investigate
+<type> prediction failures" → per-type avg error, "Fix overconfidence"
+→ overall avg triple error), so LLM cycles see the same data
+`_reconcile_goals_with_world` auto-completes on and can report progress
+explicitly instead of only learning of completion after the fact.
 
 ## Reliability properties
 

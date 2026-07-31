@@ -669,6 +669,40 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
 }}"""
 
 
+def _format_goal_evidence(
+    goal: Dict[str, Any],
+    per_type: Dict[str, Dict[str, Any]],
+    acc: Dict[str, Any],
+) -> str:
+    """Derive a short world-model evidence line for a goal.
+
+    Mirrors the title patterns handled by ``_reconcile_goals_with_world`` so
+    the LLM sees the SAME data the reconciler uses to auto-complete goals,
+    instead of only learning about completion after the fact (per-cycle goal
+    progress feedback — think_daemon_loop.md candidate next step).
+
+    Returns an empty string when no pattern matches (goal has no derivable
+    evidence yet).
+    """
+    title: str = goal.get("title", "")
+    m = re.search(r"Gather more (\w+) action samples", title)
+    if m:
+        atype = m.group(1)
+        stats = per_type.get(atype, {})
+        n = stats.get("count", 0)
+        return f"evidence: {atype} has {n} action-triple samples"
+    m = re.search(r"Investigate (\w+) prediction failures", title)
+    if m:
+        atype = m.group(1)
+        stats = per_type.get(atype, {})
+        err = stats.get("avg_error", 1.0)
+        return f"evidence: {atype} avg error {err:.2f}"
+    if "overconfidence" in title.lower():
+        err = acc.get("avg_triple_error", 1.0)
+        return f"evidence: overall avg triple error {err:.2f}"
+    return ""
+
+
 def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     """Build a self-reflection prompt from current evolve state."""
     tl = state.get("timeline", {})
@@ -715,6 +749,18 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         _goals_obj = _GoalsLoader.load()
         _active = _goals_obj.get_active()
         if _active:
+            # World-model stats for per-goal evidence lines — the same data
+            # _reconcile_goals_with_world auto-completes on, surfaced so LLM
+            # cycles report progress explicitly instead of only learning of
+            # completion after the fact.
+            try:
+                _wm = state.get("world_model")
+                if _wm is None:
+                    _wm = load_world_model()
+                _wm_per_type = _wm.get_per_type_accuracy()
+                _wm_acc = _wm.data.get("prediction_accuracy", {})
+            except Exception:
+                _wm_per_type, _wm_acc = {}, {}
             _goal_lines = []
             for g in _active[:8]:  # show top 8 by priority
                 _sym = {"proposed": "◇", "active": "○", "in_progress": "◎"}.get(
@@ -726,6 +772,12 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
                 _gap = f" [{g['gap_reference']}]" if g.get("gap_reference") else ""
                 _goal_lines.append(f"  {_sym} P{_pri} — {_title}{_gap}")
                 _goal_lines.append(f"      {_desc}")
+                _crit = (g.get("verification_criteria", "") or "").strip()
+                if _crit:
+                    _goal_lines.append(f"      verify: {_crit[:100]}")
+                _ev = _format_goal_evidence(g, _wm_per_type, _wm_acc)
+                if _ev:
+                    _goal_lines.append(f"      {_ev}")
             goals_text = "\n".join(_goal_lines)
             _active_count = sum(1 for g in _active if g.get("status") in ("active", "in_progress"))
             _proposed_count = sum(1 for g in _active if g.get("status") == "proposed")
