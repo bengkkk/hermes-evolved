@@ -2207,7 +2207,16 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
         },
         {
             "type": "write_file",
-            "path": str(EVOLVE_DIR / "state_snapshot.txt"),
+            # NOTE: resolve the evolve dir LAZILY (get_evolve_dir, not the
+            # module-level EVOLVE_DIR constant). EVOLVE_DIR is frozen at
+            # import time, so when a test imports think_daemon before the
+            # hermetic HERMES_HOME fixture applies, an action path baked
+            # from EVOLVE_DIR points at the LIVE daemon's evolve dir — and
+            # _apply_insights then clobbers the real state_snapshot.txt
+            # with synthetic test data ("Tick: 4", "Triples: 5/5") every
+            # test run. get_evolve_dir() re-reads HERMES_HOME per call, so
+            # tests write to their temp dir and production is unchanged.
+            "path": str(get_evolve_dir() / "state_snapshot.txt"),
             "content": (
                 "=== Hermes Evolved State Snapshot ===\n"
                 f"Tick: {tick_count}\n"

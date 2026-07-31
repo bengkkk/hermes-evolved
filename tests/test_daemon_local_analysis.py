@@ -289,6 +289,22 @@ class TestLocalAnalysis:
         assert "self_model" in updates
         assert "orientation" in updates
 
+        # Regression (2026-07-31): the fallback state-check write_file path
+        # used to be baked from think_daemon's module-level EVOLVE_DIR,
+        # frozen at import time BEFORE the hermetic HERMES_HOME fixture
+        # applies. Executing the action then clobbered the LIVE daemon's
+        # state_snapshot.txt with synthetic test data ("Tick: 4",
+        # "Triples: 5/5"). The path must resolve inside the CURRENT
+        # (hermetic) evolve dir instead.
+        if result["action"]["type"] == "write_file":
+            from data_layer import get_evolve_dir
+            apath = Path(result["action"]["path"])
+            assert apath.is_absolute(), f"write_file path not absolute: {apath}"
+            assert str(apath).startswith(str(get_evolve_dir())), (
+                f"fallback write_file path {apath} escapes hermetic evolve dir "
+                f"{get_evolve_dir()}"
+            )
+
     def test_cyclic_analysis_includes_per_type_breakdown(self):
         """With two action types, the insight includes both type summaries."""
         wm = WorldModel()
