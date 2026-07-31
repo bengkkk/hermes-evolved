@@ -243,6 +243,52 @@ class TestDaemonLock:
         assert td._acquire_daemon_lock() is True
         assert lock_path.read_text().strip() == str(os.getpid())
 
+    def test_lock_refused_when_held_by_live_foreign_pid(self, evolve_env: Dict) -> None:
+        """A live lock owner must block a second daemon from starting.
+
+        Regression test for the duplicate-daemon failure mode: a daemon
+        that started before the lock file existed never re-checked lock
+        ownership, so a second instance would start while the first kept
+        running — interleaving cycles, doubling LLM load, and racing
+        state writes.  The lock MUST be refused (and left untouched)
+        while another live process owns it.
+        """
+        td = evolve_env["module"]
+        lock_path = evolve_env["paths"]["daemon_lock_file"]
+
+        # Our parent process is guaranteed alive during the test run.
+        foreign_pid = os.getppid()
+        assert foreign_pid != os.getpid()
+        lock_path.write_text(str(foreign_pid))
+
+        # Acquisition must fail...
+        assert td._acquire_daemon_lock() is False
+        # ...and the live owner's lock must NOT be clobbered.
+        assert lock_path.read_text().strip() == str(foreign_pid)
+
+    def test_lock_takeover_only_when_owner_dead(self, evolve_env: Dict) -> None:
+        """Stale-PID takeover must never clobber a live owner's lock.
+
+        Guards the ownership re-check added to the daemon loop: the
+        per-cycle check calls _acquire_daemon_lock() and exits when it
+        returns False.  If a live owner's lock were wrongly taken over,
+        BOTH daemons would keep running (the exact duplicate-instance
+        bug the re-check exists to prevent).
+        """
+        td = evolve_env["module"]
+        lock_path = evolve_env["paths"]["daemon_lock_file"]
+
+        # Live foreign owner → refused, lock preserved.
+        foreign_pid = os.getppid()
+        lock_path.write_text(str(foreign_pid))
+        assert td._acquire_daemon_lock() is False
+        assert lock_path.read_text().strip() == str(foreign_pid)
+
+        # Dead owner → takeover allowed.
+        lock_path.write_text("99999999")
+        assert td._acquire_daemon_lock() is True
+        assert lock_path.read_text().strip() == str(os.getpid())
+
     def test_release_only_own_lock(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         lock_path = evolve_env["paths"]["daemon_lock_file"]

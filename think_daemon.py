@@ -2940,6 +2940,23 @@ async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
 
         cycle = 0
         while True:
+            # ── Re-verify lock ownership every cycle ──
+            # A daemon that started before the lock file existed (or that
+            # lost the lock to a newer instance) must exit instead of
+            # running duplicate cycles.  Two interleaved daemons double the
+            # LLM load, race on daemon_state.json / world_model.json writes,
+            # and pollute world-model calibration data with duplicate
+            # action triples.  _acquire_daemon_lock() returns True when we
+            # still own the lock (or can re-acquire it after a stale/manual
+            # removal) and False when another live process owns it.
+            if not _acquire_daemon_lock():
+                logger.warning(
+                    "Daemon lock now held by another process — exiting to "
+                    "prevent duplicate cycles (started first_tick=%s)",
+                    ds.get("first_tick") or "unknown",
+                )
+                break
+
             cycle += 1
             if max_cycles and cycle > max_cycles:
                 logger.info("Reached max cycles (%d), exiting", max_cycles)
