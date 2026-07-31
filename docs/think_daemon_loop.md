@@ -3,10 +3,18 @@
 Persistent-cognition daemon for the Hermes Evolved Phase 2 world-model loop.
 This document describes the action-selection loop as implemented at commit
 `d6b741b3d` + the extended-outage retry policy (0-attempt probe skip).
-Line numbers and cycle steps are verified against HEAD `68bc9c8d1`
-(2026-07-31 19:17; git_commit executor scoped to evolve-owned paths).
+Line numbers and cycle steps are verified against HEAD `d8edfb4cd`
+(2026-07-31 19:57; per-cycle goal progress feedback in the thinking prompt).
 It is the counterpart to the daemon-reliability work: the loop below is what
 the PID-lock re-verification protects.
+
+> Line-number drift note (2026-07-31): d8edfb4cd added 52 lines to
+> think_daemon.py (`_format_goal_evidence` + goal rendering in
+> `_build_thinking_prompt`), so every think_daemon.py reference below is
+> ~52 lines past the 68bc9c8d1 numbers. The navigation map in the
+> "think_daemon.py core-loop navigation map" section was re-verified by
+> direct read at HEAD d8edfb4cd; the world-model.py map is unaffected
+> (world_model.py was not touched by that commit).
 
 ## Process model
 
@@ -153,19 +161,19 @@ never deletes from. Four touchpoints connect the cycle to the goal system:
 
 1. **Plan auto-create (cycle step 3)** — if no active plan exists and no
    active/complete plan targets "Complete Gap 8 — Self-directed evolution",
-   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3206-3228).
+   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3247-3282).
    Placeholder steps (bare "Step A" descriptions, or "V"/"n/a"
    verification) are rejected at creation by `_is_placeholder_step`
    (line 212), so a plan with no actionable content can never re-enter the
    prompt as an active plan and drive a deliberation-fixation loop.
 2. **Goal reconciliation (cycle step 11)** — `_reconcile_goals_with_world`
-   (line 2703) auto-completes goals whose verification conditions are met
+   (line 2755) auto-completes goals whose verification conditions are met
    by world-model evidence, so finished work is retired without an LLM.
 3. **Goal auto-activation (cycle step 12)** — `_auto_activate_goals`
-   (line 2902) promotes proposed goals to active when capacity exists,
+   (line 2954) promotes proposed goals to active when capacity exists,
    closing the Gap 4 → Gap 8 loop without waiting for the LLM to set
    `goal_action` in its JSON.
-4. **Outage-path goal creation** — `_local_analysis` (line 2374) converts
+4. **Outage-path goal creation** — `_local_analysis` (line 2341) converts
    the top world-model improvement suggestion into a goals.json entry
    (deduplicated against existing active goals), so even LLM-outage cycles
    keep the goal store evolving.
@@ -228,10 +236,53 @@ from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
 `format_world_model_context()` (2256).
 
+## think_daemon.py core-loop navigation map
+
+Direct-read verification (2026-07-31, HEAD `d8edfb4cd`) of the daemon's own
+structure — the counterpart to the world-model map above. This fulfils the
+standing commitment to read and outline the core loop (lines 200–400 turned
+out to be infrastructure, not the loop itself: placeholder-step guard,
+state helpers, code-drift detection, PID lock; the loop lives in
+`_run_cycle_body` / `run_daemon`):
+
+| Function | Line | Role |
+|---|---|---|
+| `_is_placeholder_step(step)` | 212 | Rejects plan steps with no actionable content (empty/“Step A” desc, “n/a” verification) |
+| `load_daemon_state` / `save_daemon_state` | 240 / 250 | v1→v2 migration (cycle_history); atomic JSON persistence |
+| `_print_cycle_stats()` | 254 | Reliability summary (`--once` / status output) |
+| `_git_head()` | 294 | Repo HEAD short hash for drift detection |
+| `_check_code_drift(ds)` | 309 | Warns + records `code_drift` block when repo moved past `startup_head` |
+| `_acquire_daemon_lock()` | 341 | Atomic `O_CREAT|O_EXCL` PID lock; stale/zombie-PID takeover; per-cycle ownership re-verify |
+| `_release_daemon_lock()` | 431 | Lock release (also on shutdown) |
+| `_format_goal_evidence(goal, wm)` | 672 | Goal progress line: verification criteria + world-model evidence (new in d8edfb4cd) |
+| `_build_thinking_prompt(state)` | 706 | JSON-instructing prompt: state snapshot, goals w/ evidence, calibration guidance |
+| `_try_parse_json(raw)` | 1002 | Lenient JSON extraction from LLM output |
+| `_prune_self_model(sm, daemon_state)` | 1069 | Pre-/post-cycle stale-weakness pruning (fixation protection) |
+| `_apply_insights(result, state)` | 1515 | Action selection + execution: dedup gate, predict → record → execute → complete → feedback |
+| `_select_state_check_action(state)` | 2273 | Fallback-cycle action picker (least-sampled action type) |
+| `_local_analysis(state)` | 2341 | No-LLM fallback: data-driven insight + auto-goal creation + state-check action |
+| `_bridge_world_model_to_self_model(wm, sm)` | 2620 | Discrepancy patterns → self-model weaknesses |
+| `_reconcile_goals_with_world(wm)` | 2755 | Auto-complete goals whose criteria are met by world-model evidence |
+| `_auto_activate_goals()` | 2954 | Promote proposed goals → active (Gap 4 → Gap 8 bridge) |
+| `_validate_shell_command(cmd)` | 3124 | Pre-flight shell validation (unbalanced quotes, compile check) |
+| `_execute_shell_action(cmd, timeout)` | 3190 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
+| `_run_cycle_body(result, ds)` | 3211 | **The core cycle** (steps 1–8 in “One cycle” above) |
+| `run_one_cycle()` | 3045 | Timeout wrapper around `_run_cycle_body` |
+| `_mark_startup(ds, interval, head)` | 3504 | Stamp `startup_head`, clear stale `code_drift` block |
+| `run_daemon(interval, max_cycles)` | 3519 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
+| `_run_verification()` | 3594 | No-LLM self-test of the predict→act→observe→learn cycle |
+| `bootstrap_evolve_data()` | 3742 | Seed evolve JSON files (idempotent) |
+| `_show_status()` | 3920 | `--status` snapshot |
+| `main()` | 4057 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
+
+Action-execution call sites inside `_apply_insights` (current lines):
+`predict_action_outcome` 1865, `record_action` 1909, `complete_action` 1984,
+`[PREDICTION]` feedback 2008/2012, timeout close 2025, exception close 2031.
+
 ## Prediction feedback (closing the loop)
 
-After each executed action the daemon (lines 1956–1960; timeout/exception
-close paths at 1973/1979) appends a
+After each executed action the daemon (lines 2004–2012; timeout/exception
+close paths at 2025/2031) appends a
 `[PREDICTION ✓/△/✗] error=<n>: expected "<…>" → "<…>"` line to the
 combined output that feeds the next cycle's prompt — the LLM sees its own
 prediction vs. the actual outcome with an error icon (≤0.3 ✓, ≤0.6 △,
@@ -255,6 +306,18 @@ same way.
   (68bc9c8d1, 19:17) landed; `_check_code_drift` flagged it at 19:26.
   Restarted via `evolve_daemon.sh restart` (~19:36) so the running daemon
   stages only evolve-owned paths.
+- **Daemon code drift (actioned this cycle, 2nd)**: the daemon restarted at
+  ~19:37 on HEAD 555370f0d, before the goal-progress feedback
+  (d8edfb4cd, 19:57) landed; `_check_code_drift` flagged it at 20:10.
+  Restarted again via `evolve_daemon.sh restart` (~20:15) so the running
+  daemon renders per-goal verification criteria + world-model evidence in
+  its thinking prompt.
+- **think_daemon.py core-loop read (RESOLVED this cycle)**: the standing
+  commitment to read lines 200–400 and outline the core loop is fulfilled —
+  see the navigation map above. The committed range was infrastructure
+  (placeholder guard / state helpers / drift detection / PID lock); the
+  loop proper is `_run_cycle_body` (3211) + `run_daemon` (3519), now
+  mapped line-by-line at HEAD d8edfb4cd.
 
 ## Resolved gaps
 
