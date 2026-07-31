@@ -101,6 +101,10 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 # cycle — most of the 200s hard timeout. The policy is applied once per
 # cycle via _set_llm_retry_policy() and read by _call_llm(), keeping the
 # call signature stable (tests monkeypatch _call_llm with (messages, task)).
+# Extended outages (>=3 consecutive fallbacks) skip the probe entirely on
+# most cycles (0 attempts) and probe only every 4th cycle with a 30s cap,
+# so recovery is still detected without burning most of every cycle budget
+# on a dead endpoint.
 _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
@@ -113,13 +117,29 @@ def _llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
     - Healthy (0 consecutive fallbacks): full budget — 2 retries × 90 s
       (identical to the pre-adaptive behavior).
     - Warm outage (1): single retry with a 60 s cap.
-    - Deep outage (>=2): one probe attempt with a 45 s cap.
+    - Deep outage (2): one probe attempt with a 45 s cap.
+    - Extended outage (>=3): skip the LLM probe on most cycles (0 attempts)
+      so the full cycle budget goes to local analysis + action execution,
+      but probe every 4th cycle with a 30 s cap so recovery is still
+      detected within a bounded number of cycles.
+
+    The skip tier exists because each probe costs ~45-60 s of dead time
+    (the auxiliary client's internal retry + fallback stages); during a
+    multi-cycle outage that is most of the 200 s cycle budget, repeatedly,
+    with no chance of a different outcome. Skipping turns those cycles into
+    pure data collection, while the periodic probe keeps the daemon from
+    staying blind forever after the provider recovers.
     """
     if consecutive_fallback_cycles <= 0:
         return 2, 90.0
     if consecutive_fallback_cycles == 1:
         return 1, 60.0
-    return 1, 45.0
+    if consecutive_fallback_cycles == 2:
+        return 1, 45.0
+    if consecutive_fallback_cycles % 4 == 0:
+        # Probe cycle: bounded probe so recovery is detected within 4 cycles
+        return 1, 30.0
+    return 0, 0.0
 
 
 def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
@@ -2096,6 +2116,16 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
 
     max_retries = _llm_max_retries
     per_attempt_timeout = _llm_attempt_timeout
+    if max_retries <= 0:
+        # Extended-outage skip (see _llm_retry_policy): no probe this cycle,
+        # straight to local analysis. Keeps the cycle budget for data
+        # collection instead of burning 45-60s on a dead endpoint.
+        logger.info(
+            "LLM probe skipped (retry policy %d attempts) — "
+            "straight to local analysis",
+            max_retries,
+        )
+        return None
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:

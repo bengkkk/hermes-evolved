@@ -1630,9 +1630,28 @@ class TestLlmRetryPolicy:
 
     def test_deep_outage_single_probe(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
-        # Any outage >= 2 cycles: one probe attempt, tight 45s cap
+        # Depth 2: still probe once with a tight 45s cap
         assert td._llm_retry_policy(2) == (1, 45.0)
-        assert td._llm_retry_policy(10) == (1, 45.0)
+
+    def test_extended_outage_skips_probe(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # Depth >= 3 on a non-probe cycle: 0 attempts — the whole cycle
+        # budget goes to local analysis + action execution instead of a
+        # doomed 45s probe.
+        assert td._llm_retry_policy(3) == (0, 0.0)
+        assert td._llm_retry_policy(5) == (0, 0.0)
+        assert td._llm_retry_policy(6) == (0, 0.0)
+        assert td._llm_retry_policy(7) == (0, 0.0)
+        assert td._llm_retry_policy(10) == (0, 0.0)
+
+    def test_extended_outage_probe_cycle(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # Every 4th cycle (depth % 4 == 0): a bounded 30s probe so
+        # recovery is still detected within 4 cycles of the provider
+        # coming back.
+        assert td._llm_retry_policy(4) == (1, 30.0)
+        assert td._llm_retry_policy(8) == (1, 30.0)
+        assert td._llm_retry_policy(12) == (1, 30.0)
 
     def test_setter_applies_policy_to_globals(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
@@ -1641,15 +1660,46 @@ class TestLlmRetryPolicy:
         assert td._llm_attempt_timeout == 90.0
 
         applied = td._set_llm_retry_policy(3)
-        assert applied == (1, 45.0)
-        assert td._llm_max_retries == 1
-        assert td._llm_attempt_timeout == 45.0
+        assert applied == (0, 0.0)
+        assert td._llm_max_retries == 0
+        assert td._llm_attempt_timeout == 0.0
 
         # Returning to health restores the full budget
         applied = td._set_llm_retry_policy(0)
         assert applied == (2, 90.0)
         assert td._llm_max_retries == 2
         assert td._llm_attempt_timeout == 90.0
+
+    def test_call_llm_skips_probe_when_policy_is_zero(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a 0-attempt policy, _call_llm returns None without ever
+        invoking the auxiliary client."""
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(3)
+        assert td._llm_max_retries == 0
+
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        called = {"n": 0}
+        try:
+            import agent.auxiliary_client as _aux
+        except ImportError:
+            _aux = None  # import path unavailable — guard returns None anyway
+        if _aux is not None:
+            async def _boom(*a: Any, **k: Any) -> None:
+                called["n"] += 1
+                raise AssertionError(
+                    "async_call_llm must not be called with a 0-attempt policy"
+                )
+            monkeypatch.setattr(_aux, "async_call_llm", _boom)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+        assert result is None
+        assert called["n"] == 0
 
 
 class TestShellPreflightValidation:
