@@ -3,6 +3,8 @@
 Persistent-cognition daemon for the Hermes Evolved Phase 2 world-model loop.
 This document describes the action-selection loop as implemented at commit
 `d6b741b3d` + the extended-outage retry policy (0-attempt probe skip).
+Line numbers and cycle steps are verified against HEAD `68bc9c8d1`
+(2026-07-31 19:17; git_commit executor scoped to evolve-owned paths).
 It is the counterpart to the daemon-reliability work: the loop below is what
 the PID-lock re-verification protects.
 
@@ -144,6 +146,38 @@ subject to two overrides and one gate, in order:
      triple is marked complete, prediction error is computed, and the world
      model is saved.
 
+## Goal integration (design map)
+
+The daemon treats evolve/goals.json as a persistent store it writes to but
+never deletes from. Four touchpoints connect the cycle to the goal system:
+
+1. **Plan auto-create (cycle step 3)** — if no active plan exists and no
+   active/complete plan targets "Complete Gap 8 — Self-directed evolution",
+   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3206-3228).
+   Placeholder steps (bare "Step A" descriptions, or "V"/"n/a"
+   verification) are rejected at creation by `_is_placeholder_step`
+   (line 212), so a plan with no actionable content can never re-enter the
+   prompt as an active plan and drive a deliberation-fixation loop.
+2. **Goal reconciliation (cycle step 11)** — `_reconcile_goals_with_world`
+   (line 2703) auto-completes goals whose verification conditions are met
+   by world-model evidence, so finished work is retired without an LLM.
+3. **Goal auto-activation (cycle step 12)** — `_auto_activate_goals`
+   (line 2902) promotes proposed goals to active when capacity exists,
+   closing the Gap 4 → Gap 8 loop without waiting for the LLM to set
+   `goal_action` in its JSON.
+4. **Outage-path goal creation** — `_local_analysis` (line 2374) converts
+   the top world-model improvement suggestion into a goals.json entry
+   (deduplicated against existing active goals), so even LLM-outage cycles
+   keep the goal store evolving.
+
+Design invariant: the LLM influences goals only through structured JSON
+fields; every write path (create/activate/complete) also has a no-LLM
+equivalent, so goal progress never depends on provider availability.
+Candidate next step (not yet implemented): per-cycle goal progress
+feedback — surface each active goal's verification criteria and recent
+evidence in the thinking prompt so LLM cycles report progress explicitly
+instead of relying only on reconcile/auto-activate.
+
 ## Reliability properties
 
 - **Single instance** — atomic `O_CREAT|O_EXCL` PID lock, stale/zombie-PID
@@ -164,13 +198,13 @@ subject to two overrides and one gate, in order:
 ## World-model API surface (world_model.py, navigation map)
 
 The daemon consumes the `WorldModel` class (line 332). Methods referenced
-from `think_daemon.py`, with line numbers as of HEAD 86d62618f:
+from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 
 | Method | Line | Role in the loop |
 |---|---|---|
 | `_compute_prediction_error(expected, actual)` | 139 | Canonical error metric (0 = exact match … 1 = unrelated) |
 | `record_action(type, desc, expected, source, …)` | 366 | Opens an action triple (predict step) |
-| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 1879) |
+| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 1932; timeout/exception close paths at 1973/1979) |
 | `record_action_complete(...)` | 482 | Alternate close entry point (verify step) |
 | `record_prediction(text, timeframe, confidence, basis)` | 512 | Macro-prediction log |
 | `verify_prediction(pred_id)` | 552 | Score a single prediction against evidence |
@@ -183,7 +217,7 @@ from `think_daemon.py`, with line numbers as of HEAD 86d62618f:
 | `format_calibration_guidance()` | 1580 | Guidance when a type is poorly calibrated |
 | `format_improvement_context()` | 1745 | Top improvement suggestions |
 | `format_action_guidance(type, desc)` | 1780 | Pre-execution risk assessment (daemon logs as `[RISK WARNING]`) |
-| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 1776) |
+| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 1813) |
 | `save(path)` / `load(path)` | 2047 / 2117 | Persistence |
 
 Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
@@ -191,7 +225,8 @@ Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
 
 ## Prediction feedback (closing the loop)
 
-After each executed action the daemon (lines 1886–1907) appends a
+After each executed action the daemon (lines 1956–1960; timeout/exception
+close paths at 1973/1979) appends a
 `[PREDICTION ✓/△/✗] error=<n>: expected "<…>" → "<…>"` line to the
 combined output that feeds the next cycle's prompt — the LLM sees its own
 prediction vs. the actual outcome with an error icon (≤0.3 ✓, ≤0.6 △,
@@ -206,10 +241,15 @@ same way.
   cycle + startup/teardown > 180 s). The persistent daemon
   (`evolve_daemon.sh`, interval 900) is unaffected; only cron-launched
   single cycles hit this.
-- **LLM outage depth**: `consecutive_fallback_cycles` reached 5 on
-  2026-07-31 — the 0-attempt tier + every-4th-cycle probe is active by
-  design; recovery detection is expected within 4 cycles of the provider
-  returning.
+- **LLM outage depth**: `consecutive_fallback_cycles` reached 7 on
+  2026-07-31 (19:26) — the 0-attempt tier + every-4th-cycle probe is
+  active by design; recovery detection is expected within 4 cycles of the
+  provider returning.
+- **Daemon code drift (actioned this cycle)**: the daemon started at
+  18:56:30 on HEAD 89692b9f5, before the git_commit staging fix
+  (68bc9c8d1, 19:17) landed; `_check_code_drift` flagged it at 19:26.
+  Restarted via `evolve_daemon.sh restart` (~19:36) so the running daemon
+  stages only evolve-owned paths.
 
 ## Resolved gaps
 
