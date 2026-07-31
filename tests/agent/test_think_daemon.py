@@ -1901,3 +1901,120 @@ class TestPlaceholderPlanGuard:
         assert len(plan["steps"]) == 2
         assert plan["steps"][0]["description"] == "Run the world-model test suite"
 
+
+class TestAutoCreatePlanGuard:
+    """The bootstrap auto-create must not duplicate or re-plan a goal that
+    already has an active or completed plan.
+
+    Regression (2026-07-31): the old guard only checked
+    ``get_active_plan() is None``.  When the initial Gap 8 plan was
+    completed, that condition became true and the next cycle auto-created a
+    second *active* plan for the same already-done goal.  The duplicate
+    shadowed the completed plan in ``format_plan_context`` and drove a
+    re-planning fixation loop.  Failed plans are exempt — a goal that
+    genuinely failed may legitimately be re-planned.
+    """
+
+    GOAL = "Complete Gap 8 — Self-directed evolution"
+
+    async def _run_cycle(self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch) -> tuple:
+        td = evolve_env["module"]
+
+        async def _fake_llm(messages: list, task: str = "thinking") -> str:
+            return ""  # empty → local-analysis fallback, still runs the guard
+
+        monkeypatch.setattr(td, "_call_llm", _fake_llm)
+
+        result = {"status": "ok", "tick_duration": 0, "insight": None, "error": None}
+        ds = td.load_daemon_state()
+        ds.setdefault(
+            "cycle_stats",
+            {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
+             "avg_duration": 0.0, "max_duration": 0.0},
+        )
+
+        # Local-analysis fallback executes an action via subprocess; mock it
+        # (same pattern as TestCycleBodyEmptyLlmResponse) for hermeticity.
+        import subprocess
+
+        original_run = subprocess.run
+
+        def _mock_run(*a, **kw):
+            return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+        try:
+            subprocess.run = _mock_run
+            result = await td._run_cycle_body(result, ds)
+        finally:
+            subprocess.run = original_run
+
+        return result, ds
+
+    def _plans(self, td) -> list:
+        return (td.load_timeline().get("future") or {}).get("plans", [])
+
+    def test_completed_plan_same_goal_blocks_recreation(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A completed plan for the goal must NOT be re-created (fixation loop)."""
+        from data_layer import create_plan, complete_plan, get_active_plan
+
+        td = evolve_env["module"]
+        plan_id = create_plan(self.GOAL, steps=[{"description": "d", "verification": "v"}])
+        complete_plan(plan_id)
+        assert get_active_plan() is None  # the exact condition that used to trigger re-creation
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        assert get_active_plan() is None, "no new plan may shadow a completed goal"
+        plans = self._plans(td)
+        assert len(plans) == 1, f"expected 1 plan, got {len(plans)}"
+        assert plans[0]["id"] == plan_id
+
+    def test_active_plan_same_goal_blocks_duplicate(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An active plan for the goal must not be duplicated."""
+        from data_layer import create_plan, get_active_plan
+
+        td = evolve_env["module"]
+        plan_id = create_plan(self.GOAL, steps=[{"description": "d", "verification": "v"}])
+        assert get_active_plan()["id"] == plan_id
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        plans = self._plans(td)
+        assert len(plans) == 1, f"expected 1 plan, got {len(plans)}"
+        assert plans[0]["id"] == plan_id
+
+    def test_no_existing_plan_still_auto_creates(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no plans at all, the bootstrap plan is still auto-created."""
+        from data_layer import get_active_plan
+
+        assert get_active_plan() is None
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        plan = get_active_plan()
+        assert plan is not None
+        assert plan["goal"] == self.GOAL
+
+    def test_failed_plan_same_goal_allows_replan(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed plan for the goal is NOT a blocker — re-planning is legit."""
+        from data_layer import create_plan, complete_plan, get_active_plan
+
+        td = evolve_env["module"]
+        create_plan(self.GOAL, steps=[{"description": "d", "verification": "v"}])
+        for p in self._plans(td):
+            complete_plan(p["id"], status="failed")
+        assert get_active_plan() is None
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        assert get_active_plan() is not None, "failed goal may be re-planned"
+        assert len(self._plans(td)) == 2  # failed one + new active one
+

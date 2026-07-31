@@ -2985,11 +2985,27 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         logger.warning("Auto-verification failed (non-blocking): %s", e)
 
     # 1.5 Auto-create initial plan if none exists
+    # GUARD (2026-07-31): do not re-plan a goal that already has a plan in
+    # an active or complete state.  The old guard only checked
+    # ``get_active_plan() is None``, so the moment the bootstrap plan was
+    # completed (status "complete") this block fired again and created a
+    # duplicate *active* plan for the same already-done goal.  That
+    # duplicate then shadowed the completed plan in ``format_plan_context``
+    # and drove a re-planning fixation loop (the daemon re-promising
+    # "bootstrap / daemon / push" every cycle).  Failed plans are exempt —
+    # a goal that genuinely failed may legitimately be re-planned.
     try:
         from agent.self_evolve import get_active_plan, create_plan, record_event
-        if get_active_plan() is None:
+        _initial_plan_goal = "Complete Gap 8 — Self-directed evolution"
+        _existing_plans = (load_timeline().get("future") or {}).get("plans", [])
+        _already_planned = any(
+            p.get("goal") == _initial_plan_goal
+            and p.get("status") in ("active", "complete")
+            for p in _existing_plans
+        )
+        if get_active_plan() is None and not _already_planned:
             plan_id = create_plan(
-                "Complete Gap 8 — Self-directed evolution",
+                _initial_plan_goal,
                 steps=[
                     {"description": "Bootstrap evolve data with current state snapshot",
                      "verification": "all 6 evolve JSON files exist with meaningful data"},
