@@ -160,3 +160,60 @@ subject to two overrides and one gate, in order:
 - **Code-drift visibility** — stale daemon processes surface via the
   `code_drift` marker + launcher `status`; `evolve_daemon.sh restart`
   loads the latest logic.
+
+## World-model API surface (world_model.py, navigation map)
+
+The daemon consumes the `WorldModel` class (line 332). Methods referenced
+from `think_daemon.py`, with line numbers as of HEAD 86d62618f:
+
+| Method | Line | Role in the loop |
+|---|---|---|
+| `_compute_prediction_error(expected, actual)` | 139 | Canonical error metric (0 = exact match … 1 = unrelated) |
+| `record_action(type, desc, expected, source, …)` | 366 | Opens an action triple (predict step) |
+| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 1879) |
+| `record_action_complete(...)` | 482 | Alternate close entry point (verify step) |
+| `record_prediction(text, timeframe, confidence, basis)` | 512 | Macro-prediction log |
+| `verify_prediction(pred_id)` | 552 | Score a single prediction against evidence |
+| `verify_prediction_via_evidence(pred_id)` | 705 | Topic-token match against actual outcomes |
+| `verify_expired_predictions()` | 820 | Expired + evidence-resolved (cycle step 2) |
+| `verify_pending_predictions()` | 921 | Resolve early when decisive evidence exists |
+| `format_world_model_context()` | 1003 | Prompt context builder |
+| `format_prediction_insight()` | 1121 | Calibration insight for prompts |
+| `adjust_confidence(raw, atype)` | 1512 | Per-type historical-error calibration (cycle step 13) |
+| `format_calibration_guidance()` | 1580 | Guidance when a type is poorly calibrated |
+| `format_improvement_context()` | 1745 | Top improvement suggestions |
+| `format_action_guidance(type, desc)` | 1780 | Pre-execution risk assessment (daemon logs as `[RISK WARNING]`) |
+| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 1776) |
+| `save(path)` / `load(path)` | 2047 / 2117 | Persistence |
+
+Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
+`format_world_model_context()` (2256).
+
+## Prediction feedback (closing the loop)
+
+After each executed action the daemon (lines 1886–1907) appends a
+`[PREDICTION ✓/△/✗] error=<n>: expected "<…>" → "<…>"` line to the
+combined output that feeds the next cycle's prompt — the LLM sees its own
+prediction vs. the actual outcome with an error icon (≤0.3 ✓, ≤0.6 △,
+else ✗), so calibration happens at the source, not only in the stored
+triples. Risk warnings from `format_action_guidance` are prepended the
+same way.
+
+## Verified gap candidates (for future cycles)
+
+- **`git add -A` breadth** (think_daemon.py line 1860): the `git_commit`
+  executor stages *everything* uncommitted in the workspace repo, then
+  commits it under the auto-sync message. A stray unrelated change in the
+  tree gets swept into the daemon's commit. Candidate fix: restrict the
+  add to known evolve paths (e.g. `docs/think_daemon_loop.md`,
+  `hermes-evolved/`, `think_daemon.py`, `world_model.py`) or `git add -u`
+  on already-tracked evolve files.
+- **Cron `--once` vs 200 s timeout**: a `--once` cycle launched *from a
+  cron job* can be interrupted at the 3-minute cron hard limit (200 s
+  cycle + startup/teardown > 180 s). The persistent daemon
+  (`evolve_daemon.sh`, interval 900) is unaffected; only cron-launched
+  single cycles hit this.
+- **LLM outage depth**: `consecutive_fallback_cycles` reached 5 on
+  2026-07-31 — the 0-attempt tier + every-4th-cycle probe is active by
+  design; recovery detection is expected within 4 cycles of the provider
+  returning.
