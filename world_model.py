@@ -174,6 +174,17 @@ def _compute_prediction_error(
     if informational_nonerror:
         return 0.15
 
+    # ── Mutual exit=0 success heuristic ──
+    # When BOTH expected and actual start with "exit=0", the command
+    # succeeded in both views.  The specific output after "exit=0: "
+    # (e.g. "files" vs "23" for an ls command) is typically truncated
+    # or differs due to nondeterministic output — the prediction was
+    # semantically correct at the success/failure level.
+    # Score low (0.15) instead of falling through to bigram comparison
+    # which would produce high error from non-overlapping content tokens.
+    if e_lower.startswith("exit=0") and a_lower.startswith("exit=0"):
+        return 0.15
+
     # ── Exit-code observation (ground truth for command success/failure) ──
     # The exit code tells us whether the command itself succeeded, but NOT
     # whether the OUTCOME matched the PREDICTION.  We therefore observe it
