@@ -70,6 +70,48 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
     "consecutive_fallback_cycles": 0,  # How many consecutive cycles used local fallback (LLM unavailable)
 }
 
+# ── Adaptive LLM retry policy ──
+# When the LLM has been unavailable for consecutive cycles, we shrink the
+# retry budget so outage cycles spend their time on local analysis + action
+# execution (world-model data collection) instead of hammering a dead
+# endpoint. Observed: each failed attempt costs ~60s (the auxiliary client's
+# internal retry + fallback stages), so 2 attempts ≈ 120s of dead time per
+# cycle — most of the 200s hard timeout. The policy is applied once per
+# cycle via _set_llm_retry_policy() and read by _call_llm(), keeping the
+# call signature stable (tests monkeypatch _call_llm with (messages, task)).
+_LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
+_llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
+_llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
+
+
+def _llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
+    """Choose the LLM retry budget from the outage depth.
+
+    Returns ``(max_retries, per_attempt_timeout_seconds)``:
+    - Healthy (0 consecutive fallbacks): full budget — 2 retries × 90 s
+      (identical to the pre-adaptive behavior).
+    - Warm outage (1): single retry with a 60 s cap.
+    - Deep outage (>=2): one probe attempt with a 45 s cap.
+    """
+    if consecutive_fallback_cycles <= 0:
+        return 2, 90.0
+    if consecutive_fallback_cycles == 1:
+        return 1, 60.0
+    return 1, 45.0
+
+
+def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
+    """Apply the adaptive retry policy for the current cycle.
+
+    Must be called once per cycle before ``_call_llm``. Returns the
+    applied ``(max_retries, timeout)`` tuple for logging.
+    """
+    global _llm_max_retries, _llm_attempt_timeout
+    _llm_max_retries, _llm_attempt_timeout = _llm_retry_policy(
+        consecutive_fallback_cycles
+    )
+    return _llm_max_retries, _llm_attempt_timeout
+
 
 # ═════════════════════════════════════════════════════════════════
 #  State helpers (delegated to data_layer for the heavy lifting)
@@ -1860,7 +1902,8 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         logger.error("Could not import Hermes auxiliary_client. Is HERMES_ROOT correct?")
         return None
 
-    max_retries = 2
+    max_retries = _llm_max_retries
+    per_attempt_timeout = _llm_attempt_timeout
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -1873,7 +1916,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     provider=_RUNTIME_PROVIDER or None,
                     model=_RUNTIME_MODEL or None,
                 ),
-                timeout=90.0,  # Per-call timeout: reasoning models can take 30-60s to begin generating
+                timeout=per_attempt_timeout,  # Per-call timeout: reasoning models can take 30-60s to begin generating
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
@@ -1886,7 +1929,10 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             logger.warning("Unexpected response shape: %s", type(response).__name__)
             return None
         except asyncio.TimeoutError:
-            logger.warning("LLM call attempt %d/%d timed out after 90s", attempt, max_retries)
+            logger.warning(
+                "LLM call attempt %d/%d timed out after %ss",
+                attempt, max_retries, per_attempt_timeout,
+            )
             last_error = "timeout"
         except Exception as e:
             logger.warning("LLM call attempt %d/%d failed: %s", attempt, max_retries, e)
@@ -2749,8 +2795,21 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         {"role": "user", "content": prompt},
     ]
 
-    # 3. Call LLM
+    # 3. Call LLM — with an adaptive retry budget.
+    # During an LLM outage, consecutive_fallback_cycles grows; each extra
+    # retry costs ~60s of dead time (auxiliary client's internal retry +
+    # fallback stages). Shrink the budget as the outage deepens so the cycle
+    # keeps most of its 200s for local analysis + action execution.
     logger.info("Thinking cycle %d starting...", ds.get("tick_count", 0) + 1)
+    _retries, _attempt_tmo = _set_llm_retry_policy(
+        ds.get("consecutive_fallback_cycles", 0)
+    )
+    if _retries < _LLM_RETRY_DEFAULTS[0]:
+        logger.info(
+            "LLM outage mode (consecutive_fallback_cycles=%d): retry budget "
+            "reduced to %d attempt(s) × %.0fs",
+            ds.get("consecutive_fallback_cycles", 0), _retries, _attempt_tmo,
+        )
     raw = await _call_llm(messages)
 
     # ── Consecutive fallback tracking ──

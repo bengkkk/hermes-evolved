@@ -1422,3 +1422,47 @@ class TestCycleBodyEmptyLlmResponse:
         assert result["status"] == "parse_error"
         assert result.get("llm_fallback") is not True
         assert "Could not parse JSON" in (result.get("error") or "")
+
+
+class TestLlmRetryPolicy:
+    """Adaptive LLM retry budget (outage-aware retry policy).
+
+    ``_llm_retry_policy`` shrinks the retry budget as
+    ``consecutive_fallback_cycles`` grows, so outage cycles stop burning
+    ~60s per dead-end retry and keep their time for local analysis +
+    action execution. The healthy tier must stay identical to the
+    pre-adaptive behavior (2 × 90s).
+    """
+
+    def test_healthy_keeps_full_budget(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._llm_retry_policy(0) == (2, 90.0)
+        # Negative fallback count (corrupt state) must not escalate the budget
+        assert td._llm_retry_policy(-1) == (2, 90.0)
+
+    def test_warm_outage_single_retry(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._llm_retry_policy(1) == (1, 60.0)
+
+    def test_deep_outage_single_probe(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # Any outage >= 2 cycles: one probe attempt, tight 45s cap
+        assert td._llm_retry_policy(2) == (1, 45.0)
+        assert td._llm_retry_policy(10) == (1, 45.0)
+
+    def test_setter_applies_policy_to_globals(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # Fresh import must start at the full budget
+        assert td._llm_max_retries == 2
+        assert td._llm_attempt_timeout == 90.0
+
+        applied = td._set_llm_retry_policy(3)
+        assert applied == (1, 45.0)
+        assert td._llm_max_retries == 1
+        assert td._llm_attempt_timeout == 45.0
+
+        # Returning to health restores the full budget
+        applied = td._set_llm_retry_policy(0)
+        assert applied == (2, 90.0)
+        assert td._llm_max_retries == 2
+        assert td._llm_attempt_timeout == 90.0
