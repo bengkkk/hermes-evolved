@@ -1745,6 +1745,97 @@ class TestPruneSelfModel:
         assert sm["capabilities"]["unknown_areas"] == []
         assert sm["commitments"]["promised_features"] == []
 
+    def test_subject_is_resolved_covers_p3_retry_telemetry(
+        self, evolve_env: Dict
+    ) -> None:
+        """The P3 retry-path telemetry evidence gap is resolved.
+
+        Regression for the 2026-08-01 fixation loop: after the per-attempt
+        retry telemetry patch landed (commit 8ef5bb051, _call_llm logs
+        {attempt, outcome, wait_s, reason} into _last_llm_call_stats
+        ["attempts"] and the world-model llm_call triple), the daemon kept
+        re-asking "exact retry-helper variable names and block boundaries
+        before the patch can be written" for cycles 361-369.  The live
+        self_model.json entries at the time of writing must now resolve so
+        _prune_self_model removes them and _apply_insights blocks
+        re-adding them in new phrasings.
+        """
+        td = evolve_env["module"]
+        stale_weaknesses = [
+            "I still depend on this cycle's grep output for exact "
+            "retry-helper variable names and block boundaries, so the "
+            "patch cannot be safely written from memory alone.",
+            "Still reliant on exact inner-block source for the retry "
+            "helper; need to see AST output.",
+            "Still need exact inner-block source; risk of patching wrong "
+            "variable names remains until lines 125-165 are inspected.",
+        ]
+        stale_unknowns = [
+            "Whether the retry helper already exposes per-attempt values "
+            "(attempt, wait, reason) that can be logged without changing "
+            "control flow.",
+            "Exact call-site variable names available for logging retry "
+            "attempts/budget decisions.",
+            "Internal structure of the adaptive retry/budget block beyond "
+            "confirmed header lines 136/138/140 (variable names, loop "
+            "shape, and available per-attempt values).",
+            "Whether retry/budget is a standalone function or inline "
+            "block; AST will resolve.",
+            "Exact body of _llm_retry_policy (lines 239-288) and how "
+            "skip/exhaustion decisions are represented at the call site.",
+            "Exact variable names in the retry/budget helper lines 125-165",
+            "Exact retry helper parameter names and call-site scope in "
+            "think_daemon.py beyond confirmed boundary lines.",
+        ]
+        stale_commitments = [
+            "Land retry-telemetry logging in think_daemon.py and verify "
+            "via grep + py_compile before the next two cycles elapse.",
+            "Do not write the retry-telemetry patch until the exact "
+            "retry-helper line range and variable names are confirmed "
+            "from compact grep/sed output.",
+            "Extract exact helper bodies in small chunks, then land "
+            "retry-telemetry with py_compile verification before "
+            "declaring P3 done.",
+            "Inspect lines 125-165 now and land the retry telemetry patch "
+            "within this or the next cycle, verified by py_compile.",
+            "Write the retry-telemetry patch only after this cycle's "
+            "AST/grep evidence confirms variable names; then run "
+            "py_compile and commit within the next two cycles.",
+        ]
+        for entry in stale_weaknesses + stale_unknowns + stale_commitments:
+            assert td._subject_is_resolved(entry), entry[:80]
+
+        # _prune_self_model actually removes them (evidence section needs
+        # daemon_state with tick_count >= 10).
+        sm = {
+            "capabilities": {
+                "weaknesses": list(stale_weaknesses),
+                "unknown_areas": list(stale_unknowns),
+            },
+            "commitments": {"promised_features": list(stale_commitments)},
+        }
+        removed = td._prune_self_model(
+            sm, daemon_state={"tick_count": 340, "last_output": {"fallback": False}}
+        )
+        assert removed == len(stale_weaknesses) + len(stale_unknowns) + len(
+            stale_commitments
+        )
+        assert sm["capabilities"]["weaknesses"] == []
+        assert sm["capabilities"]["unknown_areas"] == []
+        assert sm["commitments"]["promised_features"] == []
+
+        # Inspection-discipline lessons are NOT part of the retry-helper
+        # subject and must survive.
+        discipline = [
+            "Repeated temptation to use full-line sed dumps despite known "
+            "truncation; must always use grep/head/python slicing for "
+            "source inspection.",
+            "Use bounded line slices and compact greps for any further "
+            "think_daemon.py inspection; never full-file dumps.",
+        ]
+        for entry in discipline:
+            assert not td._subject_is_resolved(entry), entry[:80]
+
     def test_subject_is_resolved_keeps_new_design_questions(
         self, evolve_env: Dict
     ) -> None:

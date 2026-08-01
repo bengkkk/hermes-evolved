@@ -1410,6 +1410,34 @@ _DOCUMENTED_SUBJECTS: tuple = (
         "docs/think_daemon_loop.md",
         re.compile(r"strip|coerce|guard|attribute|crash", re.IGNORECASE),
     ),
+    # P3 retry-path telemetry — resolved 2026-08-01 (commit 8ef5bb051).
+    # _call_llm now logs every attempt as {attempt, outcome, wait_s, reason}
+    # into _last_llm_call_stats["attempts"], persisted into the world-model
+    # llm_call triple (confirmed: world_model.json action_triples carry
+    # per-attempt entries, and the daemon restarted onto this code at
+    # 17:59Z).  The long fixation loop — "exact retry-helper variable names
+    # and block boundaries before the patch can be written", "does the
+    # helper expose per-attempt values", "when will retry-telemetry land"
+    # — restates a resolved subject, so ANY phrasing of that evidence gap
+    # is pruned and blocked from re-addition.  The keyword gate keeps
+    # genuinely new design questions (new backoff shapes, new stat fields,
+    # new providers) alive because they lack the evidence-gap vocabulary.
+    (
+        ("retry-helper", "retry helper", "retry-telemetry", "retry telemetry",
+         "retry-block", "retry block", "per-attempt", "per attempt",
+         "_llm_retry_policy", "retry/budget helper", "retry/budget",
+         "retry attempts", "retry/budget block", "retry-budget block",
+         "125-165", "136/138/140", "lines 239-288"),
+        "think_daemon.py",
+        "docs/think_daemon_loop.md",
+        re.compile(
+            r"variable name|block boundar|inner-block|inner block|line range|"
+            r"line-number|AST|grep|exact (?:body|source|inner)|per-attempt|"
+            r"parameter name|call-site scope|evidence file|patch|land|"
+            r"logging|verify|py_compile|125-165|239-288|136/138/140",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _RESOLVED_FACT_KEYWORDS = re.compile(
     r"path|locat|line count|structure|internal|loop|read|outline|unresolved",
