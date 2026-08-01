@@ -2330,6 +2330,66 @@ class TestLlmRetryPolicy:
         assert stats.get("duration_s", 0.0) >= 0.0
 
 
+class TestCoerceLlmResponseFields:
+    """Type-guard for LLM response fields (``_coerce_llm_response_fields``).
+
+    The LLM emits any response field as a non-string/non-numeric type
+    (same bug class as the 2026-08-01 ``'int' object has no attribute
+    'strip'`` crash on gap_reference). Without the coercion, an
+    int/dict ``insight`` crashes the ``--once`` display path at
+    ``r.get("insight","")[:80]`` and a non-numeric
+    ``prediction.confidence`` raises TypeError inside
+    ``adjust_confidence``'s range comparison — both AFTER the expensive
+    LLM call, wasting the whole cycle.
+    """
+
+    def test_non_string_insight_is_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {"insight": 42, "focus_next": {"nested": True}}
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["insight"] == "42"
+        assert isinstance(parsed["focus_next"], str)
+        # The coerced value must survive the --once display slice
+        assert parsed["insight"][:80] == "42"
+
+    def test_non_numeric_prediction_confidence_is_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "prediction": {"text": ["a", "list"], "confidence": "high"},
+        }
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["prediction"]["text"] == "['a', 'list']"
+        assert parsed["prediction"]["confidence"] == 0.5
+
+    def test_numeric_string_confidence_parses(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {"prediction": {"confidence": "0.8"}}
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["prediction"]["confidence"] == 0.8
+
+    def test_top_level_confidence_defaults_to_zero(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {"confidence": "n/a"}
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["confidence"] == 0
+
+    def test_none_and_valid_values_are_preserved(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "insight": "real insight",
+            "next_gap": None,
+            "reasoning": None,
+            "confidence": 0.7,
+            "prediction": {"text": "valid", "confidence": 0.3},
+        }
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["insight"] == "real insight"
+        assert parsed["next_gap"] is None
+        assert parsed["reasoning"] is None
+        assert parsed["confidence"] == 0.7
+        assert parsed["prediction"]["confidence"] == 0.3
+
+
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).
 

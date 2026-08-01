@@ -1913,6 +1913,44 @@ def _build_prediction_feedback_line(
     )
 
 
+def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
+    """Type-guard the LLM response fields (crash-proofing, P4).
+
+    Same bug class as the action-dict guard in _apply_insights: the LLM
+    emits any response field as a non-string/non-numeric type. Without
+    coercion an int/dict ``insight`` reaches ``r.get("insight","")[:80]``
+    in the ``--once`` display path (TypeError: 'int' object is not
+    subscriptable) and a non-numeric ``prediction.confidence`` raises
+    TypeError inside ``adjust_confidence``'s range comparison — both
+    AFTER the expensive LLM call, wasting the whole cycle. Mutates
+    ``parsed`` in place, once per cycle, so orientation persistence,
+    daemon_state.last_output, the cycle result dict, and the display
+    path never see a non-string/non-numeric. ``None`` values are
+    preserved (the prompt allows null for next_gap/reasoning/search_query).
+    """
+    for _fld in ("insight", "focus_next", "next_gap", "reasoning", "search_query"):
+        _v = parsed.get(_fld)
+        if _v is not None and not isinstance(_v, str):
+            parsed[_fld] = str(_v).strip()
+    _conf = parsed.get("confidence")
+    if _conf is not None and not isinstance(_conf, (int, float)):
+        try:
+            parsed["confidence"] = float(_conf)
+        except (TypeError, ValueError):
+            parsed["confidence"] = 0
+    _pred = parsed.get("prediction")
+    if isinstance(_pred, dict):
+        _pt = _pred.get("text")
+        if _pt is not None and not isinstance(_pt, str):
+            _pred["text"] = str(_pt).strip()
+        _pc = _pred.get("confidence")
+        if _pc is not None and not isinstance(_pc, (int, float)):
+            try:
+                _pred["confidence"] = float(_pc)
+            except (TypeError, ValueError):
+                _pred["confidence"] = 0.5
+
+
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
     tl = state.get("timeline", load_timeline())
@@ -3960,6 +3998,11 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                         logger.info("Search incorporated into insight")
         except Exception as e:
             logger.warning("Search failed: %s", e)
+
+    # 4.75 Type-guard the LLM response fields (crash-proofing, P4).
+    # Covers the LLM path, the search-refined path, AND the local-analysis
+    # fallback (which can emit an int next_gap from the remaining-gap list).
+    _coerce_llm_response_fields(parsed)
 
     # 5. Apply insights to state
     updates = _apply_insights(parsed, state)
