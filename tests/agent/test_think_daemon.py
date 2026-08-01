@@ -3246,14 +3246,27 @@ class TestCycleBodyLlmCallWorldModelRecording:
 
     async def _run_cycle(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch,
-        populate_stats: bool,
+        populate_stats: bool, skip: bool = False,
     ) -> Dict[str, Any]:
         td = evolve_env["module"]
 
-        async def _fake_llm(messages: list, task: str = "thinking") -> str:
+        async def _fake_llm(messages: list, task: str = "thinking") -> Optional[str]:
             if populate_stats:
                 # Mimic what the real _call_llm now does: fresh outcome stats.
                 td._last_llm_call_stats.clear()
+                if skip:
+                    # Extended-outage skip path: policy tier with 0 attempts.
+                    td._last_llm_call_stats.update({
+                        "_fresh": True,
+                        "success": False,
+                        "skipped": True,
+                        "attempts_used": 0,
+                        "last_error": None,
+                        "duration_s": 0.0,
+                        "max_retries": 0,
+                        "per_attempt_timeout": 0.0,
+                    })
+                    return None
                 td._last_llm_call_stats.update({
                     "_fresh": True,
                     "success": True,
@@ -3312,6 +3325,40 @@ class TestCycleBodyLlmCallWorldModelRecording:
         triples = [t for t in wm.data.get("action_triples", [])
                    if t["action_type"] == "llm_call"]
         assert triples == [], "monkeypatched _call_llm must not record llm_call triples"
+
+    def test_skip_outcome_recorded_as_llm_call_triple(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deliberate extended-outage skip must record expected == actual.
+
+        Regression guard: before the fix, the expected string was built
+        unconditionally as "success: LLM responds within 0 attempt(s) × 0s
+        budget" for a skipped call, scoring a phantom ~0.85 prediction error
+        against the actual "skipped: no probe..." — polluting llm_call
+        calibration with a fake failure signal on every outage cycle.
+        """
+        td = evolve_env["module"]
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch, populate_stats=True,
+                                    skip=True))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 1, f"expected 1 llm_call triple, got {len(triples)}"
+        t = triples[0]
+        assert t["completed"] is True
+        assert t["prediction_error"] is not None
+        assert t["prediction_error"] <= 0.25, (
+            f"policy skip must score low, got {t['prediction_error']}"
+        )
+        assert "skipped" in t["expected_outcome"], (
+            "skip expected must read as a skip, not as success-with-0-attempts"
+        )
+        assert "skipped" in t["actual_outcome"]
+        assert t["expected_outcome"] == t["actual_outcome"], (
+            "a deliberate policy skip is its own prediction: expected == actual"
+        )
+        assert t["action_parameters"]["max_retries"] == 0
 
 
 class TestAutoCreatePlanGuard:

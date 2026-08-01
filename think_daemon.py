@@ -4189,27 +4189,36 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     if _last_llm_call_stats.pop("_fresh", False) and wm is not None:
         _llm_stats.pop("_fresh", None)  # never persist the marker in params
         try:
-            _expected_llm = (
-                f"success: LLM responds within {_retries} attempt(s) × "
-                f"{_attempt_tmo:.0f}s budget"
-            )
-            if _llm_stats.get("success"):
-                _actual_llm = (
-                    f"succeeded on attempt {_llm_stats.get('attempts_used', 1)} "
-                    f"({_llm_stats.get('duration_s', 0.0):.1f}s)"
-                )
-            elif _llm_stats.get("skipped"):
+            if _llm_stats.get("skipped"):
+                # Deliberate policy skip (extended-outage cycle): the skip IS
+                # the applied policy, so expected == actual. Without this the
+                # expected string would read "success: LLM responds within 0
+                # attempt(s) × 0s budget" and score a phantom ~0.85 error
+                # against "skipped: no probe..." — polluting llm_call
+                # calibration with a fake failure signal on every outage
+                # cycle and re-creating a spurious "prediction bias" weakness.
+                _expected_llm = "skipped: no probe (extended-outage cycle)"
                 _actual_llm = "skipped: no probe (extended-outage cycle)"
-            elif _llm_stats.get("last_error") == "timeout":
-                _actual_llm = (
-                    "failed: timeout after "
-                    f"{_llm_stats.get('attempts_used', _retries)} attempt(s)"
-                )
             else:
-                _actual_llm = (
-                    "failed: "
-                    + str(_llm_stats.get("last_error") or "unknown")[:120]
+                _expected_llm = (
+                    f"success: LLM responds within {_retries} attempt(s) × "
+                    f"{_attempt_tmo:.0f}s budget"
                 )
+                if _llm_stats.get("success"):
+                    _actual_llm = (
+                        f"succeeded on attempt {_llm_stats.get('attempts_used', 1)} "
+                        f"({_llm_stats.get('duration_s', 0.0):.1f}s)"
+                    )
+                elif _llm_stats.get("last_error") == "timeout":
+                    _actual_llm = (
+                        "failed: timeout after "
+                        f"{_llm_stats.get('attempts_used', _retries)} attempt(s)"
+                    )
+                else:
+                    _actual_llm = (
+                        "failed: "
+                        + str(_llm_stats.get("last_error") or "unknown")[:120]
+                    )
             _llm_triple_id = wm.record_action(
                 "llm_call",
                 "LLM thinking call (adaptive retry policy)",

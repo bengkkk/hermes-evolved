@@ -345,6 +345,43 @@ class TestComputePredictionError:
         # tool_failure triggered (traceback), _error=0.85, capped by exit=0 at 0.5
         assert err == pytest.approx(0.5, abs=0.01)
 
+    # ── llm_call phrasing contract (daemon telemetry) ──
+    # The daemon records the adaptive-retry LLM call as an llm_call triple
+    # with these exact expected/actual strings (think_daemon._run_cycle_body).
+    # Pin the calibration so a wording drift in either side silently changes
+    # the llm_call error signal the daemon's self-model learns from.
+
+    def test_llm_call_success_phrasing_low_error(self):
+        """Daemon llm_call success phrasing must stay a low-error signal."""
+        err = _compute_prediction_error(
+            "success: LLM responds within 2 attempt(s) × 90s budget",
+            "succeeded on attempt 2 (176.3s)",
+        )
+        assert err == pytest.approx(0.15, abs=0.05)
+
+    def test_llm_call_timeout_phrasing_high_error(self):
+        """Daemon llm_call timeout phrasing must stay a high-error signal."""
+        err = _compute_prediction_error(
+            "success: LLM responds within 1 attempt(s) × 45s budget",
+            "failed: timeout after 1 attempt(s)",
+        )
+        assert err == pytest.approx(0.85, abs=0.05)
+
+    def test_llm_call_skip_phrasing_zero_error(self):
+        """A deliberate policy skip (expected == actual) must score 0.0.
+
+        Regression guard: before the fix, a skip recorded expected
+        "success: LLM responds within 0 attempt(s) × 0s budget" against
+        actual "skipped: no probe (extended-outage cycle)", which scored a
+        phantom ~0.85 prediction error for a policy decision — polluting
+        llm_call calibration and re-creating a spurious bias weakness.
+        """
+        err = _compute_prediction_error(
+            "skipped: no probe (extended-outage cycle)",
+            "skipped: no probe (extended-outage cycle)",
+        )
+        assert err == pytest.approx(0.0, abs=0.01)
+
     # ── Pathological exit code edge cases ──
 
     def test_no_exit_code_uses_keyword_heuristic(self):
