@@ -1310,18 +1310,62 @@ def _try_parse_json(text: str) -> Optional[Dict[str, Any]]:
 # place).  The loop reference is verified against HEAD each time it is
 # committed (see git log: "docs(daemon): core-loop navigation map
 # verified at HEAD ..."), so doc existence is a trustworthy signal.
+#
+# 2026-08-01: two more resolved subjects joined the table — the Gap 8
+# retry/budget wiring and the LLM-field type-guard hardening.  Both were
+# the subject of a multi-cycle fixation loop ("where is the retry/budget
+# policy invoked?", "are action/outcome fields type-guarded?") that the
+# generic wording patterns could not break: the policy IS wired (applied
+# once per cycle by _set_llm_retry_policy(), read by _call_llm(), which
+# passes the per-attempt timeout through to async_call_llm) and the
+# coercion IS in place (action fields at the _apply_insights boundary,
+# response fields at the _coerce_llm_response_fields choke point, plus
+# _compute_prediction_error).  Each subject carries its own keyword regex
+# (4th tuple element) so only entries restating the RESOLVED facts are
+# pruned; genuinely new design questions (backoff strategies, new field
+# types, new providers) keep their tokens but fail the keyword gate.
 _DOCUMENTED_SUBJECTS: tuple = (
-    # (subject tokens, source file, reference doc)
+    # (subject tokens, source file, reference doc, resolved-fact keyword regex)
     (
         ("think_daemon.py", "think_daemon", "daemon loop", "daemon's loop",
          "core-loop", "core loop", "coreloop"),
         "think_daemon.py",
         "docs/think_daemon_loop.md",
+        None,  # → _RESOLVED_FACT_KEYWORDS
     ),
     (
         ("world_model.py", "world model", "world-model"),
         "world_model.py",
         "docs/think_daemon_loop.md",
+        None,  # → _RESOLVED_FACT_KEYWORDS
+    ),
+    # Gap 8 retry/budget wiring — resolved 2026-08-01 (see the step-6
+    # table and the function-map rows for _llm_retry_policy /
+    # _set_llm_retry_policy / _call_llm in docs/think_daemon_loop.md).
+    # Entries asking where/how the policy is wired, invoked, referenced,
+    # or whether the call is sync/async restate established facts.
+    (
+        ("retry/budget", "retry-budget", "retry budget", "retry policy",
+         "llm call-site", "llm call site", "llm call", "call-site",
+         "call site", "auxiliary_client", "auxiliary client"),
+        "think_daemon.py",
+        "docs/think_daemon_loop.md",
+        re.compile(
+            r"wire|invok|referenc|integrat|patch|sync|async|mechanic|wrap|"
+            r"defin|connect|compile",
+            re.IGNORECASE,
+        ),
+    ),
+    # LLM-field type-guards — resolved 2026-08-01 (action fields coerced
+    # in _apply_insights, response fields at the _coerce_llm_response_fields
+    # choke point, expected/actual coerced in _compute_prediction_error).
+    # Entries about the non-string crash class restate a fixed bug.
+    (
+        ("type-guard", "type guard", "typeguard", "non-string", "non string",
+         "int' object", "has no attribute"),
+        "think_daemon.py",
+        "docs/think_daemon_loop.md",
+        re.compile(r"strip|coerce|guard|attribute|crash", re.IGNORECASE),
     ),
 )
 _RESOLVED_FACT_KEYWORDS = re.compile(
@@ -1337,17 +1381,20 @@ def _subject_is_resolved(text: str) -> bool:
     workspace AND a reference doc exists that maps it.  To stay
     conservative, only entries that ALSO use knowledge keywords (path,
     structure, read, ...) are resolved — a future design question that
-    merely mentions the file is left alone.
+    merely mentions the file is left alone.  Each subject may carry its
+    own keyword regex (4th tuple element); None falls back to the generic
+    _RESOLVED_FACT_KEYWORDS.
     """
     t = text.lower()
-    for tokens, src, doc in _DOCUMENTED_SUBJECTS:
+    for tokens, src, doc, keywords in _DOCUMENTED_SUBJECTS:
         if not any(tok in t for tok in tokens):
             continue
         if not (_WORKSPACE_ROOT / src).exists():
             continue
         if not (_WORKSPACE_ROOT / doc).exists():
             continue
-        if _RESOLVED_FACT_KEYWORDS.search(t):
+        kws = keywords if keywords is not None else _RESOLVED_FACT_KEYWORDS
+        if kws.search(t):
             return True
     return False
 

@@ -1662,6 +1662,106 @@ class TestPruneSelfModel:
             "A genuinely unresolved unknown area"
         )
 
+    def test_subject_is_resolved_covers_gap8_wiring_and_type_guards(
+        self, evolve_env: Dict
+    ) -> None:
+        """The Gap 8 retry/budget-wiring and type-guard subjects are resolved.
+
+        Regression for the 2026-08-01 fixation loop: the daemon re-asked
+        "where is the retry/budget policy wired" for many cycles even
+        though the policy was committed and documented.  The actual live
+        entries (self_model.json at the time of writing) must now resolve
+        so _prune_self_model removes them and _apply_insights blocks
+        re-adding them.
+        """
+        td = evolve_env["module"]
+        stale_unknowns = [
+            "Whether the live daemon's LLM call is sync or async and where "
+            "the retry/budget policy is currently referenced.",
+            "Exact LLM call-site lines and current integration status in "
+            "think_daemon.py.",
+            "Whether the existing retry/budget policy is currently invoked "
+            "anywhere else in the daemon or only defined at lines 133-138.",
+            "Exact mechanics of the live LLM call-site (sync/async) and how "
+            "the retain/budget policy at lines 133-138 is intended to wrap "
+            "the auxiliary_client call.",
+            "Whether wiring the retry/budget policy requires changes inside "
+            "auxiliary_client or only at the invocation point; also whether "
+            "the daemon has a test harness to run after the patch.",
+            "Exact LLM call-site lines in think_daemon.py and how the "
+            "retry/budget helper should be invoked around the "
+            "auxiliary_client call.",
+            "Exact LLM call-site line numbers and sync/async nature of the "
+            "call; whether retry/budget helpers are referenced anywhere "
+            "besides lines 133-138.",
+        ]
+        stale_commitments = [
+            "Next cycle, move from outlining to modifying/integrating the "
+            "daemon's retry/budget functions into a concrete evolution "
+            "change toward Gap 8.",
+            "Integrate retry/budget logic into think_daemon.py and verify "
+            "it compiles/tests within the next two cycles.",
+            "After seeing the call-site grep output, write the integration "
+            "patch for retry/budget logic in think_daemon.py within the "
+            "next cycle.",
+            "After seeing the extracted retry/budget section, emit the "
+            "targeted edit to think_daemon.py and verify it compiles — by "
+            "the end of next cycle.",
+            "After the grep output returns, apply the retry/budget "
+            "integration patch before writing any further orientation "
+            "summary.",
+            "After this inspection, apply the minimal patch to "
+            "think_daemon.py connecting the retry/budget policy to the LLM "
+            "call and verify with py_compile.",
+            "Wire the retry/budget helper into the auxiliary_client LLM "
+            "call site and verify python3 -m py_compile passes within the "
+            "next 2 cycles.",
+            "Write and py_compile-verify the retry/budget wiring patch in "
+            "think_daemon.py during the next cycle.",
+        ]
+        stale_weakness = (
+            "Crash-prone when action/outcome fields contain non-string types "
+            "(e.g., TypeError: 'int' object has no attribute 'strip'); needs "
+            "type-guards in cycle processing."
+        )
+        for entry in stale_unknowns + stale_commitments:
+            assert td._subject_is_resolved(entry), entry[:80]
+        assert td._subject_is_resolved(stale_weakness)
+
+        # _prune_self_model actually removes them (evidence section needs
+        # daemon_state with tick_count >= 10).
+        sm = {
+            "capabilities": {
+                "weaknesses": [stale_weakness],
+                "unknown_areas": list(stale_unknowns),
+            },
+            "commitments": {"promised_features": list(stale_commitments)},
+        }
+        removed = td._prune_self_model(
+            sm, daemon_state={"tick_count": 340, "last_output": {"fallback": False}}
+        )
+        assert removed == 1 + len(stale_unknowns) + len(stale_commitments)
+        assert sm["capabilities"]["weaknesses"] == []
+        assert sm["capabilities"]["unknown_areas"] == []
+        assert sm["commitments"]["promised_features"] == []
+
+    def test_subject_is_resolved_keeps_new_design_questions(
+        self, evolve_env: Dict
+    ) -> None:
+        """Genuine design questions about the same files must survive."""
+        td = evolve_env["module"]
+        new_design_questions = [
+            "How should the daemon's retry policy add exponential backoff "
+            "to reduce outage cost?",
+            "Should the LLM call use a longer timeout for reasoning models?",
+            "How should cycle processing guard against entirely new field "
+            "types from the LLM?",
+            "What new capability should the daemon add next for "
+            "self-directed evolution?",
+        ]
+        for q in new_design_questions:
+            assert not td._subject_is_resolved(q), q
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Action deduplication gate (break LLM fixation loops)

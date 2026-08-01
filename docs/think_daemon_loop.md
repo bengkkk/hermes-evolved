@@ -267,7 +267,20 @@ explicitly instead of only learning of completion after the fact.
   exists + reference doc exists — e.g. think_daemon.py + this doc) regardless
   of phrasing, and `_apply_insights` refuses to re-add them. This replaced the
   regex-whack-a-mole that let new phrasings of the resolved think_daemon.py
-  structure read survive for many cycles.
+  structure read survive for many cycles. Subjects currently in the table:
+  (1) think_daemon.py structure, (2) world_model.py structure, (3) the Gap 8
+  retry/budget wiring — the policy is applied once per cycle by
+  `_set_llm_retry_policy()` and read by `_call_llm()`, which passes the
+  per-attempt timeout through to `async_call_llm()` (step 6 above; rows in the
+  function map), so "where/how is the retry budget wired?" restates a
+  resolved fact, and (4) the LLM-field type-guards — action fields are
+  coerced to str at the `_apply_insights` boundary, response fields at the
+  `_coerce_llm_response_fields` choke point, and expected/actual in
+  `_compute_prediction_error`, so "action/outcome fields crash on
+  non-strings" restates a fixed bug. Each subject carries its own
+  resolved-fact keyword regex; new design questions (backoff strategies,
+  new field types, new providers) keep their tokens but fail the keyword
+  gate and survive pruning.
 - **Code-drift visibility + auto-restart** — stale daemon processes surface
   via the `code_drift` marker + launcher `status`; `_schedule_drift_restart`
   (48b3ce5cd) additionally schedules a detached restart onto fresh code 5 s
