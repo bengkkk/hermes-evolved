@@ -2231,6 +2231,34 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                     except (TypeError, ValueError):
                         _r[_num_fld] = _default
 
+    # Plan blocks are the last unguarded LLM-JSON surface in the cycle
+    # pipeline. ``plan_action`` feeds update_plan_step (string step-id
+    # comparison + persisted note) and ``new_plan`` feeds create_plan —
+    # an int ``plan_action.step_id`` silently never matches a string step
+    # id (dead update), and an int ``new_plan.steps`` CRASHES the step
+    # comprehension in _apply_insights (``for s in np["steps"]``) after
+    # the expensive LLM call, killing the whole cycle (line 4548 calls
+    # _apply_insights outside any try/except). Coerce the string fields
+    # exactly like goal_action, and guarantee ``steps`` is a list so the
+    # comprehension can never TypeError on a non-iterable.
+    for _rec, _flds in (
+        ("plan_action", ("step_id", "new_status", "note")),
+        ("new_plan", ("goal", "verification")),
+    ):
+        _r = parsed.get(_rec)
+        if isinstance(_r, dict):
+            for _fld in _flds:
+                _v = _r.get(_fld)
+                if _v is not None and not isinstance(_v, str):
+                    _r[_fld] = str(_v).strip()
+            _st = _r.get("steps")
+            if _st is not None and not isinstance(_st, list):
+                # A non-list steps (int/bool/dict/str) either crashes the
+                # comprehension or iterates garbage; degrade to [] so the
+                # plan is safely rejected as having no real steps instead
+                # of killing the cycle.
+                _r["steps"] = []
+
 
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
@@ -2509,7 +2537,7 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # dict or None at this point.
     if act is not None and isinstance(act, dict):
         for _fld in ("type", "description", "command", "path",
-                     "content", "message", "package"):
+                     "content", "message", "package", "endpoint", "method"):
             _v = act.get(_fld)
             if _v is not None and not isinstance(_v, str):
                 act[_fld] = str(_v).strip()

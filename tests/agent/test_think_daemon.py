@@ -3024,6 +3024,82 @@ class TestCoerceLlmResponseFields:
         assert ga["new_status"] == "['active']"
         assert ga["note"] == "{'n': 1}"
 
+    def test_plan_action_fields_coerced(self, evolve_env: Dict) -> None:
+        """P4: ``plan_action`` is the same LLM-JSON surface as goal_action
+        but was missing from the coercion list — an int ``step_id`` would
+        silently never match a string step id in update_plan_step (dead
+        update) and a dict ``note`` would persist garbage into the plan
+        step. All string fields must coerce like goal_action."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "plan_action": {
+                "step_id": 2, "new_status": ["complete"], "note": {"n": 1},
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        pa = parsed["plan_action"]
+        assert pa["step_id"] == "2"
+        assert pa["new_status"] == "['complete']"
+        assert pa["note"] == "{'n': 1}"
+
+    def test_new_plan_fields_coerced(self, evolve_env: Dict) -> None:
+        """P4: ``new_plan`` was unguarded — an int ``goal`` would persist a
+        garbage plan title via create_plan and an int ``steps`` CRASHES the
+        step comprehension in _apply_insights (``for s in np["steps"]``),
+        which runs outside any try/except after the LLM call, killing the
+        whole cycle. All string fields coerce; ``steps`` degrades to []."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "new_plan": {
+                "goal": 42, "verification": {"v": 1}, "steps": 5,
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        np_ = parsed["new_plan"]
+        assert np_["goal"] == "42"
+        assert np_["verification"] == "{'v': 1}"
+        assert np_["steps"] == []
+
+    def test_new_plan_valid_steps_list_preserved(self, evolve_env: Dict) -> None:
+        """A legitimate list of step dicts must pass through untouched."""
+        td = evolve_env["module"]
+        steps = [{"description": "Step A", "verification": "V"}]
+        parsed: Dict[str, Any] = {"new_plan": {"goal": "g", "steps": steps}}
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["new_plan"]["steps"] is steps
+
+    def test_action_dict_api_call_fields_coerced(self, evolve_env: Dict) -> None:
+        """P4: the action-dict guard in _apply_insights must coerce api_call
+        fields too — a dict ``endpoint`` would otherwise flow raw into
+        _action_params_from_act → world-model parameters, polluting
+        calibration features with unhashable garbage. After coercion the
+        dict endpoint becomes a string that fails the http(s) allowlist
+        check, so the action is cleanly BLOCKED with no network access."""
+        td = evolve_env["module"]
+        act: Dict[str, Any] = {
+            "type": "api_call", "endpoint": {"url": "x"},
+            "method": ["GET"], "description": 1,
+            "expected_outcome": "exit=0: response",
+        }
+        parsed: Dict[str, Any] = {"action": act}
+        state = {
+            "timeline": {"version": 1, "past": {}, "present": {}, "future": {}},
+            "self_model": {"version": 1, "identity": {}, "state": {},
+                           "capabilities": {}, "commitments": {}},
+            "orientation": None,
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+            "world_model": None,
+        }
+        updates = td._apply_insights(parsed, state)  # must not raise
+        assert updates is not None
+        # The guard coerced the api_call fields in place on the action dict
+        assert isinstance(act["endpoint"], str)
+        assert isinstance(act["method"], str)
+        assert isinstance(act["description"], str)
+        # Coerced dict endpoint fails the http(s) pre-flight → clean BLOCKED,
+        # no urllib call attempted (deny-by-default preserved)
+        assert "BLOCKED" in state["daemon_state"].get("last_action_output", "")
+
     def test_episodic_record_fields_coerced(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         parsed: Dict[str, Any] = {
