@@ -41,6 +41,36 @@ class TestComputePredictionError:
         # expected is contained in actual
         assert _compute_prediction_error("full system", "deploy the full system now") <= 0.25
 
+    def test_disjunctive_hedged_prediction_scores_intermediate(self) -> None:
+        # A hedged "success or timeout: ..." prediction resolving to EITHER
+        # named branch scores the intermediate 0.4 — calibrated uncertainty
+        # between confident-correct (0.15) and confident-wrong (0.85).
+        # Added 2026-08-01: the daemon's llm_call triples now emit this
+        # disjunctive expected under non-healthy retry tiers so outage
+        # failures stop scoring as 0.85 surprises while the predictor
+        # never learns to hedge.
+        hedge = (
+            "success or timeout: LLM responds within 1 attempt(s) × "
+            "45s budget (outage tier 'deep')"
+        )
+        assert _compute_prediction_error(
+            hedge, "failed: timeout after 1 attempt(s)"
+        ) == 0.4
+        assert _compute_prediction_error(
+            hedge, "succeeded on attempt 1 (1.5s)"
+        ) == 0.4
+
+    def test_confident_llm_predictions_unchanged(self) -> None:
+        # Confident predictions keep their original scores — the hedge
+        # heuristic must not fire when the expected names only one branch.
+        confident = "success: LLM responds within 2 attempt(s) × 90s budget"
+        assert _compute_prediction_error(
+            confident, "succeeded on attempt 1 (30.5s)"
+        ) == 0.15
+        assert _compute_prediction_error(
+            confident, "failed: timeout after 2 attempt(s)"
+        ) == 0.85
+
     def test_exit_code_success_match(self) -> None:
         # "deploy" implies success, exit=0 means success → low error
         err = _compute_prediction_error("deploy to production", "exit=0: deployed ok")

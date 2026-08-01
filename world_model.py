@@ -291,6 +291,30 @@ def _compute_prediction_error(
         if _exp_status_m.group(1)[0] == _act_status_m.group(1)[0]:
             return 0.15
 
+    # ── Disjunctive (hedged) predictions ──
+    # When the EXPECTED outcome explicitly names both a success and a
+    # failure branch ("success or timeout: ..."), the predictor was
+    # honestly unsure which would realize.  A disjunctive prediction that
+    # resolves to one of its named branches is partially correct: score
+    # the calibrated hedging with an intermediate error (0.4) instead of
+    # the confident-call rewards — confident-correct (0.15) < hedge (0.4)
+    # < confident-wrong (0.85) — so predictors learn to hedge when the
+    # environment is uncertain and stay confident when it is not.  Fires
+    # only when the expected string contains BOTH a success marker and a
+    # failure marker, so ordinary confident predictions ("success: ...")
+    # are untouched.
+    # Added 2026-08-01: the daemon's llm_call triples always predicted
+    # "success: ..." regardless of outage tier, so every real timeout
+    # scored 0.85 while the predictor never learned to hedge; the daemon
+    # now emits "success or timeout: ..." under non-healthy retry tiers.
+    _hedge_success = bool(re.search(
+        r"\b(success|succeed|ok)\b", e_lower,
+    ))
+    _hedge_failure = bool(re.search(
+        r"\b(timeout|fail|error)\b", e_lower,
+    ))
+    if _hedge_success and _hedge_failure:
+        return 0.4
 
     # ── Exit-code observation (ground truth for command success/failure) ──
     # The exit code tells us whether the command itself succeeded, but NOT

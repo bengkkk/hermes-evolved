@@ -3978,6 +3978,7 @@ class TestCycleBodyLlmCallWorldModelRecording:
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch,
         populate_stats: bool, skip: bool = False,
         budget_seconds: Optional[float] = None,
+        fallback_cycles: int = 0,
     ) -> Dict[str, Any]:
         td = evolve_env["module"]
         if budget_seconds is not None:
@@ -4016,6 +4017,8 @@ class TestCycleBodyLlmCallWorldModelRecording:
 
         result = {"status": "ok", "tick_duration": 0, "insight": None, "error": None}
         ds = td.load_daemon_state()
+        if fallback_cycles:
+            ds["consecutive_fallback_cycles"] = fallback_cycles
         ds.setdefault(
             "cycle_stats",
             {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
@@ -4111,6 +4114,38 @@ class TestCycleBodyLlmCallWorldModelRecording:
         assert params.get("cycle_budget_s") == 200.0
         assert params.get("budget_fraction") == round(1.5 / 200.0, 4), params
         assert "_fresh" not in params
+
+    def test_outage_tier_records_disjunctive_expected_outcome(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-healthy retry tier must hedge, not predict flat success.
+
+        Regression guard for the llm_call calibration bias observed
+        2026-08-01: every recorded failure (all under warm/deep/healthy
+        tiers) was predicted as "success: ..." — a tautology that scored
+        each real timeout as a 0.85 surprise.  Under an outage tier the
+        expected outcome must read as an explicit hedge ("success or
+        timeout: ...") naming the tier, and score the intermediate 0.4
+        that _compute_prediction_error assigns to disjunctive
+        predictions.
+        """
+        td = evolve_env["module"]
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=2))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 1, f"expected 1 llm_call triple, got {len(triples)}"
+        t = triples[0]
+        assert "success or timeout" in t["expected_outcome"], t["expected_outcome"]
+        assert "outage tier 'deep'" in t["expected_outcome"], t["expected_outcome"]
+        # Fake stats succeed on attempt 1; the hedge resolves to success
+        # but must score the intermediate disjunctive error, not a
+        # confident-correct 0.15 (nor the 0.85 a flat "success" would
+        # have scored on the failure branch).
+        assert t["prediction_error"] == 0.4, t["prediction_error"]
 
     def test_llm_call_triple_budget_fraction_none_without_budget(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
