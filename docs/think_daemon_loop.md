@@ -5,7 +5,8 @@ This document describes the action-selection loop as implemented at commit
 `d6b741b3d` + the extended-outage retry policy (0-attempt probe skip).
 Line numbers and cycle steps are verified against HEAD `feb075dde`
 (2026-07-31 22:28; evidence-based self-model resolution for documented
-subjects).
+subjects) and re-verified at HEAD `d6afa6faa` (2026-08-01; the
+`_action_params_from_act` predict/record parity refactor).
 It is the counterpart to the daemon-reliability work: the loop below is what
 the PID-lock re-verification protects.
 
@@ -19,6 +20,13 @@ the PID-lock re-verification protects.
 > direct AST read at HEAD feb075dde; the world-model.py map is unaffected
 > (world_model.py is unchanged across those commits — every table line
 > number re-confirmed at HEAD).
+>
+> Second drift (2026-08-01, re-verified at d6afa6faa): the
+> `_action_params_from_act` refactor (+28/−25, net +3) inserted a shared
+> parameter extractor at line 1743 and shrank `_apply_insights`, so
+> `_apply_insights` moved 1743 → 1767 and everything from
+> `_auto_detect_provider_from_env` (2311) onward is +3. The world-model.py
+> map is unaffected (world_model.py untouched by that commit).
 
 ## Process model
 
@@ -165,7 +173,7 @@ never deletes from. Four touchpoints connect the cycle to the goal system:
 
 1. **Plan auto-create (cycle step 3)** — if no active plan exists and no
    active/complete plan targets "Complete Gap 8 — Self-directed evolution",
-   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3486-3510).
+   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3489-3513).
    Placeholder steps (bare "Step A" descriptions, or "V"/"n/a"
    verification) are rejected at creation by `_is_placeholder_step`
    (line 273), so a plan with no actionable content can never re-enter the
@@ -230,7 +238,7 @@ from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 |---|---|---|
 | `_compute_prediction_error(expected, actual)` | 139 | Canonical error metric (0 = exact match … 1 = unrelated) |
 | `record_action(type, desc, expected, source, …)` | 366 | Opens an action triple (predict step) |
-| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 2212; timeout/exception close paths at 2253/2259) |
+| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 2215; timeout/exception close paths at 2256/2262) |
 | `record_action_complete(...)` | 482 | Alternate close entry point (verify step) |
 | `record_prediction(text, timeframe, confidence, basis)` | 512 | Macro-prediction log |
 | `verify_prediction(pred_id)` | 552 | Score a single prediction against evidence |
@@ -243,7 +251,7 @@ from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 | `format_calibration_guidance()` | 1580 | Guidance when a type is poorly calibrated |
 | `format_improvement_context()` | 1745 | Top improvement suggestions |
 | `format_action_guidance(type, desc)` | 1780 | Pre-execution risk assessment (daemon logs as `[RISK WARNING]`) |
-| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 1813) |
+| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 2106, params via `_action_params_from_act`) |
 | `save(path)` / `load(path)` | 2047 / 2117 | Persistence |
 
 Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
@@ -251,7 +259,7 @@ Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
 
 ## think_daemon.py core-loop navigation map
 
-Direct-read verification (2026-07-31, HEAD `feb075dde`) of the daemon's own
+Direct-read verification (2026-08-01, HEAD `d6afa6faa`) of the daemon's own
 structure — the counterpart to the world-model map above. This fulfils the
 standing commitment to read and outline the core loop (lines 200–400 turned
 out to be infrastructure, not the loop itself: placeholder-step guard,
@@ -273,29 +281,31 @@ state helpers, code-drift detection, PID lock; the loop lives in
 | `_try_parse_json(raw)` | 1141 | Lenient JSON extraction from LLM output |
 | `_subject_is_resolved(text)` | 1242 | Evidence-based resolution check (feb075dde): subject is documented (source file + reference doc exist) |
 | `_prune_self_model(sm, daemon_state)` | 1264 | Pre-/post-cycle stale-weakness pruning + documented-subject resolution (fixation protection) |
-| `_apply_insights(result, state)` | 1743 | Action selection + execution: dedup gate, predict → record → execute → complete → feedback |
-| `_auto_detect_provider_from_env` / `_ensure_runtime_main` / `_ensure_provider_env` | 2311 / 2331 / 2404 | Runtime provider bootstrap (opencode-go main, key propagation) |
-| `_call_llm(messages, task)` | 2432 | Async LLM call via auxiliary client under the adaptive retry budget |
-| `_select_state_check_action(state)` | 2501 | Fallback-cycle action picker (least-sampled action type) |
-| `_local_analysis(state)` | 2569 | No-LLM fallback: data-driven insight + auto-goal creation + state-check action |
-| `_bridge_world_model_to_self_model(wm, sm)` | 2848 | Discrepancy patterns → self-model weaknesses |
-| `_reconcile_goals_with_world(wm)` | 2983 | Auto-complete goals whose criteria are met by world-model evidence |
-| `_auto_activate_goals()` | 3182 | Promote proposed goals → active (Gap 4 → Gap 8 bridge) |
-| `run_one_cycle()` | 3273 | Timeout wrapper around `_run_cycle_body` |
-| `_validate_shell_command(cmd)` | 3352 | Pre-flight shell validation (unbalanced quotes, compile check) |
-| `_execute_shell_action(cmd, timeout)` | 3418 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
-| `_run_cycle_body(result, ds)` | 3439 | **The core cycle** (steps 1–8 in “One cycle” above) |
-| `_mark_startup(ds, interval, head)` | 3732 | Stamp `startup_head`, clear stale `code_drift` block |
-| `run_daemon(interval, max_cycles)` | 3747 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
-| `_run_verification()` | 3829 | No-LLM self-test of the predict→act→observe→learn cycle |
-| `bootstrap_evolve_data()` | 3977 | Seed evolve JSON files (idempotent) |
-| `_show_status()` | 4155 | `--status` snapshot |
-| `main()` | 4292 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
+| `_action_params_from_act(act, atype)` | 1743 | Shared parameter extractor for predict/record parity (new in d6afa6faa) |
+| `_apply_insights(result, state)` | 1767 | Action selection + execution: dedup gate, predict → record → execute → complete → feedback |
+| `_auto_detect_provider_from_env` / `_ensure_runtime_main` / `_ensure_provider_env` | 2314 / 2334 / 2407 | Runtime provider bootstrap (opencode-go main, key propagation) |
+| `_call_llm(messages, task)` | 2435 | Async LLM call via auxiliary client under the adaptive retry budget |
+| `_select_state_check_action(state)` | 2504 | Fallback-cycle action picker (least-sampled action type) |
+| `_local_analysis(state)` | 2572 | No-LLM fallback: data-driven insight + auto-goal creation + state-check action |
+| `_bridge_world_model_to_self_model(wm, sm)` | 2851 | Discrepancy patterns → self-model weaknesses |
+| `_reconcile_goals_with_world(wm)` | 2986 | Auto-complete goals whose criteria are met by world-model evidence |
+| `_auto_activate_goals()` | 3185 | Promote proposed goals → active (Gap 4 → Gap 8 bridge) |
+| `run_one_cycle()` | 3276 | Timeout wrapper around `_run_cycle_body` |
+| `_validate_shell_command(cmd)` | 3355 | Pre-flight shell validation (unbalanced quotes, compile check) |
+| `_execute_shell_action(cmd, timeout)` | 3421 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
+| `_run_cycle_body(result, ds)` | 3442 | **The core cycle** (steps 1–8 in “One cycle” above) |
+| `_mark_startup(ds, interval, head)` | 3735 | Stamp `startup_head`, clear stale `code_drift` block |
+| `run_daemon(interval, max_cycles)` | 3750 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
+| `_run_verification()` | 3832 | No-LLM self-test of the predict→act→observe→learn cycle |
+| `bootstrap_evolve_data()` | 3980 | Seed evolve JSON files (idempotent) |
+| `_show_status()` | 4158 | `--status` snapshot |
+| `main()` | 4295 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
 
 Action-execution call sites inside `_apply_insights` (current lines):
-`predict_action_outcome` 2093, `record_action` 2137, `format_action_guidance`
-2143, `complete_action` 2212, `[PREDICTION]` feedback 2236/2240, timeout
-close 2253, exception close 2259.
+`_action_params_from_act` 2105 (predict path) / 2139 (record path),
+`predict_action_outcome` 2106, `record_action` 2140, `format_action_guidance`
+2146, `complete_action` 2215, `[PREDICTION]` feedback 2239/2243, timeout
+close 2256, exception close 2262.
 
 ## Prediction feedback (closing the loop)
 
@@ -319,12 +329,14 @@ same way.
   it; `daemon_state.startup_head = feb075dde`, `code_drift = null` as of
   tick 296. No manual restart needed — the 48b3ce5cd mechanism is proven in
   the wild.
-- **think_daemon.py core-loop read (RE-VERIFIED this cycle)**: the standing
+- **think_daemon.py core-loop read (RE-VERIFIED 2026-08-01)**: the standing
   commitment to read and outline the core loop is fulfilled again at HEAD
-  feb075dde — see the navigation map above. The +267/−22 lines from the
-  five commits since d8edfb4cd shifted every line number (map now 61–139
-  lines past the previous verification); all numbers above were re-read by
-  AST at feb075dde, and the world-model.py map was re-confirmed unchanged.
+  d6afa6faa — see the navigation map above. The `_action_params_from_act`
+  refactor (+28/−25, net +3) added a shared parameter extractor at line 1743
+  (`_apply_insights` moved 1743 → 1767) and shifted everything from
+  `_auto_detect_provider_from_env` (2311) onward by +3; all numbers above
+  were re-read by AST at d6afa6faa, and the world-model.py map was
+  re-confirmed unchanged (world_model.py untouched by that commit).
 
 ## Resolved gaps
 
