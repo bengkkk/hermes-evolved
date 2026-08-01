@@ -3223,6 +3223,200 @@ class TestCoerceLlmResponseFields:
         assert "timeline" in updates
 
 
+class TestCoerceLlmResponseFieldsFuzz:
+    """P4 verification criterion: the fuzz test.
+
+    The P4 goal (``Crash-proof daemon outcome processing``) lists its
+    verification criteria as: *"Run 50+ cycles or a fuzz test feeding
+    int/None/dict values into outcome fields; zero crashes and each
+    non-string value is coerced or safely rejected."* The targeted tests
+    above prove individual fields with hand-picked values; this class
+    closes the other half of the criterion by feeding every guarded
+    field (top-level, prediction, event/outcome/commitment/session
+    records, goal/memory/plan blocks) every poison class (int, dict,
+    list, bool, float, None) and asserting the coercion invariants hold
+    for all of them — zero exceptions, strings coerced, numerics
+    coerced-or-defaulted, lists guaranteed, ``None`` preserved.
+    """
+
+    # Mirror of the guarded tables in _coerce_llm_response_fields:
+    # (block, (field, ...)) where block == "" means top-level.
+    _STRING_FIELDS = (
+        ("", ("insight", "focus_next", "next_gap", "reasoning", "search_query")),
+        ("prediction", ("text",)),
+        ("event_to_record", ("summary", "type", "impact")),
+        ("outcome_to_record", ("summary", "impact", "event_id")),
+        ("commitment", ("what", "deadline")),
+        ("session_record", ("focus",)),
+        ("new_goal", ("title", "description", "rationale",
+                      "gap_reference", "verification_criteria")),
+        ("goal_action", ("goal_id", "new_status", "note")),
+        ("episodic_record", ("mtype", "summary", "details")),
+        ("semantic_record", ("topic", "fact", "source")),
+        ("procedural_record", ("pattern", "trigger", "procedure")),
+        ("plan_action", ("step_id", "new_status", "note")),
+        ("new_plan", ("goal", "verification")),
+    )
+    # Numeric fields: (block, field, schema-default) — default is the
+    # fallback when the value is present but unconvertible.
+    _NUMERIC_FIELDS = (
+        ("", "confidence", 0),
+        ("prediction", "confidence", 0.5),
+        ("new_goal", "priority", 3),
+        ("new_goal", "salience", 0.5),
+        ("new_goal", "confidence", 0.7),
+        ("episodic_record", "salience", 0.5),
+        ("semantic_record", "confidence", 0.7),
+    )
+    # Every non-string poison class the LLM has emitted or could emit.
+    _POISONS = (42, {"nested": True}, ["a", "list"], True, 3.14, None)
+
+    def test_string_fields_never_crash_and_always_coerce(
+        self, evolve_env: Dict
+    ) -> None:
+        """Feed every poison into every string-guarded field. The choke
+        point must never raise, and each non-None value must come out as
+        ``str`` (``None`` is preserved per the null-allowed contract)."""
+        td = evolve_env["module"]
+        for block, fields in self._STRING_FIELDS:
+            for fld in fields:
+                for poison in self._POISONS:
+                    parsed: Dict[str, Any] = (
+                        {fld: poison} if not block else {block: {fld: poison}}
+                    )
+                    td._coerce_llm_response_fields(parsed)  # must not raise
+                    got = parsed[fld] if not block else parsed[block][fld]
+                    if poison is None:
+                        assert got is None, (
+                            f"{block or '<top>'}.{fld}: None must be preserved, "
+                            f"got {got!r}"
+                        )
+                    else:
+                        assert isinstance(got, str), (
+                            f"{block or '<top>'}.{fld} with {poison!r} must "
+                            f"coerce to str, got {got!r} ({type(got).__name__})"
+                        )
+
+    def test_numeric_fields_never_crash_and_coerce_or_default(
+        self, evolve_env: Dict
+    ) -> None:
+        """Numeric-guarded fields must come out int/float for every
+        poison — either converted or fallen back to the schema default.
+        ``None`` stays ``None`` (null-allowed)."""
+        td = evolve_env["module"]
+        for block, fld, default in self._NUMERIC_FIELDS:
+            for poison in self._POISONS:
+                parsed: Dict[str, Any] = (
+                    {fld: poison} if not block else {block: {fld: poison}}
+                )
+                td._coerce_llm_response_fields(parsed)  # must not raise
+                got = parsed[fld] if not block else parsed[block][fld]
+                if poison is None:
+                    assert got is None, (
+                        f"{block or '<top>'}.{fld}: None must be preserved, "
+                        f"got {got!r}"
+                    )
+                else:
+                    # bool is an int subclass and numeric-compatible, so
+                    # the choke point's isinstance((int, float)) guard
+                    # legitimately lets True/False pass through untouched.
+                    assert isinstance(got, (int, float)), (
+                        f"{block or '<top>'}.{fld} with {poison!r} must be a "
+                        f"number (or default {default!r}), got {got!r} "
+                        f"({type(got).__name__})"
+                    )
+
+    def test_list_guarded_fields_always_end_up_lists(
+        self, evolve_env: Dict
+    ) -> None:
+        """``session_record.outcomes_list`` and ``new_plan.steps`` are
+        list-shaped: a scalar degrades to a one-item list, an empty or
+        non-list value degrades to ``[]``, and a real list passes through
+        untouched — never an exception, never a non-list survivor."""
+        td = evolve_env["module"]
+        for poison in self._POISONS + ("single outcome",):
+            parsed: Dict[str, Any] = {
+                "session_record": {"focus": "f", "outcomes_list": poison},
+                "new_plan": {"goal": "g", "steps": poison},
+            }
+            td._coerce_llm_response_fields(parsed)  # must not raise
+            assert isinstance(parsed["session_record"]["outcomes_list"], list), (
+                f"outcomes_list with {poison!r} must be a list, got "
+                f"{parsed['session_record']['outcomes_list']!r}"
+            )
+            assert isinstance(parsed["new_plan"]["steps"], list), (
+                f"steps with {poison!r} must be a list, got "
+                f"{parsed['new_plan']['steps']!r}"
+            )
+        # A legitimate list of step dicts must survive untouched.
+        steps = [{"description": "Step A", "verification": "V"}]
+        parsed = {"new_plan": {"goal": "g", "steps": steps}}
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["new_plan"]["steps"] is steps
+
+    def test_fully_poisoned_document_survives_coerce_and_apply(
+        self, evolve_env: Dict
+    ) -> None:
+        """Worst case: EVERY guarded block present at once, every field
+        poisoned with a different non-string class. The full pipeline —
+        ``_coerce_llm_response_fields`` then ``_apply_insights`` — must
+        complete without raising, and everything persisted to the
+        timeline must be string-typed (so next cycle's prompt builder
+        ``\"; \".join(...)`` cannot TypeError)."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "insight": 42,
+            "focus_next": {"nested": True},
+            "next_gap": ["gap"],
+            "reasoning": True,
+            "search_query": 3.14,
+            "confidence": "n/a",
+            "prediction": {"text": 7, "confidence": "high"},
+            "event_to_record": {"summary": 1, "type": ["t"], "impact": {"i": 2}},
+            "outcome_to_record": {"summary": 3, "impact": {"x": 1}, "event_id": 4},
+            "commitment": {"what": 5, "deadline": ["2026-08-01"]},
+            "session_record": {"focus": 6, "outcomes_list": 7},
+            "new_goal": {"title": 8, "description": 9, "rationale": 10,
+                         "gap_reference": 11, "verification_criteria": 12,
+                         "priority": "high"},
+            "goal_action": {"goal_id": 13, "new_status": ["active"], "note": {"n": 1}},
+            "episodic_record": {"mtype": 14, "summary": {"s": 1}, "details": 15,
+                                "salience": "high"},
+            "semantic_record": {"topic": 16, "fact": 17, "source": {"src": 1},
+                                "confidence": "n/a"},
+            "procedural_record": {"pattern": 18, "trigger": {"t": 1},
+                                  "procedure": ["p"]},
+            "plan_action": {"step_id": 19, "new_status": ["complete"], "note": 20},
+            "new_plan": {"goal": 21, "verification": {"v": 1}, "steps": 22},
+        }
+        td._coerce_llm_response_fields(parsed)  # must not raise
+        state = {
+            "timeline": {"version": 1, "past": {}, "present": {}, "future": {}},
+            "self_model": {"version": 1, "identity": {}, "state": {},
+                           "capabilities": {}, "commitments": {}},
+            "orientation": None,
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+            "world_model": None,
+        }
+        updates = td._apply_insights(parsed, state)  # must not raise
+        tl = updates.get("timeline", {})
+        for ev in tl.get("past", {}).get("events", []):
+            assert isinstance(ev["summary"], str), ev
+            assert isinstance(ev["type"], str), ev
+        for oc in tl.get("past", {}).get("outcomes", []):
+            assert isinstance(oc["summary"], str), oc
+            assert isinstance(oc["event_id"], str), oc
+        for cm in tl.get("present", {}).get("commitments", []):
+            assert isinstance(cm["what"], str), cm
+        for pr in tl.get("future", {}).get("predictions", []):
+            assert isinstance(pr["text"], str), pr
+        # A poisoned plan must not have been created as the active plan.
+        assert not any(
+            p.get("status") == "active"
+            for p in tl.get("future", {}).get("plans", [])
+        )
+
+
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).
 

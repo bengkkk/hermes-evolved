@@ -2202,10 +2202,16 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                 if _v is not None and not isinstance(_v, str):
                     _r[_fld] = str(_v).strip()
             _ol = _r.get("outcomes_list")
-            if _ol is not None and not isinstance(_ol, list):
+            if not isinstance(_ol, list):
                 # A single scalar outcome is wrapped into a one-item list;
-                # empty/non-list values degrade to [] so the timeline's
-                # completed_sessions.outcomes stays a clean list.
+                # empty/null/non-list values degrade to [] so the timeline's
+                # completed_sessions.outcomes stays a clean list. (None is
+                # NOT preserved here: ``_apply_insights`` persists
+                # ``sess.get("outcomes_list", [])`` verbatim and
+                # ``data_layer.format_timeline_context`` calls
+                # ``len(recent_session.get("outcomes", []))`` on it — a
+                # persisted None would TypeError at timeline-brief time,
+                # the same crash class this choke point exists to kill.)
                 _r["outcomes_list"] = [str(_ol)] if _ol else []
 
     # The same bug class extends to the goal and memory record blocks,
@@ -2272,11 +2278,13 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                 if _v is not None and not isinstance(_v, str):
                     _r[_fld] = str(_v).strip()
             _st = _r.get("steps")
-            if _st is not None and not isinstance(_st, list):
-                # A non-list steps (int/bool/dict/str) either crashes the
-                # comprehension or iterates garbage; degrade to [] so the
+            if not isinstance(_st, list):
+                # A non-list steps (int/bool/dict/str/None) either crashes
+                # the comprehension or iterates garbage; degrade to [] so the
                 # plan is safely rejected as having no real steps instead
-                # of killing the cycle.
+                # of killing the cycle. None is not preserved — the
+                # ``new_plan`` guard in _apply_insights reads
+                # ``np.get("steps")`` and expects a list-shaped value.
                 _r["steps"] = []
 
 
