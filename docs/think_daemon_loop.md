@@ -179,13 +179,13 @@ never deletes from. Four touchpoints connect the cycle to the goal system:
    (line 273), so a plan with no actionable content can never re-enter the
    prompt as an active plan and drive a deliberation-fixation loop.
 2. **Goal reconciliation (cycle step 11)** — `_reconcile_goals_with_world`
-   (line 2983) auto-completes goals whose verification conditions are met
+   (line 2986) auto-completes goals whose verification conditions are met
    by world-model evidence, so finished work is retired without an LLM.
 3. **Goal auto-activation (cycle step 12)** — `_auto_activate_goals`
-   (line 3182) promotes proposed goals to active when capacity exists,
+   (line 3185) promotes proposed goals to active when capacity exists,
    closing the Gap 4 → Gap 8 loop without waiting for the LLM to set
    `goal_action` in its JSON.
-4. **Outage-path goal creation** — `_local_analysis` (line 2569) converts
+4. **Outage-path goal creation** — `_local_analysis` (line 2572) converts
    the top world-model improvement suggestion into a goals.json entry
    (deduplicated against existing active goals), so even LLM-outage cycles
    keep the goal store evolving.
@@ -324,6 +324,14 @@ same way.
   (2026-07-31 23:02) — the ≥3 extended-outage tier (0-attempt skip +
   every-4th-cycle 90 s probe) engages at tick 297 by design; recovery
   detection is expected within 4 cycles of the provider returning.
+  **Observed through tick 303 (2026-08-01 00:49):** the outage deepened to
+  10 consecutive fallback cycles — the longest continuous outage recorded.
+  The extended-outage tier has now run for 7+ cycles (297→303); the
+  periodic probes at ticks 297 and 301 both failed, confirming the tier is
+  working as designed (cycle budget preserved for local analysis + action
+  execution instead of dead LLM time) and that the provider had not yet
+  recovered. The next probe fires at tick 305. Cycles 301–303 were pure
+  local-analysis + action-execution cycles per daemon_state/last_output.
 - **Daemon code drift (auto-restart working, observed 22:28)**: the daemon
   drifted 83618253f → feb075dde and `_schedule_drift_restart` auto-restarted
   it; `daemon_state.startup_head = feb075dde`, `code_drift = null` as of
