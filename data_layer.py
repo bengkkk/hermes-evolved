@@ -36,7 +36,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -901,6 +901,28 @@ class Goals:
                     )
                     return existing_id
 
+        # No ACTIVE duplicate — but a recently-completed goal with the same
+        # objective means this is a re-spam, not a new goal. The LLM
+        # re-proposes the same goal every cycle while the triggering
+        # discrepancy keywords keep appearing in the world model, and since
+        # the previous instance is 'completed' (invisible to the active-only
+        # check above), each cycle used to create a fresh duplicate
+        # (observed 2026-08-01: 5 identical 'Investigate shell prediction
+        # failures' goals in 65 minutes). Return the completed goal's ID and
+        # skip creation — the objective was already investigated. The goal
+        # is NOT resurrected: callers that later activate by ID would need
+        # to do so explicitly, and the daemon's proposal path never does.
+        completed_id = self._find_recently_completed_goal(
+            title, gap_reference
+        )
+        if completed_id is not None:
+            logger.info(
+                "Suppressed duplicate goal proposal %r — recently completed "
+                "goal %s already covers this objective",
+                title[:60], completed_id,
+            )
+            return completed_id
+
         global _goals_id_counter
         goal_id = f"goal_{now_compact()}_{_goals_id_counter}"
         _goals_id_counter += 1
@@ -951,23 +973,85 @@ class Goals:
     ) -> Optional[str]:
         """Check if a goal with a similar title already exists and is active.
 
+        Delegates to ``_similar_goal_id`` restricted to active statuses.
+        """
+        return self._similar_goal_id(
+            title, gap_reference, {"proposed", "active", "in_progress"}
+        )
+
+    def _find_recently_completed_goal(
+        self,
+        title: str,
+        gap_reference: str = "",
+        window_hours: float = 24.0,
+    ) -> Optional[str]:
+        """Return a recently-completed goal with a similar title, if any.
+
+        Suppresses re-proposals of objectives that were already handled:
+        the LLM re-proposes the same goal every cycle while the triggering
+        discrepancy keywords keep appearing in the world model, and since
+        the previous instance is ``completed`` (invisible to the
+        active-only dedup), each cycle previously created a fresh duplicate
+        (observed 2026-08-01: 5 identical "Investigate shell prediction
+        failures" goals in 65 minutes, all gap_reference="6").
+
+        Two tiers (see ``_similar_goal_id``):
+          - Near-exact titles (>0.85 similarity) are always treated as
+            duplicates — a verbatim re-proposal is an LLM loop, so the
+            completed goal stays the single record of that objective.
+          - Reworded variants are suppressed only within ``window_hours``
+            of completion; after the window a re-investigation of a
+            recurring problem is legitimate and gets a fresh goal.
+        """
+        return self._similar_goal_id(
+            title,
+            gap_reference,
+            {"completed"},
+            completed_within_hours=window_hours,
+        )
+
+    def _similar_goal_id(
+        self,
+        title: str,
+        gap_reference: str = "",
+        statuses: Optional[set] = None,
+        completed_within_hours: Optional[float] = None,
+    ) -> Optional[str]:
+        """Find a goal with a similar title among goals in ``statuses``.
+
         Uses word-token overlap (Jaccard similarity on significant words).
         A match requires:
-          - The existing goal is NOT completed or abandoned
+          - The existing goal's status is in ``statuses``
           - Word overlap > 0.5 (or one title contains the other's words)
           - A shared gap_reference, OR the gap is the same general area
 
+        When ``completed_within_hours`` is set (completed-goal dedup), the
+        recency rule is:
+          - Near-exact titles (similarity > 0.85) always suppress — the
+            LLM is re-proposing the same objective verbatim (a loop), so
+            the completed goal stays the single record of it regardless
+            of how long ago it finished.
+          - Reworded variants (0.35-0.85) suppress only if completed
+            within the window — after that a re-investigation of a
+            recurring problem is legitimate and gets a fresh goal.
+
         Returns the existing goal ID, or None if no duplicate exists.
         """
+        statuses = statuses or {"proposed", "active", "in_progress"}
         proposed_words = self._extract_significant_words(title)
         if not proposed_words:
             return None
 
         proposed_gap = _coerce_stripped_str(gap_reference)
-        ACTIVE_STATUSES = {"proposed", "active", "in_progress"}
+
+        cutoff = None
+        if completed_within_hours is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                hours=completed_within_hours
+            )
 
         for g in self.data.get("goals", []):
-            if g.get("status") not in ACTIVE_STATUSES:
+            if g.get("status") not in statuses:
                 continue
 
             existing_words = self._extract_significant_words(
@@ -983,6 +1067,7 @@ class Goals:
             union = proposed_words | existing_words
             similarity = len(intersection) / max(len(union), 1)
 
+            matched = False
             if similarity > 0.5:
                 # Strong word overlap → match regardless of gap reference,
                 # BUT only when both titles have enough significant words
@@ -995,13 +1080,13 @@ class Goals:
                 # deduplication while still catching the real spam case
                 # (LLM-rephrased variants of a long goal title).
                 if len(proposed_words) >= 3 and len(existing_words) >= 3:
-                    return g.get("id")
+                    matched = True
                 # Short titles: require same gap reference to deduplicate
-                if proposed_gap and existing_gap and proposed_gap == existing_gap:
-                    return g.get("id")
-                # Still allow the similarity > 0.35 check below to apply
+                elif proposed_gap and existing_gap and proposed_gap == existing_gap:
+                    matched = True
+                # else: fall through to the >0.35 check below
 
-            if similarity > 0.35:
+            if not matched and similarity > 0.35:
                 # Moderate overlap + same gap reference → match (catches
                 # reworded variants of the same objective, e.g.
                 # "Integrate goal lifecycle into think_daemon" vs
@@ -1011,7 +1096,29 @@ class Goals:
                     or proposed_gap.split("—")[0].strip()
                     == existing_gap.split("—")[0].strip()
                 ):
-                    return g.get("id")
+                    matched = True
+
+            if not matched:
+                continue
+
+            # Recency gate for completed-goal dedup: near-exact titles are
+            # always treated as duplicates (LLM loop); reworded variants
+            # must fall inside the completion window. Ambiguous legacy
+            # timestamps (missing/unparseable) never suppress.
+            if cutoff is not None and similarity <= 0.85:
+                completed_at = g.get("completed_at")
+                if not completed_at:
+                    continue  # ambiguous legacy data — do not suppress
+                try:
+                    parsed = datetime.fromisoformat(str(completed_at))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue  # unparseable timestamp — do not suppress
+                if parsed < cutoff:
+                    continue  # completed too long ago — re-proposal is legitimate
+
+            return g.get("id")
 
         return None
 

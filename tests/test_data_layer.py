@@ -20,7 +20,7 @@ import json
 import os
 import sys
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
@@ -694,6 +694,88 @@ class TestGoals:
         gid2 = g.propose("Refactor daemon loop", "Desc2", gap_reference="8")
         assert gid2 == gid1
         assert len(g.data["goals"]) == 1
+
+    def test_propose_suppresses_recently_completed_duplicate(self) -> None:
+        """A proposal matching a recently-completed goal is suppressed, not
+        duplicated.
+
+        Regression for the 5 identical 'Investigate shell prediction
+        failures' goals observed 2026-08-01: the active-only dedup missed
+        completed goals, so every cycle re-created the same objective the
+        moment the previous instance was completed. The re-proposal must
+        return the existing goal's ID without adding a new goal, and must
+        NOT resurrect the completed goal.
+
+        Near-exact titles suppress regardless of age (an identical
+        verbatim re-proposal is an LLM loop, not a new investigation), so
+        this holds even when the completion is far outside the window.
+        """
+        g = Goals()
+        title = (
+            "Investigate shell prediction failures "
+            "(keywords: auto-default, sibling, dirs)"
+        )
+        gid1 = g.propose(title, "Desc")
+        g.update_status(gid1, "completed")
+        assert len(g.data["goals"]) == 1
+
+        gid2 = g.propose(title, "Desc again")
+        assert gid2 == gid1                       # same objective → same reference
+        assert len(g.data["goals"]) == 1          # no new goal created
+        assert g.data["goals"][0]["status"] == "completed"  # not resurrected
+
+        # Same verbatim title proposed much later is still a loop, not a
+        # new investigation.
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        g.data["goals"][0]["completed_at"] = old
+        gid3 = g.propose(title, "Desc once more")
+        assert gid3 == gid1
+        assert len(g.data["goals"]) == 1
+
+    def test_propose_suppresses_reworded_variant_within_window(self) -> None:
+        """A reworded variant (moderate overlap) is suppressed only while
+        the completed goal is inside the recency window."""
+        g = Goals()
+        original = (
+            "Investigate shell prediction failures "
+            "(keywords: auto-default, sibling, dirs)"
+        )
+        gid1 = g.propose(original, "Desc", gap_reference="6")
+        g.update_status(gid1, "completed")
+        # Completed 1h ago → inside the 24h window.
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        g.data["goals"][0]["completed_at"] = recent
+
+        variant = (
+            "Investigate recurring shell action failures "
+            "in auto-default commands"
+        )
+        gid2 = g.propose(variant, "Desc again", gap_reference="6")
+        assert gid2 == gid1
+        assert len(g.data["goals"]) == 1
+
+    def test_propose_allows_after_completion_window(self) -> None:
+        """A reworded variant after the 24h suppression window is a
+        legitimate new investigation of a recurring problem → a fresh goal
+        is created."""
+        g = Goals()
+        original = (
+            "Investigate shell prediction failures "
+            "(keywords: auto-default, sibling, dirs)"
+        )
+        gid1 = g.propose(original, "Desc", gap_reference="6")
+        g.update_status(gid1, "completed")
+        # Backdate completion beyond the 24h suppression window.
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        g.data["goals"][0]["completed_at"] = old
+
+        variant = (
+            "Investigate recurring shell action failures "
+            "in auto-default commands"
+        )
+        gid2 = g.propose(variant, "Desc again", gap_reference="6")
+        assert gid2 != gid1
+        assert len(g.data["goals"]) == 2
 
     def test_update_status_valid(self) -> None:
         g = Goals()
