@@ -1455,6 +1455,69 @@ class WorldModel:
             }
         self.data["per_type_accuracy"] = result
 
+    def _recompute_stale_triple_errors(self) -> int:
+        """Re-score completed triples with the current error scorer.
+
+        ``prediction_error`` is written into the triple at completion
+        time and later read back verbatim by ``_update_per_type_accuracy``
+        and ``_update_accuracy_stats`` — so triples recorded under an
+        older scorer keep their stale scores forever and poison the
+        calibration stats derived from them.  Concrete case (2026-08-01):
+        the first live api_call triple stored error 0.5 because the
+        mutual HTTP-status heuristic did not exist yet; the current
+        scorer returns 0.15 for the same expected/actual pair, but the
+        stored 0.5 kept ``per_type_accuracy.api_call.avg_error`` at 0.5
+        and made the Gap 10 calibration target (avg error < 0.3)
+        unreachable even for a *correct* prediction.
+
+        Deterministic re-scoring is idempotent (same inputs → same
+        score), so this converges in one pass.  Triples with empty
+        expected or actual (nothing to score) are left untouched.
+
+        Returns the number of triples whose stored error changed.
+        """
+        changed = 0
+        for t in self.data.get("action_triples", []):
+            if not t.get("completed") or t.get("prediction_error") is None:
+                continue
+            expected = t.get("expected_outcome")
+            actual = t.get("actual_outcome")
+            if not isinstance(expected, str) or not isinstance(actual, str):
+                continue
+            if not expected.strip() or not actual.strip():
+                continue
+            fresh = _compute_prediction_error(expected, actual)
+            stored = t.get("prediction_error")
+            if not isinstance(stored, (int, float)) or abs(
+                fresh - float(stored)
+            ) > 1e-9:
+                t["prediction_error"] = fresh
+                changed += 1
+        if changed:
+            # The rolling error window and aggregate stats hold stale
+            # scores too — rebuild them from the re-scored triples so
+            # trend, per-type, and aggregate calibration all agree.
+            self._rebuild_error_history_from_triples()
+            self._update_accuracy_stats()
+        return changed
+
+    def _rebuild_error_history_from_triples(self) -> None:
+        """Rebuild the rolling error window from re-scored triples.
+
+        Called by :meth:`_recompute_stale_triple_errors` when stored
+        errors were corrected, so the trend computation sees the same
+        scores the per-type calibration sees.
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        completed = [
+            t for t in self.data.get("action_triples", [])
+            if t.get("completed") and t.get("prediction_error") is not None
+        ]
+        completed.sort(
+            key=lambda t: t.get("completed_at") or t.get("timestamp") or ""
+        )
+        acc["error_history"] = [t["prediction_error"] for t in completed[-20:]]
+
     # ── Discrepancy pattern detection (Gap 6) ────────────────────
 
     def _update_discrepancy_patterns(
@@ -2326,6 +2389,11 @@ class WorldModel:
         target = path or cls.storage_path()
         data = safe_read_json(target)
         result = cls(data=data) if isinstance(data, dict) else cls()
+        # Re-score triples recorded under older error scorers so the
+        # calibration stats computed below reflect the current scorer
+        # (e.g. the first api_call triple stored 0.5 before the mutual
+        # HTTP-status heuristic existed; the current scorer says 0.15).
+        result._recompute_stale_triple_errors()
         # Recompute computed fields (per-type accuracy) after load
         # to avoid stale cache until the next action is completed.
         result._update_per_type_accuracy()

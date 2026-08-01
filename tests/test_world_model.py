@@ -1589,6 +1589,97 @@ class TestPersistence:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  Stale triple error migration
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestStaleTripleErrorMigration:
+    """Re-scoring stored triples when the error scorer evolves.
+
+    prediction_error is written at completion time and read back
+    verbatim by the calibration stats, so triples recorded under an
+    older scorer keep stale scores forever.  load() must re-score them
+    with the current _compute_prediction_error so per-type / aggregate
+    calibration reflects the current scorer.
+    """
+
+    def _stale_api_call_data(self):
+        """First live GitHub read (2026-08-01 19:06:55Z) scored 0.5
+        before the mutual HTTP-status heuristic existed."""
+        return {
+            "version": 1,
+            "action_triples": [{
+                "id": "act_stale_api_1",
+                "action_type": "api_call",
+                "action_description": "first live GitHub read",
+                "expected_outcome": (
+                    "HTTP 200: JSON body listing GitHub API endpoint "
+                    "fields (current_user_url, repository_url, etc.)"
+                ),
+                "actual_outcome": (
+                    'exit=0: {"status": 200, "bytes": 2262, "body": '
+                    '"{\\"current_user_url\\":\\"https://api.github.com/user\\",...}"}'
+                ),
+                "prediction_error": 0.5,
+                "prediction_confidence": 0.65,
+                "timestamp": "2026-08-01T19:06:55.024506+00:00",
+                "completed": True,
+                "completed_at": "2026-08-01T19:06:55.383513+00:00",
+            }],
+            "predictions": [],
+            "discrepancy_patterns": [],
+            "prediction_accuracy": {
+                "total_triples": 1,
+                "avg_triple_error": 0.5,
+                "error_history": [0.5],
+            },
+        }
+
+    def test_load_rescores_stale_api_call_triple(self, tmp_path):
+        """Stored 0.5 → current scorer 0.15, and every derived stat
+        (per-type avg, aggregate avg, error window) follows."""
+        wm = WorldModel(data=self._stale_api_call_data())
+        path = tmp_path / "wm_stale.json"
+        wm.save(path)
+
+        loaded = WorldModel.load(path)
+        triple = loaded.data["action_triples"][0]
+        assert triple["prediction_error"] == pytest.approx(0.15, abs=0.01)
+        assert loaded.get_per_type_accuracy()["api_call"]["avg_error"] == (
+            pytest.approx(0.15, abs=0.01)
+        )
+        acc = loaded.data["prediction_accuracy"]
+        assert acc["avg_triple_error"] == pytest.approx(0.15, abs=0.01)
+        assert acc["error_history"] == [pytest.approx(0.15, abs=0.01)]
+
+    def test_recompute_is_idempotent(self):
+        """Deterministic re-scoring converges in one pass."""
+        wm = WorldModel(data=self._stale_api_call_data())
+        assert wm._recompute_stale_triple_errors() == 1
+        assert wm._recompute_stale_triple_errors() == 0
+        assert wm.data["action_triples"][0]["prediction_error"] == (
+            pytest.approx(0.15, abs=0.01)
+        )
+
+    def test_recompute_skips_triples_without_scoreable_text(self):
+        """Empty actual_outcome (nothing to score) must keep stored error."""
+        data = self._stale_api_call_data()
+        data["action_triples"][0]["actual_outcome"] = ""
+        wm = WorldModel(data=data)
+        assert wm._recompute_stale_triple_errors() == 0
+        assert wm.data["action_triples"][0]["prediction_error"] == 0.5
+
+    def test_recompute_leaves_fresh_errors_untouched(self):
+        """Triples already scored under the current scorer: no churn."""
+        wm = WorldModel()
+        wm.record_action_complete("shell", "test", "exit=0: ok", "should exit 0")
+        assert wm._recompute_stale_triple_errors() == 0
+        assert wm.data["action_triples"][0]["prediction_error"] == (
+            pytest.approx(0.15, abs=0.01)
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  Edge cases & stress
 # ══════════════════════════════════════════════════════════════════════
 
