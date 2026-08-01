@@ -1785,6 +1785,43 @@ def _action_params_from_act(act: Dict[str, Any], atype: str) -> Dict[str, Any]:
     return params
 
 
+def _build_prediction_feedback_line(
+    wm: Optional[WorldModel],
+    triple_id: Optional[str],
+    pred_err: Optional[float],
+    actual_text: str,
+) -> str:
+    """Build the ``[PREDICTION ...]`` feedback line for an action's outcome.
+
+    Returns ``""`` when there is nothing to report (no triple id, no error,
+    or no expected-outcome text).  The same helper serves the success path
+    AND the failure/timeout paths so the LLM always sees expected-vs-actual
+    — including when the action itself failed, which is precisely when
+    calibration feedback matters most.
+    """
+    if wm is None or not triple_id or pred_err is None:
+        return ""
+    expected_text = ""
+    for _t in wm.data.get("action_triples", []):
+        if _t.get("id") == triple_id:
+            expected_text = _t.get("expected_outcome", "") or ""
+            break
+    if not expected_text:
+        return f"[PREDICTION] error={pred_err:.2f} (no expected_outcome set)"
+    actual_preview = (actual_text or "(no output)")[:100]
+    exp_preview = expected_text[:80]
+    if pred_err <= 0.3:
+        icon = "✓"
+    elif pred_err <= 0.6:
+        icon = "△"
+    else:
+        icon = "✗"
+    return (
+        f"[PREDICTION {icon}] error={pred_err:.2f}: "
+        f'expected "{exp_preview}" → "{actual_preview}"'
+    )
+
+
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
     tl = state.get("timeline", load_timeline())
@@ -2234,15 +2271,9 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 
             # ── World Model: complete action with actual outcome ──
             _pred_err = None
-            _expected_text = ""
             if triple_id and wm is not None:
                 actual_for_wm = action_output if action_output else "(no output)"
                 _pred_err = wm.complete_action(triple_id, actual_for_wm)
-                # Retrieve the triple to get the expected-outcome text for feedback
-                for _t in wm.data.get("action_triples", []):
-                    if _t.get("id") == triple_id:
-                        _expected_text = _t.get("expected_outcome", "") or ""
-                        break
 
             # Build output for next cycle's prompt (guidance + prediction feedback + outcome)
             combined_output = ""
@@ -2251,21 +2282,11 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             # ── Prediction comparison feedback ──
             # Tell the LLM what it predicted vs what actually happened, closing the
             # world-model learning loop so it can calibrate its expectations.
-            if _pred_err is not None and _expected_text:
-                _actual_preview = (action_output or "(no output)")[:100]
-                _exp_preview = _expected_text[:80]
-                if _pred_err <= 0.3:
-                    _icon = "✓"
-                elif _pred_err <= 0.6:
-                    _icon = "△"
-                else:
-                    _icon = "✗"
-                combined_output += (
-                    f"[PREDICTION {_icon}] error={_pred_err:.2f}: "
-                    f"expected \"{_exp_preview}\" → \"{_actual_preview}\"\n"
-                )
-            elif _pred_err is not None:
-                combined_output += f"[PREDICTION] error={_pred_err:.2f} (no expected_outcome set)\n"
+            _feedback_line = _build_prediction_feedback_line(
+                wm, triple_id, _pred_err, action_output or "(no output)"
+            )
+            if _feedback_line:
+                combined_output += _feedback_line + "\n"
             if action_output:
                 combined_output += action_output
             if combined_output:
@@ -2278,13 +2299,28 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
             _add_ep("action", "Action timed out: " + atype, desc)
             # Record timeout as outcome
             if triple_id and wm is not None:
-                wm.complete_action(triple_id, f"TIMEOUT: {atype}")
+                _pred_err = wm.complete_action(triple_id, f"TIMEOUT: {atype}")
+                # Close the prediction loop for failures too — the LLM must
+                # see expected-vs-actual when the action timed out, not only
+                # when it succeeded.
+                _feedback_line = _build_prediction_feedback_line(
+                    wm, triple_id, _pred_err, f"TIMEOUT: {atype}"
+                )
+                if _feedback_line:
+                    ds["last_action_output"] = _feedback_line
         except Exception as e:
             logger.warning("Action %s failed: %s", atype, e)
             _add_ep("action", "Action failed: " + atype, str(e)[:200])
             # Record failure as outcome
             if triple_id and wm is not None:
-                wm.complete_action(triple_id, f"FAILED: {e!s}")
+                _pred_err = wm.complete_action(triple_id, f"FAILED: {e!s}")
+                # Same as the timeout path: surface expected-vs-actual so the
+                # next prompt can calibrate against the failure.
+                _feedback_line = _build_prediction_feedback_line(
+                    wm, triple_id, _pred_err, f"FAILED: {e!s}"
+                )
+                if _feedback_line:
+                    ds["last_action_output"] = _feedback_line
         finally:
             # World model changes (memory is saved inline by add_* functions)
             if wm is not None:

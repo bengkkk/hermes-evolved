@@ -1683,6 +1683,154 @@ class TestActionDedupGate:
         # The output should contain our mocked 'exit=0: mocked' text
         assert "exit=0" in last_output or not last_output, f"Unexpected output: {last_output[:100]}"
 
+    def test_failed_action_sets_prediction_feedback(self, evolve_env: Dict) -> None:
+        """A shell action that fails must still close the prediction loop.
+
+        The LLM needs expected-vs-actual feedback for FAILED actions too —
+        otherwise failures silently skip the [PREDICTION] comparison and the
+        next prompt never sees why its prediction was wrong (the exact
+        moment calibration feedback matters most).
+        """
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        ds = {"tick_count": 5, "last_action_output": ""}
+
+        result = {
+            "action": {
+                "type": "shell",
+                "command": "python3 -c 'print(1)'",
+                "description": "Run a harmless python one-liner",
+                "expected_outcome": "exit=0: 1",
+            },
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": ds,
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _boom(*a, **kw):
+                raise RuntimeError("boom")
+
+            subprocess.run = _boom
+            td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        last_output = ds.get("last_action_output", "")
+        assert "[PREDICTION" in last_output, (
+            f"No prediction feedback written for failed action: {last_output!r}"
+        )
+        assert "FAILED: boom" in last_output, (
+            f"Failure outcome missing from feedback: {last_output!r}"
+        )
+        assert "exit=0: 1" in last_output, (
+            f"Expected-outcome text missing from feedback: {last_output!r}"
+        )
+
+        # The triple must be completed with the failure as the actual outcome
+        completed = [t for t in wm.data.get("action_triples", []) if t.get("actual_outcome")]
+        assert completed, "No completed action triple recorded"
+        assert completed[-1]["actual_outcome"] == "FAILED: boom", completed[-1]
+
+    def test_timed_out_action_sets_prediction_feedback(self, evolve_env: Dict) -> None:
+        """A timed-out shell action must also produce prediction feedback."""
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        ds = {"tick_count": 5, "last_action_output": ""}
+
+        result = {
+            "action": {
+                "type": "shell",
+                "command": "sleep 999",
+                "description": "Sleep forever (will time out)",
+                "expected_outcome": "exit=0: sleep completes",
+            },
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": ds,
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _hang(*a, **kw):
+                raise subprocess.TimeoutExpired(cmd="sleep 999", timeout=60)
+
+            subprocess.run = _hang
+            td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        last_output = ds.get("last_action_output", "")
+        assert "[PREDICTION" in last_output, (
+            f"No prediction feedback written for timed-out action: {last_output!r}"
+        )
+        assert "TIMEOUT: shell" in last_output, (
+            f"Timeout outcome missing from feedback: {last_output!r}"
+        )
+
     def test_unique_action_not_overridden(self, evolve_env: Dict) -> None:
         """New action types not matching recent triples should pass through."""
         td = evolve_env["module"]
