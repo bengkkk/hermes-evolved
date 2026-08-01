@@ -735,6 +735,35 @@ class TestBuildThinkingPrompt:
         prompt = td._build_thinking_prompt(self._make_state())
         assert "Gap 6" in prompt
 
+    def test_prompt_includes_live_root_note(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        prompt = td._build_thinking_prompt(self._make_state())
+        assert "Live code root" in prompt
+        assert td._WORKSPACE_ROOT_STR in prompt
+
+    def test_live_root_note_flags_stale_copy(
+        self, evolve_env: Dict, tmp_path: Any
+    ) -> None:
+        td = evolve_env["module"]
+        stale = tmp_path / "stale-deploy"
+        stale.mkdir()
+        note = td._live_root_prompt_note(
+            td._WORKSPACE_ROOT, stale_candidates=(str(stale),)
+        )
+        assert "Stale copies exist" in note
+        assert str(stale) in note
+        # Missing candidate dir → no stale warning.
+        note2 = td._live_root_prompt_note(
+            td._WORKSPACE_ROOT,
+            stale_candidates=(str(tmp_path / "does-not-exist"),),
+        )
+        assert "Stale copies exist" not in note2
+        # Workspace root itself is never flagged as stale.
+        note3 = td._live_root_prompt_note(
+            td._WORKSPACE_ROOT, stale_candidates=(td._WORKSPACE_ROOT_STR,)
+        )
+        assert "Stale copies exist" not in note3
+
     def test_prompt_with_events(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         state = self._make_state()

@@ -872,6 +872,44 @@ def _format_goal_evidence(
     return ""
 
 
+def _live_root_prompt_note(
+    workspace_root: Path,
+    stale_candidates: tuple[str, ...] = ("/opt/hermes-evolved",),
+) -> str:
+    """Build the "live code root" directive injected into every thinking prompt.
+
+    Multiple copies of this project have existed over time — e.g. a stale
+    deployment snapshot at /opt/hermes-evolved from 2026-07-30 that predates
+    the world-model + retry/budget integration.  The daemon once wasted cycles
+    grepping that stale copy for retry/budget code and concluded — wrongly —
+    that the integration was missing (recorded as 0.15-error triples on
+    2026-08-01, but the miss was a wrong-copy artifact, not a code gap).
+    Stating the authoritative root every cycle keeps searches and patches
+    aimed at the live tree.
+
+    Pure and dependency-injected so tests can exercise the stale-copy branch
+    with temp directories regardless of what exists on the host.
+    """
+    note = (
+        f"  ℹ Live code root: {workspace_root} (auto-detected from the running\n"
+        "    script's own location — the authoritative git repo where all\n"
+        "    evolve commits land)."
+    )
+    stale = [
+        c for c in stale_candidates
+        if Path(c).is_dir() and str(Path(c)) != str(workspace_root)
+    ]
+    if stale:
+        note += (
+            "\n    ⚠ Stale copies exist — do NOT grep/patch these as if they\n"
+            "    were the live code: " + ", ".join(stale) + ". They predate the\n"
+            "    world-model + retry/budget integration, so finding no\n"
+            "    retry/budget code there does NOT mean the integration is\n"
+            "    missing."
+        )
+    return note
+
+
 def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     """Build a self-reflection prompt from current evolve state."""
     tl = state.get("timeline", {})
@@ -1107,6 +1145,9 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         "    finding files that don't exist."
     )
     orientation_context += "\n" + orient_prompt_note
+
+    # ── Live code root directive (prevents grepping stale deployment copies) ──
+    orientation_context += "\n" + _live_root_prompt_note(_WORKSPACE_ROOT)
 
     # ── Daemon health (failure diagnostics for the LLM) ──
     history = ds.get("cycle_history", [])
