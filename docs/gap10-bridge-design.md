@@ -133,6 +133,19 @@ not an assistant.
    (expected 2xx + observed 2xx → 0.15; hundreds-digit class match so a
    predicted 200 vs observed 404 still falls through). Recomputed error
    for the stored triple: 0.5 → 0.15. 211 world-model + daemon tests pass.)
+   CALIBRATION STATUS 2026-08-01 23:55Z: 1/3 api_call triples recorded
+   (avg_error 0.15, already below the 0.3 milestone bar). The daemon was
+   observed looping on COMPLETED Gap 8 work instead of firing api_call
+   (repeated stale insights "remaining Gap 8 work is telemetry", next_gap=8,
+   actions=[] across many cycles) — root cause: stale injected guidance
+   (orientation.json next_steps/insights + self_model remaining_gaps) had
+   never been updated after the retry/budget telemetry landed (commits
+   6c8480add, 662e5a7ee), and the injected next_steps[-3:] self-reinforce
+   because focus "continue current" never appends replacement steps
+   (think_daemon.py:2895-2897). Fix: guidance state corrected to point at
+   Gap 10 calibration (orientation focus/next_steps + self_model
+   remaining_gaps=["10"]). Lesson: close guidance state the moment a
+   milestone commits, or the loop parrots the stale plan indefinitely.)
 5. ✅ Commit + update self-model state (DONE 2026-08-01 — live triple
    validated, scoring fixed, unknown_areas resolved: api_call IS wired into
    the action loop and gated by allowlist + permission registry; outcomes
