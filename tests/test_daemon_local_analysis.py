@@ -568,7 +568,7 @@ class TestLlmRetryPolicyBudget:
         assert _llm_retry_policy(1) == (1, 60.0)      # warm outage
         assert _llm_retry_policy(2) == (1, 45.0)      # deep outage
         assert _llm_retry_policy(3) == (0, 0.0)       # extended outage: skip
-        assert _llm_retry_policy(4) == (1, 90.0)      # every-4th probe
+        assert _llm_retry_policy(4) == (1, 90.0)      # every-2nd probe (even depth, since 2026-08-01)
         assert _llm_retry_policy(7) == (0, 0.0)       # non-probe skip
 
     def test_default_budget_clamps_healthy_tier(self) -> None:
