@@ -420,3 +420,123 @@ class TestBridgeProofGoalReconciliation:
         count = _reconcile_goals_with_world(wm, goals)
         assert count == 0
         assert Goals(data=goals).get_active()[0]["id"] == "g_prove_bridge"
+
+
+class TestCrashProofAndRetryCoverageReconciliation:
+    """Auto-completion of the P4 crash-proof and P3 universal-retry goals.
+
+    These goals' verification criteria are met by *repo evidence* rather
+    than world-model stats: the coercion choke point + fuzz suite (P4) and
+    the single guarded LLM call site (P3).  The reconciler must close them
+    exactly when that evidence holds and leave them open otherwise, so the
+    daemon stops re-planning already-shipped work.
+    """
+
+    def _goal(self, gid: str, title: str) -> dict:
+        return {
+            "version": 1,
+            "goals": [
+                {
+                    "id": gid,
+                    "title": title,
+                    "description": "",
+                    "priority": 3, "status": "proposed",
+                    "gap_reference": "8",
+                    "created_at": "2026-08-01T00:00:00",
+                    "completed_at": None, "notes": "",
+                },
+            ],
+        }
+
+    # ── Rule 8: crash-proof / type-guard ──
+
+    def test_crash_proof_completes_when_choke_and_fuzz_present(self, wm_with_data):
+        """Real repo: choke point callable + fuzz class present → completes."""
+        from think_daemon import _reconcile_goals_with_world
+        goals = self._goal("g_p4", "Crash-proof daemon outcome processing")
+        count = _reconcile_goals_with_world(wm_with_data, goals)
+        assert count == 1
+        g = Goals(data=goals)
+        assert g.get_active() == []
+        assert "Auto-completed:" in g.data["goals"][0].get("notes", "")
+
+    def test_crash_proof_stays_open_without_fuzz_suite(
+        self, wm_with_data, monkeypatch, tmp_path
+    ):
+        """Fuzz test file absent → goal stays open (evidence incomplete)."""
+        import think_daemon as td
+        from think_daemon import _reconcile_goals_with_world
+        monkeypatch.setattr(td, "_WORKSPACE_ROOT", tmp_path)  # no tests/ dir here
+        goals = self._goal("g_p4", "Crash-proof daemon outcome processing")
+        count = _reconcile_goals_with_world(wm_with_data, goals)
+        assert count == 0
+        assert Goals(data=goals).get_active()[0]["id"] == "g_p4"
+
+    def test_crash_proof_stays_open_without_choke_point(self, wm_with_data, monkeypatch):
+        """Choke point missing from module globals → goal stays open."""
+        import think_daemon as td
+        from think_daemon import _reconcile_goals_with_world
+        monkeypatch.setattr(td, "_coerce_llm_response_fields", None)
+        goals = self._goal("g_p4", "Crash-proof daemon outcome processing")
+        count = _reconcile_goals_with_world(wm_with_data, goals)
+        assert count == 0
+
+    # ── Rule 9: universal retry/budget coverage ──
+
+    def _fake_daemon(self, tmp_path, raw_outside: bool) -> str:
+        """Write a fake think_daemon module and return its path.
+
+        Mirrors the P3 invariant: a ``_call_llm`` choke point that invokes
+        ``async_call_llm``, plus (when ``raw_outside``) a second raw
+        ``async_call_llm`` call outside the choke point.
+        """
+        body = (
+            "async def async_call_llm(*a, **k):\n"
+            "    return None\n"
+            "\n"
+            "async def _call_llm(messages, task='thinking'):\n"
+            "    return await async_call_llm(messages=messages, task=task)\n"
+        )
+        if raw_outside:
+            body += (
+                "\n"
+                "async def _unbudgeted_probe(messages):\n"
+                "    return await async_call_llm(messages=messages)\n"
+            )
+        p = tmp_path / "fake_think_daemon.py"
+        p.write_text(body, encoding="utf-8")
+        return str(p)
+
+    def test_retry_coverage_completes_when_all_sites_guarded(
+        self, wm_with_data, monkeypatch, tmp_path
+    ):
+        """All raw calls inside _call_llm → goal completes."""
+        import think_daemon as td
+        from think_daemon import _reconcile_goals_with_world
+        monkeypatch.setattr(
+            td, "__file__", self._fake_daemon(tmp_path, raw_outside=False)
+        )
+        goals = self._goal(
+            "g_p3", "Universal retry/budget coverage at every LLM call site"
+        )
+        count = _reconcile_goals_with_world(wm_with_data, goals)
+        assert count == 1
+        g = Goals(data=goals)
+        assert g.get_active() == []
+        assert "AST-verified" in g.data["goals"][0].get("notes", "")
+
+    def test_retry_coverage_stays_open_with_raw_site_outside(
+        self, wm_with_data, monkeypatch, tmp_path
+    ):
+        """A raw async_call_llm call outside _call_llm → goal stays open."""
+        import think_daemon as td
+        from think_daemon import _reconcile_goals_with_world
+        monkeypatch.setattr(
+            td, "__file__", self._fake_daemon(tmp_path, raw_outside=True)
+        )
+        goals = self._goal(
+            "g_p3", "Universal retry/budget coverage at every LLM call site"
+        )
+        count = _reconcile_goals_with_world(wm_with_data, goals)
+        assert count == 0
+        assert Goals(data=goals).get_active()[0]["id"] == "g_p3"

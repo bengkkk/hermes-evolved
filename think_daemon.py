@@ -3691,6 +3691,13 @@ def _reconcile_goals_with_world(
         if ``orientation.json`` exists with meaningful data (``focus`` and
         ``insights`` fields populated), since the orientation context is
         already injected into the thinking prompt every cycle.
+      - "Crash-proof ..." / "type-guard ..." goals → completed when the
+        ``_coerce_llm_response_fields`` choke point exists AND the P4 fuzz
+        suite (``TestCoerceLlmResponseFieldsFuzz``) is present in
+        ``tests/agent/test_think_daemon.py``.
+      - "Universal retry/budget coverage ..." goals → completed when an
+        AST scan shows every real ``async_call_llm`` call site lives inside
+        the retry/budget-instrumented ``_call_llm`` choke point.
       - Duplicate titles (same text, different IDs) → all but the most
         recently created one are completed.
 
@@ -3871,6 +3878,92 @@ def _reconcile_goals_with_world(
                     "with exit=0 and HTTP 2xx — external action bridge proven"
                 )
                 completed = True
+
+        # 8. "Crash-proof daemon outcome processing" (P4) → completed when
+        # the coercion choke point exists AND the P4 fuzz suite is present.
+        # The fuzz test (TestCoerceLlmResponseFieldsFuzz, added in
+        # ebbaf6fbc) feeds int/None/dict/list/bool/float poison values into
+        # every guarded field and asserts the coercion invariants hold —
+        # exactly the goal's verification criterion ("a fuzz test feeding
+        # int/None/dict values into outcome fields; zero crashes").  Without
+        # this rule the goal stayed 'in_progress' for many cycles after the
+        # code landed because the LLM kept re-planning already-shipped
+        # hardening instead of checking repo evidence.
+        if not completed and re.search(
+            r"crash[\s-]?proof|type.guard",
+            title, re.IGNORECASE,
+        ):
+            _choke_ok = callable(globals().get("_coerce_llm_response_fields"))
+            _fuzz_path = _WORKSPACE_ROOT / "tests" / "agent" / "test_think_daemon.py"
+            _fuzz_ok = False
+            try:
+                _fuzz_ok = (
+                    _fuzz_path.exists()
+                    and "class TestCoerceLlmResponseFieldsFuzz"
+                    in _fuzz_path.read_text(encoding="utf-8", errors="replace")
+                )
+            except OSError:
+                pass
+            if _choke_ok and _fuzz_ok:
+                note = (
+                    "Auto-completed: _coerce_llm_response_fields choke point "
+                    "exists and the P4 fuzz suite "
+                    "(TestCoerceLlmResponseFieldsFuzz) is present in "
+                    "tests/agent/test_think_daemon.py"
+                )
+                completed = True
+
+        # 9. "Universal retry/budget coverage at every LLM call site" (P3)
+        # → completed when an AST scan of this module shows every real
+        # async_call_llm invocation lives inside _call_llm — the single
+        # retry/budget-instrumented choke point (_set_llm_retry_policy sets
+        # the budget once per cycle; _call_llm reads it and passes the
+        # per-attempt timeout into async_call_llm).  AST Call nodes capture
+        # only real invocation sites, never import statements or comments,
+        # so a raw unbudgeted client call anywhere else in the file keeps
+        # the goal open.  A scan failure (missing ast, unreadable file) is
+        # treated as NOT satisfied — never complete on unknown evidence.
+        if not completed and re.search(
+            r"retry/budget coverage|universal.*retry",
+            title, re.IGNORECASE,
+        ):
+            try:
+                import ast as _ast
+                _self_src = Path(__file__).resolve().read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                _tree = _ast.parse(_self_src)
+                _call_llm_span = None
+                for _node in _ast.walk(_tree):
+                    if (
+                        isinstance(_node, (_ast.AsyncFunctionDef, _ast.FunctionDef))
+                        and _node.name == "_call_llm"
+                    ):
+                        _call_llm_span = (_node.lineno, _node.end_lineno)
+                        break
+                _total_raw = 0
+                _unguarded = 0
+                if _call_llm_span is not None:
+                    for _node in _ast.walk(_tree):
+                        if isinstance(_node, _ast.Call):
+                            _fn = _node.func
+                            if isinstance(_fn, _ast.Name) and _fn.id == "async_call_llm":
+                                _total_raw += 1
+                                if not (
+                                    _call_llm_span[0] <= _node.lineno <= _call_llm_span[1]
+                                ):
+                                    _unguarded += 1
+                if _call_llm_span is not None and _total_raw >= 1 and _unguarded == 0:
+                    note = (
+                        "Auto-completed: every async_call_llm call site is "
+                        "inside the retry/budget-instrumented _call_llm "
+                        "choke point (AST-verified)"
+                    )
+                    completed = True
+            except Exception:
+                # AST scan failed — leave the goal open rather than
+                # completing on unverifiable evidence.
+                pass
 
         # 7. Duplicate titles → keep the newest
         # This runs AFTER the pattern checks above so that pattern-matched
