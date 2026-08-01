@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -759,6 +760,11 @@ ACTION CAPABILITIES (Gap 10):
   - shell: run a shell command (set command)
   - git_commit: add + commit (set message)
   - install_package: pip install (set package)
+  - api_call: external read-only HTTP via the host bridge (set endpoint + method,
+    optional body). Gated deny-by-default: the endpoint MUST be allowlisted AND the
+    PERMISSIONS registry in the state snapshot MUST grant read on its resource.
+    Until a grant exists and the host bridge is running, expect "BLOCKED:" or
+    "bridge unavailable" outcomes — do not spam api_call attempts that cannot pass.
 - CRITICAL: Before every action, set "expected_outcome" to PREDICT what the output will be
   (e.g. "Written main.py (245 bytes)" or "exit=0: files listed"). The daemon compares this
   against the actual result to compute prediction error and improve future calibration.
@@ -1957,6 +1963,11 @@ def _action_params_from_act(act: Dict[str, Any], atype: str) -> Dict[str, Any]:
         params["message"] = act["message"]
     elif atype == "install_package" and act.get("package"):
         params["package"] = act["package"]
+    elif atype == "api_call":
+        if act.get("endpoint"):
+            params["endpoint"] = act["endpoint"]
+        if act.get("method"):
+            params["method"] = act["method"]
     return params
 
 
@@ -2529,6 +2540,31 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     r = subprocess.run(["pip", "install", apkg, "--break-system-packages"], capture_output=True, text=True, timeout=120)
                     action_output = "exit=" + str(r.returncode) + ": " + r.stdout[:200]
                     _add_ep("action", "Installed: " + apkg, action_output)
+            elif atype == "api_call":
+                # Gap 10 step 2: external read-only action through the host
+                # bridge. Deny-by-default pre-flight: the endpoint must match
+                # the allowlist AND the self-model permission registry must
+                # grant read on its resource. A BLOCKED outcome is still
+                # recorded into the world model (expected vs actual), so
+                # unauthorized attempts become calibration data instead of
+                # vanishing silently.
+                _sm = state.get("self_model", {})
+                _perms = (
+                    _sm.get("permissions", {})
+                    if isinstance(_sm, dict)
+                    else {}
+                )
+                _ok, _err = _validate_api_call(act, _perms)
+                if not _ok:
+                    action_output = "BLOCKED: " + _err
+                    _add_ep("action", "api_call blocked: " + _err, desc)
+                else:
+                    action_output = _execute_api_call(act)
+                    _add_ep(
+                        "action",
+                        "api_call: " + str(act.get("endpoint", ""))[:60],
+                        action_output,
+                    )
             else:
                 logger.warning("Unknown action type: %s", atype)
 
@@ -3876,6 +3912,149 @@ def _execute_shell_action(command: str, timeout: int = 60) -> str:
     r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
     rv = (r.stdout[:400] + "\n" + r.stderr[:200])[:500]
     return f"exit={r.returncode}: {rv}"
+
+
+# ── api_call action type (Gap 10 step 2) ──────────────────────────────
+# The daemon's first EXTERNAL action type. Deny-by-default, exactly like
+# the permission registry: an api_call is executed ONLY when the endpoint
+# matches the allowlist AND the self-model permission registry grants
+# ``read`` on the entry's resource. Everything else is rejected pre-flight
+# with a clear error and NO execution (design verification criterion #1:
+# "unauthorized endpoints rejected with a clear error and NO execution").
+# Execution goes through the host bridge (Gap 10 step 3) — a localhost
+# HTTP service that holds credentials; the daemon never sees them. While
+# the bridge is not stood up, real connection-refused outcomes are
+# recorded into the world model instead of pretending success, so the new
+# action type calibrates honestly from day one (the predict→execute→compare
+# loop flips these triples to successes the moment the bridge exists).
+_API_CALL_ALLOWLIST: list[Dict[str, Any]] = [
+    {
+        "method": "GET",
+        "host": "api.github.com",
+        "path_prefix": "/",
+        "resource": "github",
+    },
+]
+# Host bridge transport (design doc §3): localhost TCP + shared token.
+# The token is a SECRET and lives only in env on the daemon side — the
+# daemon forwards it to the bridge, which is the only component that
+# ever holds real credentials.
+_API_BRIDGE_URL: str = os.environ.get(
+    "HERMES_EVOLVED_BRIDGE_URL", "http://127.0.0.1:8791"
+)
+_API_BRIDGE_TOKEN: str = os.environ.get("HERMES_EVOLVED_BRIDGE_TOKEN", "")
+_API_BRIDGE_TIMEOUT: float = 30.0
+
+
+def _api_call_allowlist_entry(method: str, endpoint: str) -> Optional[Dict[str, Any]]:
+    """Return the allowlist entry matching *method* + *endpoint*, or None.
+
+    Matching is exact on method + hostname and prefix on path. A None
+    return means the endpoint is NOT allowlisted → the action is denied.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        p = urlparse(endpoint)
+    except Exception:
+        return None
+    host = (p.hostname or "").lower()
+    path = p.path or "/"
+    method = (method or "GET").upper()
+    for entry in _API_CALL_ALLOWLIST:
+        if method != entry.get("method"):
+            continue
+        if host != entry.get("host"):
+            continue
+        if not path.startswith(entry.get("path_prefix", "/")):
+            continue
+        return entry
+    return None
+
+
+def _validate_api_call(act: Dict[str, Any], permissions: Dict[str, Any]) -> tuple:
+    """Pre-flight validation for an ``api_call`` action (Gap 10 step 2).
+
+    Returns ``(ok, error)``; ``ok=False`` means the action MUST NOT be
+    executed. Two independent deny layers:
+
+      1. Endpoint allowlist — ``endpoint`` must match an allowlist entry
+         (method + host + path prefix), else rejected.
+      2. Permission registry — the entry's ``resource`` must carry a
+         truthy ``read`` flag in the self-model ``permissions`` dict
+         (mirrors ``SelfModel.check_permission`` semantics: a missing
+         resource or a False flag both deny).
+    """
+    method = str(act.get("method", "GET") or "GET")
+    endpoint = str(act.get("endpoint", "") or "")
+    if not endpoint:
+        return False, "api_call requires an 'endpoint'"
+    if not endpoint.startswith(("http://", "https://")):
+        return False, f"endpoint must be an absolute http(s) URL: {endpoint[:80]!r}"
+    entry = _api_call_allowlist_entry(method, endpoint)
+    if entry is None:
+        return False, f"endpoint not in allowlist: {method.upper()} {endpoint[:80]}"
+    resource = entry.get("resource", "")
+    granted = False
+    if isinstance(permissions, dict):
+        res_entry = permissions.get(resource)
+        granted = bool(isinstance(res_entry, dict) and res_entry.get("read"))
+    if not granted:
+        return False, f"permission denied: no read grant for resource {resource!r}"
+    return True, ""
+
+
+def _execute_api_call(act: Dict[str, Any]) -> str:
+    """Execute an allowlisted ``api_call`` through the host bridge.
+
+    POSTs a structured request to the bridge (Gap 10 step 3); the bridge
+    is the only component that touches credentials. Returns the canonical
+    world-model outcome string ``"exit=<code>: <output>"``. While no
+    bridge is listening, the real connection-refused outcome is returned
+    so the world model records an honest failure triple. Stdlib urllib
+    only — no new dependencies.
+    """
+    import json as _json
+    from urllib import request as _request
+    from urllib.error import URLError as _URLError
+
+    payload = _json.dumps(
+        {
+            "endpoint": str(act.get("endpoint", "") or ""),
+            "method": str(act.get("method", "GET") or "GET").upper(),
+            "body": act.get("body") or {},
+            "expected_outcome": str(act.get("expected_outcome", "") or ""),
+        }
+    ).encode("utf-8")
+    req = _request.Request(
+        _API_BRIDGE_URL.rstrip("/") + "/bridge/v1/exec",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    if _API_BRIDGE_TOKEN:
+        req.add_header("Authorization", "Bearer " + _API_BRIDGE_TOKEN)
+    try:
+        with _request.urlopen(req, timeout=_API_BRIDGE_TIMEOUT) as resp:
+            raw = resp.read(8192).decode("utf-8", "replace")
+            status = getattr(resp, "status", 200)
+    except _URLError as e:
+        return (
+            "exit=1: bridge unavailable "
+            f"({getattr(e, 'reason', e)}): {_API_BRIDGE_URL}"
+        )
+    except Exception as e:  # outcome string — never raise into the cycle
+        return f"exit=1: api_call failed: {e}"
+    # Structured bridge response: {exit: int, output: ...} (design doc §3)
+    try:
+        parsed = _json.loads(raw)
+        if isinstance(parsed, dict) and "exit" in parsed:
+            b_exit = int(parsed["exit"])
+            b_out = str(parsed.get("output", ""))[:400]
+            return f"exit={b_exit}: {b_out}"
+    except Exception:
+        pass
+    return f"exit={status}: {raw[:400]}"
 
 
 async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[str, Any]:

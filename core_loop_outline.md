@@ -1,7 +1,7 @@
 # think_daemon.py — Core Loop & World Model Integration Outline
 
-*Line numbers re-verified against live code root 2026-08-01 (4835 lines).*
-*File: 4835 lines (~225 KB). Module-level rotating auto-default actions begin ~line 64.*
+*Line numbers re-verified against live code root 2026-08-01 (5066 lines).*
+*File: 5066 lines (~236 KB). Module-level rotating auto-default actions begin ~line 64.*
 *Status: living document — update as the daemon evolves.*
 
 This outline maps the daemon's continuous loop and its prediction integration
@@ -13,7 +13,7 @@ future cycles can navigate the file without re-deriving its structure.
 ## 1. Entry & Process Model
 
 ```
-main() (4775)
+main() (4989)
  └─ subcommand dispatch: run | once | verify | bootstrap | status
      ├─ run    → run_daemon(interval_seconds, max_cycles)   # continuous loop
      ├─ once   → run_one_cycle()                            # single cycle
@@ -22,10 +22,10 @@ main() (4775)
      └─ status → _show_status()
 ```
 
-## 2. Continuous Loop — `run_daemon(interval_seconds=600, max_cycles=0)` (4230)
+## 2. Continuous Loop — `run_daemon(interval_seconds=600, max_cycles=0)` (4444)
 
 ```
-_acquire_daemon_lock() (501)          # PID lock; skip if another daemon runs
+_acquire_daemon_lock() (542)          # PID lock; skip if another daemon runs
 _mark_startup(ds, interval, head)
 save_daemon_state(ds)
 while True:
@@ -41,7 +41,7 @@ finally:
     _release_daemon_lock()
 ```
 
-## 3. One Cycle — `run_one_cycle()` (3680)
+## 3. One Cycle — `run_one_cycle()` (3751)
 
 ```
 pre-cycle health snapshot: ds["cycle_stats"] (total/ok/error/parse_error/avg/max)
@@ -52,33 +52,33 @@ result = await asyncio.wait_for(
 post-cycle: duration stats, cycle_history (last 20), save_daemon_state
 ```
 
-## 4. Cycle Body — `_run_cycle_body(result, ds)` (3846)
+## 4. Cycle Body — `_run_cycle_body(result, ds)` (4060)
 
-Step offsets below are relative to the function start (3846) — add the offset
-to get the current line (e.g. offset 105 → 3846+105 = 3951).
+Step offsets below are relative to the function start (4060) — add the offset
+to get the current line (e.g. offset 105 → 4060+105 = 4165).
 
 | Step | What happens | Offset |
 |------|--------------|--------|
 | 1    | Load state: timeline, self_model, orientation, world_model into `state` | 0 |
 | 1.75 | Auto-verify predictions: `wm.verify_expired_predictions()` + `wm.verify_pending_predictions()`, `wm.save()` immediately if any | 33 |
 | 1.5  | Auto-create initial plan if none (guarded against duplicate active/complete plans) | 45 |
-| 1.75 | Pre-cycle `_prune_self_model` (1431) — prompt shows clean state | 79 |
-| 2    | `_build_thinking_prompt(state)` (944) — includes world-model context and last action's prediction feedback | 100 |
-| 3    | `_call_llm(messages)` (2724) — adaptive retry budget `_set_llm_retry_policy` (299); `None` → `_local_analysis` (2927) fallback + `consecutive_fallback_cycles` tracking + recovery note | 105 |
+| 1.75 | Pre-cycle `_prune_self_model` (1445) — prompt shows clean state | 79 |
+| 2    | `_build_thinking_prompt(state)` (951) — includes world-model context and last action's prediction feedback | 100 |
+| 3    | `_call_llm(messages)` (2795) — adaptive retry budget `_set_llm_retry_policy` (301); `None` → `_local_analysis` (2998) fallback + `consecutive_fallback_cycles` tracking + recovery note | 105 |
 | 3.25 | Record the LLM-call outcome as an `llm_call` world-model triple (guarded on the `_fresh` marker; params carry tier/attempts/backoff telemetry) | 125 |
-| 4    | `_try_parse_json(raw)` (1261); `parse_error` → early return | 200 |
+| 4    | `_try_parse_json(raw)` (1275); `parse_error` → early return | 200 |
 | 4.5  | Search phase: DDGS web search → follow-up LLM call, re-parse | 208 |
-| 4.75 | `_coerce_llm_response_fields(parsed)` (1992) — type-guard all LLM fields | 245 |
-| 5    | **`_apply_insights(parsed, state)` (2030) — the predict→act→observe→learn core (see §5)** | 248 |
-| 5.25 | `_bridge_world_model_to_self_model(wm, sm)` (3206) — discrepancy patterns → self-model weaknesses | 250 |
-| 5.3  | `_reconcile_goals_with_world(wm)` (3341) — auto-complete stale goals | 259 |
-| 5.4  | `_auto_activate_goals()` (3570) — promote proposed goals to active | 269 |
+| 4.75 | `_coerce_llm_response_fields(parsed)` (2011) — type-guard all LLM fields | 245 |
+| 5    | **`_apply_insights(parsed, state)` (2076) — the predict→act→observe→learn core (see §5)** | 248 |
+| 5.25 | `_bridge_world_model_to_self_model(wm, sm)` (3277) — discrepancy patterns → self-model weaknesses | 250 |
+| 5.3  | `_reconcile_goals_with_world(wm)` (3412) — auto-complete stale goals | 259 |
+| 5.4  | `_auto_activate_goals()` (3641) — promote proposed goals to active | 269 |
 | 5.5  | Record LLM prediction: `wm.adjust_confidence` + `wm.record_prediction`; `wm.save()` | 280 |
 | 6    | Save state: timeline, self_model (total_cycles++), orientation, wm | 294 |
 | 7    | daemon_state: last_tick, tick_count++, last_output (+fallback flag, recovery note); `save_daemon_state` | 307 |
 | 8    | Build result (insight, focus_next, confidence, duration) | 332 |
 
-## 5. Prediction Integration — `_apply_insights` action path (2030)
+## 5. Prediction Integration — `_apply_insights` action path (2076)
 
 The world-model learning loop inside each action execution:
 
@@ -93,17 +93,25 @@ record BEFORE execution:
 
 execute:
   write_file    → p.write_text(content)
-  shell         → _execute_shell_action (3825)
-                   └─ pre-flight _validate_shell_command (3759)
+  shell         → _execute_shell_action (3896)
+                   └─ pre-flight _validate_shell_command (3830)
                       (quote balance + embedded python3 -c compile check)
   git_commit    → git add (evolve-tracked paths only) + commit
   install_package → pip install
+  api_call      → pre-flight _validate_api_call (3975): deny-by-default —
+                   endpoint must match _API_CALL_ALLOWLIST AND the
+                   permission registry must grant read on its resource;
+                   BLOCKED outcomes still become world-model triples
+                   (Gap 10 step 2, 2026-08-01). Execution
+                   _execute_api_call (4007) POSTs to the host bridge
+                   (not stood up yet → honest "bridge unavailable"
+                   triples until Gap 10 step 3 lands).
 
 observe AFTER:
   _pred_err = wm.complete_action(triple_id, actual_outcome)
 
 feedback:  # closes the loop for the NEXT prompt
-  _build_prediction_feedback_line (1955)
+  _build_prediction_feedback_line (1974)
   → "[PREDICTION ✓/△/✗] error=X: expected \"…\" → \"…\""
   → ds["last_action_output"] → shown to LLM next cycle
 
@@ -119,15 +127,15 @@ calibration (inside world_model.complete_action):
   _update_accuracy_stats, _add_to_error_history
 ```
 
-## 6. LLM Call — `_call_llm(messages, task="thinking")` (2724)
+## 6. LLM Call — `_call_llm(messages, task="thinking")` (2795)
 
-- Resolves provider/model via `_ensure_runtime_main` (2623); passes explicitly
+- Resolves provider/model via `_ensure_runtime_main` (2694); passes explicitly
   to `agent.auxiliary_client.async_call_llm` (bypasses auto-detect).
 - Per-attempt timeout passed INTO the auxiliary client (not just outer
   `wait_for`) — fixes "outage blindness" for slow-but-healthy endpoints.
 - Retries with exponential backoff (2s, 4s, 8s); retry budget shrinks during
-  extended outages (`_clamp_retry_budget` 181, `_llm_retry_policy` 237,
-  `_llm_retry_tier` + `_LLM_RETRY_BUDGETS` 201-234 — single source of truth
+  extended outages (`_clamp_retry_budget` 183, `_llm_retry_policy` 239,
+  `_llm_retry_tier` + `_LLM_RETRY_BUDGETS` 205-230 — single source of truth
   for tier names and budgets).
 - **Retry-path telemetry (P3, 2026-08-01):** every call writes
   `_last_llm_call_stats` (policy_tier, max_retries, per_attempt_timeout,
@@ -135,24 +143,31 @@ calibration (inside world_model.complete_action):
   The cycle body persists this as the `llm_call` world-model triple's
   parameters, so retry/skip decisions feed prediction calibration.
 
-## 7. Local-Analysis Fallback — `_local_analysis(state)` (2927)
+## 7. Local-Analysis Fallback — `_local_analysis(state)` (2998)
 
 Runs when the LLM is unavailable. No standalone LLM predictions, but actions
 still go through the same world-model data-driven prediction path
-(`_select_state_check_action` 2859) so triples/errors keep accumulating.
+(`_select_state_check_action` 2930) so triples/errors keep accumulating.
 
 ## 8. Verification
 
-- `_run_verification()` (4312) — no-LLM self-test of the full
+- `_run_verification()` (4526) — no-LLM self-test of the full
   predict→act→observe→learn cycle on an isolated world-model copy.
 - `scripts/verify_loop_map.py` — AST navigation-map verification.
 - Tests: `tests/agent/test_think_daemon.py`,
   `tests/test_world_model.py`, `tests/agent/test_world_model.py`,
   `tests/test_daemon_local_analysis.py`, `tests/test_wm_self_bridge.py`
-  (520 passed after the 2026-08-01 telemetry change).
+  (520 passed after the 2026-08-01 telemetry change; +11 api_call
+  pre-flight tests).
 
 ## Change Log
 
+- 2026-08-01: Added the `api_call` action type (Gap 10 step 2) — deny-by-default
+  pre-flight `_validate_api_call` (3975) = endpoint allowlist
+  (`_API_CALL_ALLOWLIST`) AND permission-registry read grant; bridge executor
+  `_execute_api_call` (4007) with honest connection-refused outcomes until the
+  host bridge (step 3) exists; prompt guidance; BLOCKED outcomes recorded as
+  world-model triples. Re-verified all line numbers for the 5066-line file.
 - 2026-08-01: Restored the detailed outline (last cycle's rewrite had slimmed
   it to 30 lines) with fresh line numbers for the 4835-line file. Added the
   P3 retry-path telemetry section (`_llm_retry_tier`/`_LLM_RETRY_BUDGETS` +

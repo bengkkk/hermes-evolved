@@ -2792,6 +2792,208 @@ class TestShellPreflightValidation:
         assert out.startswith("exit=3:")
 
 
+class TestApiCallPreflightValidation:
+    """Pre-flight validation for the ``api_call`` action type (Gap 10 step 2).
+
+    Deny-by-default, two layers: the endpoint must match the allowlist
+    (method + host + path prefix) AND the self-model permission registry
+    must grant ``read`` on the entry's resource. Unauthorized endpoints
+    must be rejected with a clear error and NO execution — the first
+    verification criterion of the Gap 10 design doc.
+    """
+
+    def test_allowlisted_github_endpoint_matches(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        entry = td._api_call_allowlist_entry(
+            "GET", "https://api.github.com/repos/NousResearch/hermes-agent"
+        )
+        assert entry is not None
+        assert entry["resource"] == "github"
+
+    def test_method_mismatch_rejected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert (
+            td._api_call_allowlist_entry(
+                "POST", "https://api.github.com/repos/NousResearch/hermes-agent"
+            )
+            is None
+        )
+
+    def test_unknown_host_rejected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._api_call_allowlist_entry("GET", "https://example.com/") is None
+
+    def test_missing_endpoint_rejected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call({}, {})
+        assert not ok
+        assert "requires an 'endpoint'" in err
+
+    def test_non_http_endpoint_rejected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {"endpoint": "file:///etc/passwd", "method": "GET"}, {}
+        )
+        assert not ok
+        assert "absolute http(s)" in err
+
+    def test_allowlisted_but_no_read_grant_is_denied(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        # github is allowlisted, but the registry declares it with NO grants
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            },
+            {"github": {"read": False, "write": False, "act": False, "cap": None}},
+        )
+        assert not ok
+        assert "permission denied" in err
+        assert "github" in err
+
+    def test_missing_resource_entry_is_denied(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            },
+            {},
+        )
+        assert not ok
+        assert "permission denied" in err
+
+    def test_read_grant_passes(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            },
+            {"github": {"read": True}},
+        )
+        assert ok
+        assert err == ""
+
+    def test_action_params_extractor_includes_api_call_fields(
+        self, evolve_env: Dict
+    ) -> None:
+        td = evolve_env["module"]
+        params = td._action_params_from_act(
+            {
+                "type": "api_call",
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            },
+            "api_call",
+        )
+        assert params["endpoint"].startswith("https://api.github.com")
+        assert params["method"] == "GET"
+
+    def test_execute_api_call_reports_bridge_unavailable(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        td = evolve_env["module"]
+        # Port 1 refuses connections immediately — no bridge is listening
+        monkeypatch.setattr(td, "_API_BRIDGE_URL", "http://127.0.0.1:1")
+        out = td._execute_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            }
+        )
+        assert out.startswith("exit=1:")
+        assert "bridge unavailable" in out
+
+    def test_execute_api_call_parses_structured_success(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        td = evolve_env["module"]
+        import urllib.request
+
+        captured: Dict[str, Any] = {}
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, body: bytes) -> None:
+                self._body = body
+
+            def read(self, n: int = -1) -> bytes:
+                return self._body
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *a: Any) -> bool:
+                return False
+
+        def _fake_urlopen(req: Any, timeout: float = 30.0) -> _FakeResp:
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["data"] = req.data
+            return _FakeResp(b'{"exit": 0, "output": {"repo": "hermes-agent"}}')
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        out = td._execute_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+            }
+        )
+        assert out.startswith("exit=0:")
+        assert "hermes-agent" in out
+        assert captured["url"].endswith("/bridge/v1/exec")
+        assert captured["method"] == "POST"
+
+    def test_apply_insights_blocks_api_call_without_execution(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unauthorized api_call must be BLOCKED and never executed."""
+        td = evolve_env["module"]
+
+        def _boom(*args: Any, **kwargs: Any) -> str:
+            raise AssertionError(
+                "_execute_api_call must not run for a denied action"
+            )
+
+        monkeypatch.setattr(td, "_execute_api_call", _boom)
+        parsed: Dict[str, Any] = {
+            "action": {
+                "type": "api_call",
+                "endpoint": "https://api.github.com/repos/NousResearch/hermes-agent",
+                "method": "GET",
+                "expected_outcome": "exit=0: repo info",
+            },
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+        }
+        state = {
+            "timeline": {"version": 1, "past": {}, "present": {}, "future": {}},
+            "self_model": {
+                "version": 1,
+                "identity": {},
+                "state": {},
+                "capabilities": {},
+                "commitments": {},
+                "permissions": {
+                    "github": {"read": False, "write": False, "act": False, "cap": None}
+                },
+            },
+            "orientation": None,
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+        }
+        updates = td._apply_insights(parsed, state)
+        # _apply_insights mutates the daemon_state dict in place (it is not
+        # part of the returned dict), so read the outcome from `state`.
+        out = state["daemon_state"].get("last_action_output", "")
+        assert "BLOCKED:" in out
+        assert "permission denied" in out
+
+
 class TestLocalAnalysisStateCheckCommands:
     """The local-analysis fallback's rotating state-check commands must be
     valid shell commands (pre-flight validation passes) and execute

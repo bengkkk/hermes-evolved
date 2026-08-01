@@ -1,7 +1,8 @@
 # Gap 10 — Real Action Bridge: Design
 
-**Status:** Level 1 step 1 done (permission registry in self-model); steps
-2-5 remain
+**Status:** Level 1 steps 1-2 done (permission registry in self-model +
+`api_call` action type with deny-by-default pre-flight validation); steps
+3-5 remain
 **Owner:** think_daemon self-directed evolution
 **Target:** Turn the daemon from a sandboxed local actor into an economic actor
 with real-world permissions, keeping every action verifiable through the
@@ -79,11 +80,18 @@ not an assistant.
    `github` entry, `check_permission`/`grant_permission`/`revoke_permission`,
    `validate_permissions()` schema validator, snapshot summary, 8 tests in
    `tests/test_data_layer.py`)
-2. Add `api_call` action type to daemon with pre-flight validation
-   (endpoint allowlist check) — next step; pre-flight must call
-   `sm.check_permission(resource, "read")` and reject when False
+2. ✅ Add `api_call` action type to daemon with pre-flight validation
+   (DONE 2026-08-01 — `_API_CALL_ALLOWLIST` + `_validate_api_call` in
+   think_daemon.py: deny-by-default two-layer check = endpoint allowlist
+   (method + host + path prefix, currently GET api.github.com → `github`)
+   AND permission-registry read grant (`sm.check_permission` semantics);
+   unauthorized endpoints rejected with a clear `BLOCKED:` error and NO
+   execution. `_execute_api_call` POSTs to the host bridge
+   (`HERMES_EVOLVED_BRIDGE_URL`, default localhost:8791) and records honest
+   connection-refused triples until step 3 lands. 11 tests in
+   `TestApiCallPreflightValidation`; 175 daemon tests + 53 adjacent pass.)
 3. Stand up host bridge (FastAPI/uvicorn, token auth, `gh` + `gws` read
-   endpoints)
+   endpoints) — next step
 4. Calibrate: record 3+ read-only api_call triples, confirm prediction error
    drops below 0.3 for the new type
 5. Commit + update self-model state
