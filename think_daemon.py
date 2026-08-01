@@ -3787,7 +3787,36 @@ def _reconcile_goals_with_world(
             except Exception as _e:
                 logger.debug("Orientation goal check failed: %s", _e)
 
-        # 6. Duplicate titles → keep the newest
+        # 6. "Prove the external action bridge …" → completed when the world
+        # model holds an api_call triple whose actual outcome shows a
+        # successful external read (exit=0 plus an HTTP 2xx status).  Without
+        # this rule the Gap 10 proof goal stayed 'proposed' for many cycles
+        # even after the first real GitHub read succeeded (bridge audit exec
+        # at 2026-08-01T19:06:55Z, world-model triple act_20260801190655_2)
+        # because no reconciliation pattern covered bridge-proof goals —
+        # the criteria were met but nothing recognized the evidence.
+        if not completed and re.search(
+            r"prove the external action bridge|external action bridge.*github"
+            r"|github read.*bridge|bridge.*github read",
+            title, re.IGNORECASE,
+        ):
+            _bridge_ok = False
+            for _t in wm.data.get("action_triples", []):
+                if not isinstance(_t, dict) or _t.get("action_type") != "api_call":
+                    continue
+                _ao = str(_t.get("actual_outcome", ""))
+                _st = re.search(r'"status"\s*:\s*(\d{3})', _ao)
+                if "exit=0" in _ao and _st and 200 <= int(_st.group(1)) < 300:
+                    _bridge_ok = True
+                    break
+            if _bridge_ok:
+                note = (
+                    "Auto-completed: world model holds an api_call triple "
+                    "with exit=0 and HTTP 2xx — external action bridge proven"
+                )
+                completed = True
+
+        # 7. Duplicate titles → keep the newest
         # This runs AFTER the pattern checks above so that pattern-matched
         # goals get completed regardless; duplicate-phase only catches
         # remaining identical-titled goals that weren't caught by patterns.

@@ -344,3 +344,79 @@ class TestReconcileGoalsWithWorld:
                 assert goal["status"] == "completed"
                 assert "Auto-completed:" in goal.get("notes", "")
                 assert "48" in goal.get("notes", "")  # mentions sample count
+
+
+class TestBridgeProofGoalReconciliation:
+    """Auto-completion of the Gap 10 bridge-proof goal.
+
+    The world model records api_call triples whose actual_outcome embeds the
+    host-bridge result (``exit=0`` plus an HTTP status).  A goal titled
+    "Prove the external action bridge with a GitHub read" must flip to
+    completed exactly when such a successful triple exists.
+    """
+
+    def _bridge_wm(self, outcome: str) -> WorldModel:
+        wm = WorldModel()
+        wm.data["action_triples"] = [
+            {
+                "id": "act_test_1",
+                "action_type": "api_call",
+                "action_description": "GitHub read through the open gate",
+                "action_parameters": {"endpoint": "https://api.github.com/", "method": "GET"},
+                "expected_outcome": "HTTP 200 JSON body",
+                "prediction_confidence": 0.65,
+                "actual_outcome": outcome,
+            }
+        ]
+        return wm
+
+    def _bridge_goal(self) -> dict:
+        return {
+            "version": 1,
+            "goals": [
+                {
+                    "id": "g_prove_bridge",
+                    "title": "Prove the external action bridge with a GitHub read",
+                    "description": "Turn Gap 10 into a working proof.",
+                    "priority": 4, "status": "proposed",
+                    "gap_reference": "10",
+                    "created_at": "2026-08-01T18:51:00",
+                    "completed_at": None, "notes": "",
+                },
+            ],
+        }
+
+    def test_completed_when_api_call_triple_is_http_success(self):
+        from think_daemon import _reconcile_goals_with_world
+        wm = self._bridge_wm('exit=0: {"status": 200, "bytes": 2262}')
+        goals = self._bridge_goal()
+        count = _reconcile_goals_with_world(wm, goals)
+        assert count == 1
+        g = Goals(data=goals)
+        assert g.get_active() == []
+        completed = g.data["goals"][0]
+        assert completed["status"] == "completed"
+        assert "Auto-completed:" in completed.get("notes", "")
+
+    def test_stays_open_when_api_call_failed(self):
+        from think_daemon import _reconcile_goals_with_world
+        wm = self._bridge_wm('exit=1: {"status": 500, "bytes": 12}')
+        goals = self._bridge_goal()
+        count = _reconcile_goals_with_world(wm, goals)
+        assert count == 0
+        assert Goals(data=goals).get_active()[0]["id"] == "g_prove_bridge"
+
+    def test_stays_open_without_api_call_triples(self):
+        from think_daemon import _reconcile_goals_with_world
+        wm = WorldModel()
+        wm.data["action_triples"] = [
+            {
+                "id": "act_shell_1", "action_type": "shell",
+                "action_description": "list files", "action_parameters": {},
+                "expected_outcome": "listing", "actual_outcome": "file names",
+            },
+        ]
+        goals = self._bridge_goal()
+        count = _reconcile_goals_with_world(wm, goals)
+        assert count == 0
+        assert Goals(data=goals).get_active()[0]["id"] == "g_prove_bridge"
