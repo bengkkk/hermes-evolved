@@ -81,6 +81,40 @@ class TestComputePredictionError:
         """Both empty → error 1.0."""
         assert _compute_prediction_error("", "") == 1.0
 
+    def test_non_str_expected_coerced(self):
+        """LLM can emit ints where strings are expected — must not crash.
+
+        Regression for the 2026-08-01 crash class ('int' object has no
+        attribute 'strip'/'lower'): an int expected_outcome used to
+        explode inside complete_action's except-path re-entry and kill
+        the daemon cycle.  After coercion the comparison proceeds and a
+        bounded error is returned.
+        """
+        err = _compute_prediction_error(123, "exit=0: 123")
+        assert isinstance(err, float)
+        assert 0.0 <= err <= 1.0
+
+    def test_non_str_actual_coerced(self):
+        """Non-string actual outcome must not crash either."""
+        err = _compute_prediction_error("exit=0: 123", 123)
+        assert isinstance(err, float)
+        assert 0.0 <= err <= 1.0
+
+    def test_record_action_int_expected_roundtrip(self):
+        """record_action → complete_action with an int expected survives.
+
+        Simulates the daemon path end-to-end: an int expected_outcome
+        must be stringified before storage so complete_action can score
+        it without raising.
+        """
+        wm = WorldModel()
+        tid = wm.record_action("shell", "run test", 123, expected_source="llm")
+        err = wm.complete_action(tid, "exit=0: output")
+        assert err is not None
+        assert 0.0 <= err <= 1.0
+        triple = next(t for t in wm.data["action_triples"] if t["id"] == tid)
+        assert isinstance(triple["expected_outcome"], str)
+
     # ── Write-file heuristics ──
 
     def test_write_file_match_with_path(self):

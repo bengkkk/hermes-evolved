@@ -2174,6 +2174,29 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                 "Auto-default action (tick %d → auto[%d]: %s)",
                 tick, idx, act["description"],
             )
+
+    # ── Type-guard the LLM-provided action dict (crash-proofing) ──
+    # The action block is LLM JSON — the same model that emitted
+    # gap_reference as an int (2026-08-01 06:17 cycle crash) can emit
+    # any action field as a non-string (int/list/dict where a string is
+    # expected).  Coerce the string-typed fields here, once, so the
+    # dedup gate (.lower()), the data-driven prediction path
+    # (.strip()/slicing), the world-model record, and the execution path
+    # never hit 'int' object has no attribute 'strip'/'lower' or a slice
+    # on an int.  Without this, an int expected_outcome survives the
+    # prediction try/except and crashes complete_action → _compute_prediction_error
+    # INSIDE the action-failure except block (which re-calls complete_action),
+    # killing the whole cycle.  The branches above guarantee act is a
+    # dict or None at this point.
+    if act is not None and isinstance(act, dict):
+        for _fld in ("type", "description", "command", "path",
+                     "content", "message", "package"):
+            _v = act.get(_fld)
+            if _v is not None and not isinstance(_v, str):
+                act[_fld] = str(_v).strip()
+        _eo = act.get("expected_outcome")
+        if _eo is not None and not isinstance(_eo, str):
+            act["expected_outcome"] = str(_eo).strip()
     
     # ── Action deduplication gate: break LLM fixation loops ──
     # The LLM sometimes produces nearly-identical actions cycle after cycle

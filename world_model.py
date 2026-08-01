@@ -158,6 +158,16 @@ def _compute_prediction_error(
     if not expected or not actual:
         return 1.0
 
+    # The daemon's LLM occasionally emits numbers where strings are
+    # expected (same bug class as the 2026-08-01 06:17 crash: 'int'
+    # object has no attribute 'strip' on goal gap_reference).  Coerce
+    # before any string method so a stored int expected/actual can never
+    # crash a cycle inside complete_action's except-path re-entry.
+    if not isinstance(expected, str):
+        expected = str(expected)
+    if not isinstance(actual, str):
+        actual = str(actual)
+
     e_lower = expected.lower().strip()
     a_lower = actual.lower().strip()
 
@@ -401,6 +411,18 @@ class WorldModel:
             Triple ID to pass to :meth:`complete_action`.
         """
         triple_id = _unique_id("act")
+        # The daemon's LLM occasionally emits non-strings for these
+        # fields (2026-08-01 crash class: 'int' object has no attribute
+        # 'strip').  Coerce at the persistence boundary — same principle
+        # as data_layer.propose()'s _coerce_stripped_str — so a triple
+        # can never carry a non-str field that later crashes
+        # complete_action / _compute_prediction_error.
+        if not isinstance(action_type, str):
+            action_type = str(action_type)
+        if not isinstance(action_description, str):
+            action_description = str(action_description)
+        if expected_outcome is not None and not isinstance(expected_outcome, str):
+            expected_outcome = str(expected_outcome)
         # Derive default confidence from source if not explicitly provided
         if prediction_confidence is not None:
             conf = max(0.0, min(1.0, prediction_confidence))
