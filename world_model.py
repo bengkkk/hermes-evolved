@@ -342,6 +342,46 @@ def _compute_prediction_error(
         return _error
 
 
+def _command_changed_since(
+    current_params: Optional[Dict[str, Any]],
+    past: Optional[Dict[str, Any]],
+) -> bool:
+    """True when a past action's outcome must NOT be reused as the prediction
+    because the underlying shell command changed.
+
+    Shell outcomes are deterministic functions of the exact command text, so a
+    past *failure* of a different command is a stale template, not a signal.
+    Observed 2026-08-01: an auto-default shell command with broken quoting
+    failed once ("Syntax error: Unterminated quoted string"); after the quoting
+    was fixed, ``predict_action_outcome`` kept reusing that failure as the
+    predicted outcome for the fixed command, manufacturing ~0.5 prediction
+    error every cycle and feeding the shell discrepancy pattern.
+
+    Conservative by design:
+      - Only applies when current parameters carry a ``command`` (shell
+        actions). write_file content / git_commit messages legitimately vary
+        between runs, so they never trip this guard.
+      - Returns False when the stored past command was truncated at write time
+        (``...[truncated]`` suffix) — a truncated copy cannot be compared
+        reliably, so the caller keeps the existing copy-the-outcome behavior.
+      - The comparison collapses whitespace but does NOT normalize quote
+        characters, so a quoting fix (the actual root cause observed above)
+        reads as a command change while ``cmd  --flag`` vs ``cmd --flag``
+        still compare equal.
+    """
+    if not current_params or not isinstance(current_params, dict):
+        return False
+    cur = current_params.get("command")
+    past_cmd = past.get("command") if isinstance(past, dict) else None
+    if not isinstance(cur, str) or not isinstance(past_cmd, str):
+        return False
+    cur = cur.strip()
+    past_cmd = past_cmd.strip()
+    if not cur or not past_cmd or past_cmd.endswith("...[truncated]"):
+        return False
+    return " ".join(cur.split()) != " ".join(past_cmd.split())
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  WorldModel class
 # ═══════════════════════════════════════════════════════════════════
@@ -2073,19 +2113,28 @@ class WorldModel:
                     if similarity > 0.2:
                         err = t.get("prediction_error", 0.5)
                         actual = (t.get("actual_outcome", "") or "")[:80]
-                        scored.append((similarity, past_desc[:60], err, actual))
+                        # Keep the past command (if any) so outcome selection
+                        # can detect when the current command differs from the
+                        # matched past action (_command_changed_since).
+                        past_cmd = (
+                            past_params.get("command", "")
+                            if past_params and isinstance(past_params, dict)
+                            else ""
+                        )
+                        scored.append((similarity, past_desc[:60], err, actual, past_cmd))
                         # Mark that we matched based on parameters if parameters were provided
                         if parameters and not result["parameters_match"]:
                             result["parameters_match"] = True
 
             # Sort by similarity, take top 3
             scored.sort(key=lambda x: x[0], reverse=True)
-            for sim, desc_text, err_val, actual_text in scored[:3]:
+            for sim, desc_text, err_val, actual_text, past_cmd in scored[:3]:
                 result["similar_actions"].append({
                     "description": desc_text,
                     "similarity": round(sim, 3),
                     "error": err_val,
                     "outcome": actual_text,
+                    "command": past_cmd,
                 })
 
         # ── Generate predicted outcome string ──
@@ -2113,12 +2162,23 @@ class WorldModel:
                 best = result["similar_actions"][0]
                 # Use the most similar past action's outcome, truncated
                 outcome_text = (best.get("outcome", "") or "").strip()
-                if outcome_text:
+                # A past action whose own prediction was a high-error surprise
+                # (error >= 0.5) is an anomaly, not a template — and if its
+                # command differs from the current one (e.g. a quoting fix),
+                # reusing its failure as the prediction manufactures a
+                # systematic error every cycle. Fall back to the generic
+                # per-type prediction instead.
+                stale_template = (
+                    outcome_text
+                    and best.get("error", 0.0) >= 0.5
+                    and _command_changed_since(parameters, best)
+                )
+                if outcome_text and not stale_template:
                     result["predicted_outcome"] = outcome_text[:100]
-                else:
-                    result["predicted_outcome"] = f"{action_type}: expected success"
-            else:
-                # Generic prediction based on action type
+            if not result.get("predicted_outcome"):
+                # Generic prediction based on action type (no similar actions,
+                # empty outcome, or the best match is a stale failure of a
+                # different command — see _command_changed_since).
                 if action_type == "shell":
                     result["predicted_outcome"] = "exit=0: command output"
                 elif action_type == "write_file":
@@ -2149,6 +2209,13 @@ class WorldModel:
                     f" | Most similar: \"{best['description'][:50]}\" "
                     f"→ \"{best['outcome'][:50]}\" [err={best['error']:.2f}]"
                 )
+                if (
+                    best.get("error", 0.0) >= 0.5
+                    and _command_changed_since(parameters, best)
+                ):
+                    rationale_parts.append(
+                        " | STALE template (command changed) — generic fallback"
+                    )
             result["prediction_rationale"] = "".join(rationale_parts)
 
         return result

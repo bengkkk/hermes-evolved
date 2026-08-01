@@ -1834,6 +1834,79 @@ class TestPredictActionOutcome:
         result_long = wm.predict_action_outcome("shell", "a" * 5000)
         assert result_long is not None
 
+    def test_stale_failure_not_reused_when_command_changed(self):
+        """A past FAILURE of a *different* command must not be predicted for the
+        current action.
+
+        Regression for the 2026-08-01 'sibling dirs check' bug: the auto-default
+        shell command had broken quoting and failed once; after the quoting was
+        fixed (command text changed), the predictor kept reusing the old
+        'Syntax error' outcome as the prediction — manufacturing ~0.5 error
+        every cycle and feeding the shell discrepancy pattern.
+        """
+        wm = WorldModel()
+        broken_cmd = 'python3 -c "import pathlib; print(1)"'
+        fixed_cmd = "python3 -c 'import pathlib; print(1)'"
+        tid = wm.record_action(
+            "shell", "Auto-default: sibling dirs check",
+            "exit=0: listing", parameters={"command": broken_cmd},
+        )
+        wm.complete_action(tid, "exit=2: Syntax error: Unterminated quoted string")
+
+        # Same description, but the command text changed (quoting fixed):
+        result = wm.predict_action_outcome(
+            "shell", "Auto-default: sibling dirs check",
+            parameters={"command": fixed_cmd},
+        )
+        assert result["predicted_outcome"] is not None
+        assert "Syntax error" not in result["predicted_outcome"]
+        # Falls back to the generic shell prediction instead of the stale failure
+        assert result["predicted_outcome"].startswith("exit=0")
+        assert "STALE template" in result.get("prediction_rationale", "")
+
+    def test_same_command_reuses_past_outcome(self):
+        """An unchanged command may reuse the past action's outcome as template —
+        even when that past action's own prediction error was at the 0.5 gate."""
+        wm = WorldModel()
+        cmd = "ls -la /tmp"
+        tid = wm.record_action("shell", "list tmp", "exit=0: files",
+                               parameters={"command": cmd})
+        wm.complete_action(tid, "exit=0: file1 file2")
+        result = wm.predict_action_outcome("shell", "list tmp",
+                                           parameters={"command": cmd})
+        assert "file1" in result["predicted_outcome"]
+        assert "STALE template" not in result.get("prediction_rationale", "")
+
+    def test_truncated_stored_command_keeps_copy_behavior(self):
+        """Long commands are stored truncated ('...[truncated]') and cannot be
+        compared reliably — the predictor must keep the existing copy behavior
+        instead of flagging every long command as changed."""
+        wm = WorldModel()
+        long_cmd = "echo " + "x" * 400  # exceeds _MAX_PARAM_VALUE_LEN (300)
+        tid = wm.record_action("shell", "long echo", "exit=0: x",
+                               parameters={"command": long_cmd})
+        wm.complete_action(tid, "exit=0: xxxx")
+        result = wm.predict_action_outcome("shell", "long echo",
+                                           parameters={"command": long_cmd})
+        assert "xxxx" in result["predicted_outcome"]
+        assert "STALE template" not in result.get("prediction_rationale", "")
+
+    def test_non_shell_ignores_stale_check(self):
+        """write_file content/path legitimately vary between runs — copying the
+        most similar past outcome stays (no 'command' key, so no stale guard)."""
+        wm = WorldModel()
+        tid = wm.record_action(
+            "write_file", "write snapshot", "Wrote file",
+            parameters={"path": "/tmp/a.txt", "content": "v1"},
+        )
+        wm.complete_action(tid, "Wrote /tmp/a.txt (10 bytes)")
+        result = wm.predict_action_outcome(
+            "write_file", "write snapshot",
+            parameters={"path": "/tmp/a.txt", "content": "v2-different"},
+        )
+        assert "10 bytes" in result["predicted_outcome"]
+        assert "STALE template" not in result.get("prediction_rationale", "")
+
 
 class TestCalibrationBucketCleanup:
     """Tests for _clean_stale_calibration_buckets on load."""
