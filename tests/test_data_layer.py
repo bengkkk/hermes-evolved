@@ -346,6 +346,85 @@ class TestSelfModel:
         assert sm.data["unknown_key"] == "value"
         assert sm.state["total_cycles"] == 10
 
+    # ── Permissions (Gap 10) ──────────────────────────────────────
+
+    def test_permissions_default_deny(self) -> None:
+        sm = SelfModel()
+        assert sm.permissions["github"] == {
+            "read": False, "write": False, "act": False, "cap": None,
+        }
+        # Deny by default: declared resource, zero grants.
+        assert sm.check_permission("github", "read") is False
+        assert sm.check_permission("github", "write") is False
+        assert sm.check_permission("github", "act") is False
+        # Unknown resource → no entry → deny.
+        assert sm.permission_entry("nonexistent") is None
+        assert sm.check_permission("nonexistent", "read") is False
+
+    def test_permission_grant_revoke(self) -> None:
+        sm = SelfModel()
+        sm.grant_permission("github", "read")
+        assert sm.check_permission("github", "read") is True
+        assert sm.check_permission("github", "write") is False
+        assert sm.revoke_permission("github", "read") is True
+        assert sm.check_permission("github", "read") is False
+        # Revoking an already-False flag changes nothing.
+        assert sm.revoke_permission("github", "read") is False
+
+    def test_permission_grant_creates_full_entry(self) -> None:
+        sm = SelfModel()
+        sm.grant_permission("calendar", "read", cap=10)
+        assert sm.permission_entry("calendar") == {
+            "read": True, "write": False, "act": False, "cap": 10,
+        }
+
+    def test_permission_unknown_action_denied_and_rejected(self) -> None:
+        sm = SelfModel()
+        sm.grant_permission("github", "read")
+        assert sm.check_permission("github", "delete") is False
+        with pytest.raises(ValueError):
+            sm.grant_permission("github", "delete")
+
+    def test_validate_permissions(self) -> None:
+        sm = SelfModel()
+        # Default registry is valid.
+        assert sm.validate_permissions() == []
+        # Non-bool flag.
+        sm.permissions["github"]["read"] = "yes"  # type: ignore[assignment]
+        assert any("read" in p for p in sm.validate_permissions())
+        # Negative cap.
+        sm.permissions["github"]["read"] = True
+        sm.permissions["github"]["cap"] = -1
+        assert any("cap" in p for p in sm.validate_permissions())
+        # Non-dict entry.
+        sm.permissions["github"]["cap"] = None
+        sm.permissions["bad"] = "not-a-dict"  # type: ignore[assignment]
+        assert any("bad" in p for p in sm.validate_permissions())
+        assert sm.validate_permissions()  # non-empty → invalid
+
+    def test_validate_permissions_unknown_key(self) -> None:
+        sm = SelfModel()
+        sm.permissions["github"]["exec"] = True
+        assert any("exec" in p for p in sm.validate_permissions())
+
+    def test_merge_defaults_permissions_section(self) -> None:
+        sm = SelfModel(
+            data={
+                "permissions": {
+                    "github": {"read": True, "write": False, "act": False, "cap": None},
+                }
+            }
+        )
+        # Loaded state wins over the default entry.
+        assert sm.check_permission("github", "read") is True
+        assert sm.validate_permissions() == []
+
+    def test_state_snapshot_permissions(self) -> None:
+        sm = SelfModel()
+        assert sm.get_state_snapshot()["permissions"] == {"github": []}
+        sm.grant_permission("github", "read")
+        assert sm.get_state_snapshot()["permissions"]["github"] == ["read"]
+
 
 class TestSelfModelPersistence:
     """File-backed SelfModel save/load."""

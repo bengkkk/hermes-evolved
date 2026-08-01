@@ -336,6 +336,15 @@ class SelfModel:
             "promised_features": [],
             "active_obligations": [],
         },
+        "permissions": {
+            # Gap 10 real-action bridge: deny-by-default capability registry.
+            # "github" is declared up-front (recommended first Level-1
+            # endpoint — `gh` reads via a PAT already in ~/.git-credentials)
+            # but every flag starts False: nothing is permitted until
+            # explicitly granted. Schema per resource:
+            #   {read: bool, write: bool, act: bool, cap: None|number}
+            "github": {"read": False, "write": False, "act": False, "cap": None},
+        },
     }
 
     def __init__(self, data: Optional[Dict[str, Any]] = None):
@@ -354,7 +363,7 @@ class SelfModel:
         call would leak saved keys into the shared defaults dict.
         """
         merged = copy.deepcopy(SelfModel._DEFAULT_DATA)
-        for section in ("identity", "state", "capabilities", "commitments"):
+        for section in ("identity", "state", "capabilities", "commitments", "permissions"):
             if section in data:
                 merged[section].update(data[section])
         # Absorb top-level keys that don't fit a section
@@ -433,6 +442,121 @@ class SelfModel:
         ]
         return before - len(self.capabilities["weaknesses"])
 
+    # ── Permissions (Gap 10 — real-action bridge registry) ────────
+    #
+    # The permission registry is the single source of truth for what the
+    # daemon may do OUTSIDE the container. Every Gap-10 action type
+    # (api_call and later) MUST declare its resource entry here; pre-flight
+    # validation rejects actions whose resource has no entry. Deny by
+    # default: a missing entry or a False flag grants nothing.
+
+    _PERMISSION_ACTIONS: tuple = ("read", "write", "act")
+    _PERMISSION_KEYS: tuple = ("read", "write", "act", "cap")
+
+    @property
+    def permissions(self) -> Dict[str, Any]:
+        """Per-resource capability matrix.
+
+        Schema per resource: ``{"read": bool, "write": bool, "act": bool,
+        "cap": None | non-negative number}``. ``cap`` is a value cap for
+        valued actions (Level 3+; enforced by the host bridge, never by
+        the daemon itself). A resource with no entry grants nothing.
+        """
+        return self._section("permissions")
+
+    def permission_entry(self, resource: str) -> Optional[Dict[str, Any]]:
+        """Return a copy of *resource*'s registry entry, or None."""
+        entry = self.permissions.get(resource)
+        return copy.deepcopy(entry) if isinstance(entry, dict) else None
+
+    def check_permission(self, resource: str, action: str) -> bool:
+        """True iff *resource* has an entry AND *action*'s flag is truthy.
+
+        ``action`` must be one of ``read``/``write``/``act``. Unknown
+        resources, unknown actions, and False flags all deny.
+        """
+        if action not in self._PERMISSION_ACTIONS:
+            return False
+        entry = self.permissions.get(resource)
+        return bool(isinstance(entry, dict) and entry.get(action))
+
+    def grant_permission(
+        self, resource: str, action: str, cap: Any = None
+    ) -> Dict[str, Any]:
+        """Declare *resource* and grant *action* (read|write|act).
+
+        This is the ONLY path that adds a resource to the registry, so a
+        resource can never appear without a full deny-by-default entry.
+        ``cap`` optionally sets the entry's value cap (None = uncapped).
+        Raises ValueError for unknown actions.
+        """
+        if action not in self._PERMISSION_ACTIONS:
+            raise ValueError(
+                f"Unknown permission action {action!r} "
+                f"(expected one of {self._PERMISSION_ACTIONS})"
+            )
+        entry = self.permissions.setdefault(
+            resource,
+            {k: False for k in self._PERMISSION_ACTIONS} | {"cap": None},
+        )
+        entry[action] = True
+        if cap is not None:
+            entry["cap"] = cap
+        return entry
+
+    def revoke_permission(self, resource: str, action: str) -> bool:
+        """Revoke *action* from *resource* (flag → False).
+
+        Returns True if a True flag was flipped; False if the resource,
+        action, or a False flag meant nothing changed.
+        """
+        entry = self.permissions.get(resource)
+        if not isinstance(entry, dict) or action not in entry:
+            return False
+        if entry.get(action) is True:
+            entry[action] = False
+            return True
+        return False
+
+    def validate_permissions(self) -> List[str]:
+        """Schema-check the registry; returns problem descriptions.
+
+        Empty list = valid. Each entry must be a dict whose keys are a
+        subset of {read, write, act, cap}; read/write/act must be bools;
+        cap must be None or a non-negative number. Used by pre-flight
+        validation (and tests) to guarantee the registry never carries a
+        malformed entry that could be misread as a grant.
+        """
+        problems: List[str] = []
+        for res, entry in self.permissions.items():
+            if not isinstance(entry, dict):
+                problems.append(
+                    f"permissions[{res!r}]: expected a dict, got {type(entry).__name__}"
+                )
+                continue
+            for k, v in entry.items():
+                if k not in self._PERMISSION_KEYS:
+                    problems.append(
+                        f"permissions[{res!r}]: unknown key {k!r} "
+                        f"(allowed: {', '.join(self._PERMISSION_KEYS)})"
+                    )
+                elif k == "cap":
+                    if v is not None and not (
+                        isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and v >= 0
+                    ):
+                        problems.append(
+                            f"permissions[{res!r}].cap: expected None or "
+                            f"non-negative number, got {v!r}"
+                        )
+                elif not isinstance(v, bool):
+                    problems.append(
+                        f"permissions[{res!r}].{k}: expected bool, "
+                        f"got {type(v).__name__}"
+                    )
+        return problems
+
     # ── Commitments ───────────────────────────────────────────────
 
     def set_commitment(
@@ -472,6 +596,13 @@ class SelfModel:
             "strengths": caps.get("strengths", [])[:8],
             "weaknesses": caps.get("weaknesses", [])[:5],
             "unknown_areas": caps.get("unknown_areas", [])[:5],
+            # Gap 10: granted actions per resource (deny-by-default; an
+            # empty list means the resource is declared but grants nothing).
+            "permissions": {
+                res: [a for a in self._PERMISSION_ACTIONS if entry.get(a)]
+                for res, entry in self.permissions.items()
+                if isinstance(entry, dict)
+            },
         }
 
     def summary(self) -> str:

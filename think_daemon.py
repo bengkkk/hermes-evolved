@@ -91,6 +91,7 @@ _EVOLVE_TRACKED_PATHS: list[str] = [
     "Timeline.py",
     "agent/self_evolve.py",
     "docs/think_daemon_loop.md",
+    "docs/gap10-bridge-design.md",
     "scripts/bootstrap_world_model.py",
     "scripts/evolve_check.py",
     "scripts/test_evolved.py",
@@ -664,6 +665,7 @@ Strengths: {strengths}
 Weaknesses: {weaknesses}
 Unknown areas: {unknown}
 Commitments: {commitments}
+Permissions (Gap 10 registry, deny-by-default): {permissions}
 
 Recent timeline events:
 {events_text}
@@ -925,6 +927,23 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     strengths = caps.get("strengths", [])
     weaknesses = caps.get("weaknesses", [])
     unknown = caps.get("unknown_areas", [])
+
+    # Permissions (Gap 10 registry): compact grants summary, deny-by-default.
+    # The LLM must see its own permission state so it never proposes an
+    # external action it is not allowed to take (and knows the api_call
+    # path is gated on these flags).
+    _perm_entries = sm.get("permissions", {})
+    if isinstance(_perm_entries, dict) and _perm_entries:
+        _perm_parts = []
+        for _res, _entry in sorted(_perm_entries.items()):
+            if isinstance(_entry, dict):
+                _granted = [a for a in ("read", "write", "act") if _entry.get(a)]
+                _perm_parts.append(
+                    f"{_res}: {', '.join(_granted) if _granted else 'no grants'}"
+                )
+        permissions_text = "; ".join(_perm_parts) if _perm_parts else "(none declared)"
+    else:
+        permissions_text = "(none declared)"
 
     # Recent events
     events = tl.get("past", {}).get("events", [])
@@ -1190,6 +1209,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         strengths="; ".join(strengths[:5]) if strengths else "(none)",
         weaknesses="; ".join(weaknesses[:3]) if weaknesses else "(none)",
         unknown="; ".join(unknown[:3]) if unknown else "(none)",
+        permissions=permissions_text,
         commitments=all_commits,
         events_text=events_text,
         active_project=present.get("active_project", "(none)"),

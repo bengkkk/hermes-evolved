@@ -918,6 +918,7 @@ class TestBuildThinkingPrompt:
             "Weaknesses:",
             "Unknown areas:",
             "Commitments:",
+            "Permissions (Gap 10 registry",
             "Recent timeline events:",
             "Active project:",
             "Active tasks:",
