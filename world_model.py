@@ -200,6 +200,38 @@ def _compute_prediction_error(
         # If expected mentions the file path, it's a successful write
         if file_path and file_path in e_lower:
             return 0.15
+        # ── Semantic file-name match (byte-count gate) ──
+        # The full-path containment check above misses near-miss
+        # predictions that name the same file with different
+        # punctuation/formatting (space vs underscore, missing
+        # directory prefix).  Observed 2026-08-01: prediction
+        # "Wrote state snapshot (199 bytes)" vs actual
+        # "Wrote /root/.hermes-evolved/evolve/state_snapshot.txt
+        # (199 bytes)" scored 0.25 even though both name the same
+        # file AND the same byte count — the prediction was correct.
+        # When both sides agree on the byte count, treat a normalized
+        # (punctuation-stripped) file-name overlap as a successful
+        # write (0.15).  The byte-count equality is the gate: it
+        # proves the prediction referred to this exact write, so a
+        # partial-name overlap cannot be coincidence ("create config"
+        # vs "Created config.yaml (120 bytes)" has no byte count on
+        # the expected side and correctly stays 0.25).
+        e_bytes_m = re.search(r"\((\d+)\s+bytes?\)", e_lower)
+        a_bytes_m = re.search(r"\((\d+)\s+bytes?\)", a_lower)
+        if e_bytes_m and a_bytes_m and e_bytes_m.group(1) == a_bytes_m.group(1):
+            fname = file_path.rsplit("/", 1)[-1]
+            stem = fname.rsplit(".", 1)[0] if "." in fname else fname
+
+            def _norm(s: str) -> str:
+                return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+            fname_norm = _norm(fname)
+            stem_norm = _norm(stem)
+            e_norm = _norm(e_lower)
+            if len(stem_norm) >= 5 and (
+                stem_norm in e_norm or e_norm in fname_norm
+            ):
+                return 0.15
         # File was written but expected didn't name it — partial match
         return 0.25
     # ── Informational non-error messages ──

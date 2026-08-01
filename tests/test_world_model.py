@@ -148,6 +148,41 @@ class TestComputePredictionError:
         err = _compute_prediction_error("overwrite config.yaml", "Overwrote config.yaml (30 bytes)")
         assert err == pytest.approx(0.15, abs=0.01)
 
+    def test_write_file_semantic_byte_match(self):
+        """Near-miss write prediction naming same file+bytes → 0.15.
+
+        Space/underscore formatting differs and the full path is missing
+        from the expected side, but both sides agree on the byte count
+        and the normalized file name overlaps → the prediction was
+        correct (observed 2026-08-01: 'Wrote state snapshot (199 bytes)'
+        vs 'Wrote /root/.hermes-evolved/evolve/state_snapshot.txt
+        (199 bytes)' was scored 0.25).
+        """
+        err = _compute_prediction_error(
+            "Wrote state snapshot (199 bytes)",
+            "Wrote /root/.hermes-evolved/evolve/state_snapshot.txt (199 bytes)",
+        )
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    def test_write_file_semantic_byte_gate_blocks_without_byte_match(self):
+        """File-name overlap WITHOUT matching byte count → 0.25.
+
+        The byte-count equality is the gate that proves the prediction
+        referred to this exact write; without it, a generic name overlap
+        ('state snapshot' ⊂ 'state_snapshot.txt') could be coincidence
+        and must not be promoted to a successful write.
+        """
+        err = _compute_prediction_error(
+            "Wrote state snapshot",
+            "Wrote /root/.hermes-evolved/evolve/state_snapshot.txt (199 bytes)",
+        )
+        assert err == pytest.approx(0.25, abs=0.01)
+
+    def test_write_file_semantic_generic_name_still_partial(self):
+        """'create config' vs 'Created config.yaml' stays 0.25 (no byte gate)."""
+        err = _compute_prediction_error("create config", "Created config.yaml (120 bytes)")
+        assert err == pytest.approx(0.25, abs=0.01)
+
     # ── Exit code heuristics ──
 
     def test_exit_zero_success(self):
