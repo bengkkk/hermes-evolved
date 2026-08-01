@@ -7,8 +7,11 @@ Line numbers and cycle steps are verified against HEAD `feb075dde`
 (2026-07-31 22:28; evidence-based self-model resolution for documented
 subjects), re-verified at HEAD `d6afa6faa` (2026-08-01; the
 `_action_params_from_act` predict/record parity refactor), re-verified
-at HEAD `01c44e3a6` (2026-08-01; the auto-default comment fix, +4), and
-re-verified at HEAD `52262233f` (2026-08-01; the probe-cadence fix, +11).
+at HEAD `01c44e3a6` (2026-08-01; the auto-default comment fix, +4),
+re-verified at HEAD `52262233f` (2026-08-01; the probe-cadence fix, +11),
+and re-verified at HEAD `ade0b177a` (2026-08-01; the timeout
+pass-through fix `986f1f219` + the `scripts/verify_loop_map.py` AST
+map-verification script — see the Sixth drift note).
 It is the counterpart to the daemon-reliability work: the loop below is what
 the PID-lock re-verification protects.
 
@@ -56,6 +59,20 @@ the PID-lock re-verification protects.
 > onward. Every navigation-map line below was re-read by AST at HEAD
 > `52262233f` (2026-08-01 04:12); the world-model.py map is unaffected
 > (world_model.py untouched by that commit).
+>
+> Sixth drift (2026-08-01, timeout pass-through + map script): `986f1f219`
+> threaded `timeout=per_attempt_timeout` into `async_call_llm` (ending the
+> internal-30s-cap outage blindness), adding +9 lines in the retry-policy
+> comment region before `_call_llm` and +12 lines inside `_call_llm`'s
+> body — net +9 for every map entry up to `_call_llm` (2450 → 2459) and
+> +21 from `_select_state_check_action` onward. Then `ade0b177a` added the
+> `scripts/verify_loop_map.py` tracking entry to `_EVOLVE_TRACKED_PATHS`
+> (+1 line after the tracked-paths list), so the final net vs the
+> `52262233f` numbers is +10 up to `_call_llm` and +22 from
+> `_select_state_check_action` onward. Every map line below was re-read by
+> AST at HEAD `ade0b177a` (2026-08-01) via `scripts/verify_loop_map.py`;
+> the world-model.py map is unaffected (world_model.py untouched since
+> `042a37017`, all numbers re-confirmed at HEAD).
 
 ## Process model
 
@@ -202,19 +219,19 @@ never deletes from. Four touchpoints connect the cycle to the goal system:
 
 1. **Plan auto-create (cycle step 3)** — if no active plan exists and no
    active/complete plan targets "Complete Gap 8 — Self-directed evolution",
-   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3503-3528).
+   `agent.self_evolve.create_plan` seeds one (think_daemon.py:3526-3548).
    Placeholder steps (bare "Step A" descriptions, or "V"/"n/a"
    verification) are rejected at creation by `_is_placeholder_step`
-   (line 284), so a plan with no actionable content can never re-enter the
+   (line 294), so a plan with no actionable content can never re-enter the
    prompt as an active plan and drive a deliberation-fixation loop.
 2. **Goal reconciliation (cycle step 11)** — `_reconcile_goals_with_world`
-   (line 3001) auto-completes goals whose verification conditions are met
+   (line 3023) auto-completes goals whose verification conditions are met
    by world-model evidence, so finished work is retired without an LLM.
 3. **Goal auto-activation (cycle step 12)** — `_auto_activate_goals`
-   (line 3200) promotes proposed goals to active when capacity exists,
+   (line 3222) promotes proposed goals to active when capacity exists,
    closing the Gap 4 → Gap 8 loop without waiting for the LLM to set
    `goal_action` in its JSON.
-4. **Outage-path goal creation** — `_local_analysis` (line 2587) converts
+4. **Outage-path goal creation** — `_local_analysis` (line 2609) converts
    the top world-model improvement suggestion into a goals.json entry
    (deduplicated against existing active goals), so even LLM-outage cycles
    keep the goal store evolving.
@@ -267,7 +284,7 @@ from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 |---|---|---|
 | `_compute_prediction_error(expected, actual)` | 139 | Canonical error metric (0 = exact match … 1 = unrelated) |
 | `record_action(type, desc, expected, source, …)` | 366 | Opens an action triple (predict step) |
-| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 2230; timeout/exception close paths at 2271/2277) |
+| `complete_action(triple_id, actual)` | 444 | Closes the triple, computes error (called from daemon line 2240; timeout/exception close paths at 2281/2287) |
 | `record_action_complete(...)` | 482 | Alternate close entry point (verify step) |
 | `record_prediction(text, timeframe, confidence, basis)` | 512 | Macro-prediction log |
 | `verify_prediction(pred_id)` | 552 | Score a single prediction against evidence |
@@ -280,7 +297,7 @@ from `think_daemon.py`, with line numbers as of HEAD 68bc9c8d1:
 | `format_calibration_guidance()` | 1580 | Guidance when a type is poorly calibrated |
 | `format_improvement_context()` | 1745 | Top improvement suggestions |
 | `format_action_guidance(type, desc)` | 1780 | Pre-execution risk assessment (daemon logs as `[RISK WARNING]`) |
-| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 2106, params via `_action_params_from_act`) |
+| `predict_action_outcome(type, desc, params)` | 1846 | Data-driven expected outcome (daemon line 2131, params via `_action_params_from_act`) |
 | `save(path)` / `load(path)` | 2047 / 2117 | Persistence |
 
 Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
@@ -288,7 +305,7 @@ Module helpers: `load_world_model()` (2246), `save_world_model()` (2251),
 
 ## think_daemon.py core-loop navigation map
 
-Direct-read verification (2026-08-01, HEAD `52262233f`) of the daemon's own
+Direct-read verification (2026-08-01, HEAD `ade0b177a`) of the daemon's own
 structure — the counterpart to the world-model map above. This fulfils the
 standing commitment to read and outline the core loop (lines 200–400 turned
 out to be infrastructure, not the loop itself: placeholder-step guard,
@@ -297,49 +314,52 @@ state helpers, code-drift detection, PID lock; the loop lives in
 
 | Function | Line | Role |
 |---|---|---|
-| `_is_placeholder_step(step)` | 284 | Rejects plan steps with no actionable content (empty/“Step A” desc, “n/a” verification) |
-| `load_daemon_state` / `save_daemon_state` | 312 / 322 | v1→v2 migration (cycle_history); atomic JSON persistence |
-| `_print_cycle_stats()` | 326 | Reliability summary (`--once` / status output) |
-| `_git_head()` | 366 | Repo HEAD short hash for drift detection |
-| `_check_code_drift(ds)` | 381 | Warns + records `code_drift` block when repo moved past `startup_head` |
-| `_schedule_drift_restart(ds)` | 426 | Drift auto-restart (48b3ce5cd): schedules detached `evolve_daemon.sh restart` in 5 s, exits this process |
-| `_acquire_daemon_lock()` | 491 | Atomic `O_CREAT|O_EXCL` PID lock; stale/zombie-PID takeover; per-cycle ownership re-verify |
-| `_release_daemon_lock()` | 581 | Lock release (also on shutdown) |
-| `_format_goal_evidence(goal, wm)` | 822 | Goal progress line: verification criteria + world-model evidence (new in d8edfb4cd) |
-| `_build_thinking_prompt(state)` | 856 | JSON-instructing prompt: state snapshot, goals w/ evidence, calibration guidance |
-| `_try_parse_json(raw)` | 1152 | Lenient JSON extraction from LLM output |
-| `_subject_is_resolved(text)` | 1253 | Evidence-based resolution check (feb075dde): subject is documented (source file + reference doc exist) |
-| `_prune_self_model(sm, daemon_state)` | 1275 | Pre-/post-cycle stale-weakness pruning + documented-subject resolution (fixation protection) |
-| `_action_params_from_act(act, atype)` | 1754 | Shared parameter extractor for predict/record parity (new in d6afa6faa) |
-| `_apply_insights(result, state)` | 1778 | Action selection + execution: dedup gate, predict → record → execute → complete → feedback |
-| `_auto_detect_provider_from_env` / `_ensure_runtime_main` / `_ensure_provider_env` | 2329 / 2349 / 2422 | Runtime provider bootstrap (opencode-go main, key propagation) |
-| `_call_llm(messages, task)` | 2450 | Async LLM call via auxiliary client under the adaptive retry budget |
-| `_select_state_check_action(state)` | 2519 | Fallback-cycle action picker (least-sampled action type) |
-| `_local_analysis(state)` | 2587 | No-LLM fallback: data-driven insight + auto-goal creation + state-check action |
-| `_bridge_world_model_to_self_model(wm, sm)` | 2866 | Discrepancy patterns → self-model weaknesses |
-| `_reconcile_goals_with_world(wm)` | 3001 | Auto-complete goals whose criteria are met by world-model evidence |
-| `_auto_activate_goals()` | 3200 | Promote proposed goals → active (Gap 4 → Gap 8 bridge) |
-| `run_one_cycle()` | 3291 | Timeout wrapper around `_run_cycle_body` |
-| `_validate_shell_command(cmd)` | 3370 | Pre-flight shell validation (unbalanced quotes, compile check) |
-| `_execute_shell_action(cmd, timeout)` | 3436 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
-| `_run_cycle_body(result, ds)` | 3457 | **The core cycle** (steps 1–8 in “One cycle” above) |
-| `_mark_startup(ds, interval, head)` | 3750 | Stamp `startup_head`, clear stale `code_drift` block, reset inherited extended-outage counter to probe tier |
-| `run_daemon(interval, max_cycles)` | 3785 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
-| `_run_verification()` | 3867 | No-LLM self-test of the predict→act→observe→learn cycle |
-| `bootstrap_evolve_data()` | 4015 | Seed evolve JSON files (idempotent) |
-| `_show_status()` | 4193 | `--status` snapshot |
-| `main()` | 4330 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
+| `_llm_retry_policy(consecutive_fallback_cycles, budget)` | 188 | Adaptive retry budget: 2×90 s healthy → 0-attempt skip tier in extended outage (see the step-6 table) |
+| `_apply_cycle_budget(budget_seconds)` | 254 | Wall-clock cap for `--once` cron runs (resolved gap: 200 s cycle vs 3-min cron limit) |
+| `_set_llm_retry_policy(consecutive_fallback_cycles)` | 264 | Per-cycle policy setter: clamps retry budget to the remaining wall clock, returns `(retries, attempt_timeout)` |
+| `_is_placeholder_step(step)` | 294 | Rejects plan steps with no actionable content (empty/“Step A” desc, “n/a” verification) |
+| `load_daemon_state` / `save_daemon_state` | 322 / 332 | v1→v2 migration (cycle_history); atomic JSON persistence |
+| `_print_cycle_stats()` | 336 | Reliability summary (`--once` / status output) |
+| `_git_head()` | 376 | Repo HEAD short hash for drift detection |
+| `_check_code_drift(ds)` | 391 | Warns + records `code_drift` block when repo moved past `startup_head` |
+| `_schedule_drift_restart(ds)` | 436 | Drift auto-restart (48b3ce5cd): schedules detached `evolve_daemon.sh restart` in 5 s, exits this process |
+| `_acquire_daemon_lock()` | 501 | Atomic `O_CREAT|O_EXCL` PID lock; stale/zombie-PID takeover; per-cycle ownership re-verify |
+| `_release_daemon_lock()` | 591 | Lock release (also on shutdown) |
+| `_format_goal_evidence(goal, wm)` | 832 | Goal progress line: verification criteria + world-model evidence (new in d8edfb4cd) |
+| `_build_thinking_prompt(state)` | 866 | JSON-instructing prompt: state snapshot, goals w/ evidence, calibration guidance |
+| `_try_parse_json(raw)` | 1162 | Lenient JSON extraction from LLM output |
+| `_subject_is_resolved(text)` | 1263 | Evidence-based resolution check (feb075dde): subject is documented (source file + reference doc exist) |
+| `_prune_self_model(sm, daemon_state)` | 1285 | Pre-/post-cycle stale-weakness pruning + documented-subject resolution (fixation protection) |
+| `_action_params_from_act(act, atype)` | 1764 | Shared parameter extractor for predict/record parity (new in d6afa6faa) |
+| `_apply_insights(result, state)` | 1788 | Action selection + execution: dedup gate, predict → record → execute → complete → feedback |
+| `_auto_detect_provider_from_env` / `_ensure_runtime_main` / `_ensure_provider_env` | 2339 / 2359 / 2432 | Runtime provider bootstrap (opencode-go main, key propagation) |
+| `_call_llm(messages, task)` | 2460 | Async LLM call via auxiliary client under the adaptive retry budget; passes `timeout=per_attempt_timeout` into `async_call_llm` (986f1f219) |
+| `_select_state_check_action(state)` | 2541 | Fallback-cycle action picker (least-sampled action type) |
+| `_local_analysis(state)` | 2609 | No-LLM fallback: data-driven insight + auto-goal creation + state-check action |
+| `_bridge_world_model_to_self_model(wm, sm)` | 2888 | Discrepancy patterns → self-model weaknesses |
+| `_reconcile_goals_with_world(wm)` | 3023 | Auto-complete goals whose criteria are met by world-model evidence |
+| `_auto_activate_goals()` | 3222 | Promote proposed goals → active (Gap 4 → Gap 8 bridge) |
+| `run_one_cycle()` | 3313 | Timeout wrapper around `_run_cycle_body` |
+| `_validate_shell_command(cmd)` | 3392 | Pre-flight shell validation (unbalanced quotes, compile check) |
+| `_execute_shell_action(cmd, timeout)` | 3458 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
+| `_run_cycle_body(result, ds)` | 3479 | **The core cycle** (steps 1–8 in “One cycle” above) |
+| `_mark_startup(ds, interval, head)` | 3772 | Stamp `startup_head`, clear stale `code_drift` block, reset inherited extended-outage counter to probe tier |
+| `run_daemon(interval, max_cycles)` | 3807 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
+| `_run_verification()` | 3889 | No-LLM self-test of the predict→act→observe→learn cycle |
+| `bootstrap_evolve_data()` | 4037 | Seed evolve JSON files (idempotent) |
+| `_show_status()` | 4215 | `--status` snapshot |
+| `main()` | 4352 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
 
 Action-execution call sites inside `_apply_insights` (current lines):
-`_action_params_from_act` 2120 (predict path) / 2154 (record path),
-`predict_action_outcome` 2121, `record_action` 2155, `format_action_guidance`
-2161, `complete_action` 2230, `[PREDICTION]` feedback 2254/2258, timeout
-close 2271, exception close 2277.
+`_action_params_from_act` 2130 (predict path) / 2164 (record path),
+`predict_action_outcome` 2131, `record_action` 2165, `format_action_guidance`
+2171, `complete_action` 2240, `[PREDICTION]` feedback 2264/2268, timeout
+close 2281, exception close 2287.
 
 ## Prediction feedback (closing the loop)
 
-After each executed action the daemon (lines 2242–2246; timeout/exception
-close paths at 2260/2266) appends a
+After each executed action the daemon (lines 2247–2273; timeout/exception
+close paths at 2281/2287) appends a
 `[PREDICTION ✓/△/✗] error=<n>: expected "<…>" → "<…>"` line to the
 combined output that feeds the next cycle's prompt — the LLM sees its own
 prediction vs. the actual outcome with an error icon (≤0.3 ✓, ≤0.6 △,
@@ -375,6 +395,18 @@ same way.
   time each (60.9–61.9 s at ticks 314/315), consistent with the policy's
   estimate. The endpoint remains unrecovered; the every-2nd cadence keeps
   blindness ≤ 2 cycles once the provider returns.
+  **Resolved at tick 319 (2026-08-01 04:57) — the `986f1f219` timeout fix
+  is proven in the wild:** after the drift-restart onto `986f1f219`
+  (04:56), which threaded `timeout=per_attempt_timeout` into
+  `async_call_llm` (raising the inner HTTP cap from the auxiliary
+  client's internal 30 s to the daemon's per-attempt timeout), tick 319
+  completed **llm-backed in 88.1 s** (HTTP 200), the recovery note was
+  injected, and `consecutive_fallback_cycles` reset to 0. This matches
+  the diagnosis exactly: the endpoint was healthy-but-slow (healthy
+  completions were observed up to 31 s+ and were being cut off by the
+  inner 30 s cap, not by the outer budget), so the fix ended the outage
+  blindness the moment it loaded. The every-2nd-cycle probe cadence
+  remains the safety net for genuine provider outages.
 - **Startup outage-counter inheritance (FIXED 2026-08-01)**: a restarted
   daemon inherited `consecutive_fallback_cycles` from the dead process,
   so after the 01:04 drift-restart (which inherited counter=10) ticks
@@ -409,6 +441,12 @@ same way.
   entry in the map and every call site; all numbers were re-read by AST
   and grep, and the world-model.py map was re-confirmed unchanged
   (world_model.py untouched by that commit).
+  Re-verified again at HEAD `ade0b177a` (2026-08-01): the timeout
+  pass-through `986f1f219` (+9 before `_call_llm`, +12 inside its body →
+  net +10 up to `_call_llm` / +22 onward after the
+  `scripts/verify_loop_map.py` tracking entry) — all numbers re-read via
+  `scripts/verify_loop_map.py`, and the world-model.py map was
+  re-confirmed unchanged (world_model.py untouched since `042a37017`).
 
 ## Resolved gaps
 
