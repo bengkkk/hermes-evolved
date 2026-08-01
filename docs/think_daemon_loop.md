@@ -105,8 +105,8 @@ last-20 `cycle_history`). The cycle body:
    | 0 (healthy)  | 2 attempts × 90 s | full budget (pre-adaptive behavior)|
    | 1            | 1 attempt × 60 s  | warm outage                        |
    | 2            | 1 attempt × 45 s  | deep outage, one probe             |
-   | ≥3, skip     | **0 attempts**    | extended outage: straight to local analysis, no dead time |
-   | ≥3, probe    | 1 attempt × 90 s  | every 4th cycle, so recovery is detected within 4 cycles. Cap raised 30 s → 90 s (2026-07-31): the auxiliary client's internal transport timeout (~30 s) + one in-client retry must fit inside it; a 30 s cap failed probes on endpoints that were merely slow (healthy opencode-go latencies observed at 31 s) |
+   | ≥3, skip     | **0 attempts**    | extended outage, odd cycle: straight to local analysis, no dead time |
+   | ≥3, probe    | 1 attempt × 90 s  | every 2nd cycle, so recovery is detected within 2 cycles. Cap raised 30 s → 90 s (2026-07-31): the auxiliary client's internal transport timeout (~30 s) + one in-client retry must fit inside it; a 30 s cap failed probes on endpoints that were merely slow (healthy opencode-go latencies observed at 31 s). Cadence 4th → 2nd (2026-08-01): endpoint observed intermittent on a ~15 min period (fresh-process probes PONG'd in 2.8-3.0 s while daemon probes timed out), so the 4-cycle cadence left the daemon blind for up to 60 min during up-windows |
 
    Each failed probe costs ~45–60 s of dead time (auxiliary client's
    internal retry + fallback stages), so during a multi-cycle outage probes
@@ -352,6 +352,9 @@ same way.
   The next probe fires at tick 306 (counter 12). Ticks 297/301/303-305
   were pure local-analysis + action-execution cycles per daemon_state/
   last_output; ticks 298 and 302 each burned one bounded 90 s probe.
+  *(Cadence updated 2026-08-01: the extended-outage probe now fires every
+  2nd cycle — see the retry-policy table above; this bullet records the
+  historical 4th-cycle behavior observed through tick 305.)*
 - **Startup outage-counter inheritance (FIXED 2026-08-01)**: a restarted
   daemon inherited `consecutive_fallback_cycles` from the dead process,
   so after the 01:04 drift-restart (which inherited counter=10) ticks

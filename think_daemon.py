@@ -138,13 +138,20 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 # cycle — most of the 200s hard timeout. The policy is applied once per
 # cycle via _set_llm_retry_policy() and read by _call_llm(), keeping the
 # call signature stable (tests monkeypatch _call_llm with (messages, task)).
-# Extended outages (>=3 consecutive fallbacks) skip the probe entirely on
-# most cycles (0 attempts) and probe only every 4th cycle with a 90s cap,
-# so recovery is still detected without burning most of every cycle budget
+# Extended outages (>=3 consecutive fallbacks) skip the probe on odd
+# cycles (0 attempts) and probe every 2nd cycle with a 90s cap, so
+# recovery is still detected without burning most of every cycle budget
 # on a dead endpoint. The cap must exceed the auxiliary client's internal
 # transport timeout (~30s) + its one in-client retry (~30s): a 30s cap cut
 # probes off mid-retry and failed even on endpoints that were merely slow
-# (healthy opencode-go latencies observed up to 31s on 2026-07-31).
+# (healthy opencode-go latencies observed up to 31s on 2026-07-31),
+# extending outage blindness by another 2 cycles. The 4th-cycle cadence
+# was halved to every-2nd on 2026-08-01: direct probes from fresh
+# processes returned PONG in 2.8-3.0s at 03:27 and 03:44 while the
+# daemon's own probes timed out at 02:37 and 03:38 — the endpoint was
+# intermittent on a ~15 min period, and with 15-min ticks the 4-cycle
+# cadence sampled that signal far below its Nyquist rate, leaving the
+# daemon blind for up to 60 min during up-windows.
 _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
@@ -187,10 +194,10 @@ def _llm_retry_policy(
       (identical to the pre-adaptive behavior).
     - Warm outage (1): single retry with a 60 s cap.
     - Deep outage (2): one probe attempt with a 45 s cap.
-    - Extended outage (>=3): skip the LLM probe on most cycles (0 attempts)
-      so the full cycle budget goes to local analysis + action execution,
-      but probe every 4th cycle with a 90 s cap so recovery is still
-      detected within a bounded number of cycles. The cap is 90 s (not
+    - Extended outage (>=3): skip the LLM probe on odd cycles (0 attempts)
+      so alternating cycles give the full budget to local analysis + action
+      execution, but probe every 2nd cycle with a 90 s cap so recovery is
+      still detected within a bounded number of cycles. The cap is 90 s (not
       30 s) because the auxiliary client's internal transport timeout
       (~30 s) plus its one in-client retry (~30 s) must fit inside it;
       with a 30 s cap the probe was cut off mid-retry and failed even
@@ -217,13 +224,17 @@ def _llm_retry_policy(
         retries, timeout = 1, 60.0
     elif consecutive_fallback_cycles == 2:
         retries, timeout = 1, 45.0
-    elif consecutive_fallback_cycles % 4 == 0:
-        # Probe cycle: bounded probe so recovery is detected within 4 cycles.
-        # 90s (not 30s): the auxiliary client's internal transport timeout
-        # (~30s) + its one in-client retry (~30s) must fit inside the cap,
-        # and healthy opencode-go latencies have been observed at 31s. A 30s
-        # cap failed probes on endpoints that were merely slow, extending
-        # outage blindness by another 4 cycles.
+    elif consecutive_fallback_cycles % 2 == 0:
+        # Probe cycle: bounded probe so recovery is detected within 2
+        # cycles. 90s (not 30s): the auxiliary client's internal transport
+        # timeout (~30s) + its one in-client retry (~30s) must fit inside
+        # the cap, and healthy opencode-go latencies have been observed at
+        # 31s. A 30s cap failed probes on endpoints that were merely slow,
+        # extending outage blindness by another 2 cycles. Every-2nd (not
+        # every-4th) since 2026-08-01: the endpoint was observed
+        # intermittent on a ~15 min period (fresh-process probes PONG'd in
+        # 2.8-3.0s while daemon probes timed out), so the 4-cycle cadence
+        # left the daemon blind for up to 60 min during up-windows.
         retries, timeout = 1, 90.0
     else:
         retries, timeout = 0, 0.0
@@ -3749,7 +3760,7 @@ def _mark_startup(ds: Dict[str, Any], interval_seconds: int, head: Optional[str]
     The same reasoning applies to ``consecutive_fallback_cycles``: the
     counter is evidence gathered by the *previous* process.  A fresh
     process inheriting a skip-tier value (>= 3) would skip LLM probes
-    for up to 4 more cycles even after the provider recovered — a
+    for up to 2 more cycles even after the provider recovered — a
     needless blind window after every restart (observed 2026-08-01:
     the 01:04 drift-restart inherited counter=10; ticks 304-305
     skipped probes while a direct ``_call_llm`` probe returned PONG in

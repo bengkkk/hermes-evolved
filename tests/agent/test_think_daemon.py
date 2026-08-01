@@ -486,7 +486,7 @@ class TestCodeDriftDetection:
         ``consecutive_fallback_cycles`` is evidence gathered by the
         (now-dead) process that last held the lock.  If a fresh process
         inherited a skip-tier value (>= 3) it would skip LLM probes for
-        up to 4 more cycles even after the provider recovered — a
+        up to 2 more cycles even after the provider recovered — a
         needless blind window after every drift/manual restart.  The
         reset targets the probe tier (4 → one bounded 90 s attempt), so
         a still-down endpoint costs exactly one bounded probe before the
@@ -1941,24 +1941,30 @@ class TestLlmRetryPolicy:
 
     def test_extended_outage_skips_probe(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
-        # Depth >= 3 on a non-probe cycle: 0 attempts — the whole cycle
+        # Depth >= 3 on an odd (skip) cycle: 0 attempts — that cycle's
         # budget goes to local analysis + action execution instead of a
-        # doomed 45s probe.
+        # doomed 45s probe. Odd counters alternate with even (probe)
+        # counters so recovery is detected within 2 cycles.
         assert td._llm_retry_policy(3) == (0, 0.0)
         assert td._llm_retry_policy(5) == (0, 0.0)
-        assert td._llm_retry_policy(6) == (0, 0.0)
         assert td._llm_retry_policy(7) == (0, 0.0)
-        assert td._llm_retry_policy(10) == (0, 0.0)
+        assert td._llm_retry_policy(9) == (0, 0.0)
+        assert td._llm_retry_policy(11) == (0, 0.0)
 
     def test_extended_outage_probe_cycle(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
-        # Every 4th cycle (depth % 4 == 0): a bounded 90s probe so
-        # recovery is still detected within 4 cycles of the provider
+        # Every 2nd cycle (depth % 2 == 0): a bounded 90s probe so
+        # recovery is still detected within 2 cycles of the provider
         # coming back. 90s (not 30s) so the auxiliary client's internal
         # transport timeout + one retry fit inside the cap; healthy
-        # opencode-go latencies have been observed up to 31s.
+        # opencode-go latencies have been observed up to 31s. Every-2nd
+        # (not every-4th) since 2026-08-01: the endpoint was observed
+        # intermittent on a ~15 min period, so the 4-cycle cadence left
+        # the daemon blind for up to 60 min during up-windows.
         assert td._llm_retry_policy(4) == (1, 90.0)
+        assert td._llm_retry_policy(6) == (1, 90.0)
         assert td._llm_retry_policy(8) == (1, 90.0)
+        assert td._llm_retry_policy(10) == (1, 90.0)
         assert td._llm_retry_policy(12) == (1, 90.0)
 
     def test_setter_applies_policy_to_globals(self, evolve_env: Dict) -> None:
