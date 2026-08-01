@@ -760,11 +760,7 @@ ACTION CAPABILITIES (Gap 10):
   - shell: run a shell command (set command)
   - git_commit: add + commit (set message)
   - install_package: pip install (set package)
-  - api_call: external read-only HTTP via the host bridge (set endpoint + method,
-    optional body). Gated deny-by-default: the endpoint MUST be allowlisted AND the
-    PERMISSIONS registry in the state snapshot MUST grant read on its resource.
-    Until a grant exists and the host bridge is running, expect "BLOCKED:" or
-    "bridge unavailable" outcomes — do not spam api_call attempts that cannot pass.
+{api_call_capabilities}
 - CRITICAL: Before every action, set "expected_outcome" to PREDICT what the output will be
   (e.g. "Written main.py (245 bytes)" or "exit=0: files listed"). The daemon compares this
   against the actual result to compute prediction error and improve future calibration.
@@ -948,6 +944,57 @@ def _live_root_prompt_note(
     return note
 
 
+def _api_call_capability_text(perm_entries: Any) -> str:
+    """Render the api_call capability block for the thinking prompt.
+
+    Dynamic (Gap 10 step 4): mirrors the ACTUAL pre-flight gate state instead
+    of the old static "until a grant exists ... do not spam" text, which kept
+    suppressing api_call proposals even after github.read was granted and the
+    host bridge was stood up — calibration stalled at 0 api_call triples
+    because the prompt discouraged the only action type that could produce
+    them. If any resource has a read grant AND a matching allowlist entry,
+    the LLM is told the gate is open and pointed at the exact endpoints;
+    otherwise the discourage text is kept so it does not spam doomed calls.
+    """
+    granted = {
+        res: entry
+        for res, entry in (perm_entries or {}).items()
+        if isinstance(entry, dict) and entry.get("read")
+    }
+    ready = []
+    for e in _API_CALL_ALLOWLIST:
+        res = e.get("resource")
+        if res in granted:
+            ready.append(
+                "{method} https://{host}{path} (resource: {res})".format(
+                    method=e.get("method", "GET"),
+                    host=e.get("host", "?"),
+                    path=e.get("path_prefix", "/"),
+                    res=res,
+                )
+            )
+    if ready:
+        lines = [
+            "- api_call: external read-only HTTP via the host bridge (set endpoint + method,",
+            "    optional body). Deny-by-default gating: endpoint MUST be allowlisted AND the",
+            "    PERMISSIONS registry must grant read on its resource.",
+            "    >>> GATE OPEN <<< — read grant exists for: "
+            + ", ".join(sorted(granted)),
+            "    Ready-to-use allowlisted endpoint(s):",
+        ]
+        lines += [f"      - {r}" for r in ready]
+        lines.append("    Propose api_call actions against these to gather real external")
+        lines.append("    data — they WILL pass pre-flight and calibrate the new type.")
+        return "\n".join(lines)
+    return (
+        "- api_call: external read-only HTTP via the host bridge (set endpoint + method,\n"
+        "    optional body). Gated deny-by-default: the endpoint MUST be allowlisted AND the\n"
+        "    PERMISSIONS registry in the state snapshot MUST grant read on its resource.\n"
+        "    Currently NO read grants are open — expect \"BLOCKED:\" outcomes; do not spam\n"
+        "    api_call attempts that cannot pass."
+    )
+
+
 def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     """Build a self-reflection prompt from current evolve state."""
     tl = state.get("timeline", {})
@@ -980,6 +1027,14 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         permissions_text = "; ".join(_perm_parts) if _perm_parts else "(none declared)"
     else:
         permissions_text = "(none declared)"
+
+    # api_call capability line (Gap 10 step 4): render the ACTUAL gate state
+    # instead of the old static "until a grant exists ... do not spam" text,
+    # which kept suppressing api_call proposals even after github.read was
+    # granted and the host bridge was stood up — calibration stalled at 0
+    # api_call triples because the prompt discouraged the only action type
+    # that could produce them.
+    api_call_capabilities = _api_call_capability_text(sm.get("permissions"))
 
     # Recent events
     events = tl.get("past", {}).get("events", [])
@@ -1253,6 +1308,7 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         weaknesses="; ".join(weaknesses[:3]) if weaknesses else "(none)",
         unknown="; ".join(unknown[:3]) if unknown else "(none)",
         permissions=permissions_text,
+        api_call_capabilities=api_call_capabilities,
         commitments=all_commits,
         events_text=events_text,
         active_project=present.get("active_project", "(none)"),

@@ -877,6 +877,38 @@ class TestBuildThinkingPrompt:
         assert "CURRENT STATE" in prompt
         assert "world model" in prompt.lower()
 
+    def test_prompt_api_call_capabilities_closed_gate(self, evolve_env: Dict) -> None:
+        """No read grants -> api_call capability line keeps the discourage text."""
+        td = evolve_env["module"]
+        prompt = td._build_thinking_prompt(self._make_state())
+        assert "Currently NO read grants are open" in prompt
+        assert "do not spam" in prompt
+
+    def test_prompt_api_call_capabilities_open_gate(self, evolve_env: Dict) -> None:
+        """github.read granted + allowlisted endpoint -> prompt advertises api_call."""
+        td = evolve_env["module"]
+        state = self._make_state()
+        state["self_model"]["permissions"] = {
+            "github": {"read": True, "write": False, "act": False, "cap": None},
+        }
+        prompt = td._build_thinking_prompt(state)
+        assert ">>> GATE OPEN <<<" in prompt
+        assert "https://api.github.com/" in prompt
+        # The old static discouragement must NOT appear when the gate is open.
+        assert "do not spam" not in prompt
+
+    def test_api_call_capability_text_unit(self, evolve_env: Dict) -> None:
+        """Helper directly: empty/malformed permissions never crash."""
+        td = evolve_env["module"]
+        assert "NO read grants" in td._api_call_capability_text(None)
+        assert "NO read grants" in td._api_call_capability_text({})
+        assert "NO read grants" in td._api_call_capability_text(
+            {"github": {"read": False}}
+        )
+        out = td._api_call_capability_text({"github": {"read": True}})
+        assert "GATE OPEN" in out
+        assert "https://api.github.com/" in out
+
     def test_prompt_includes_commitments(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         state = self._make_state()
