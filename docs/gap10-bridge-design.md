@@ -109,7 +109,14 @@ not an assistant.
 4. Calibrate: record 3+ read-only api_call triples, confirm prediction error
    drops below 0.3 for the new type (IN PROGRESS — the daemon's next
    cycles can now reach the bridge; the deny-by-default grant gate is
-   open for read-only GitHub GETs)
+   open for read-only GitHub GETs. 2026-08-01: root-caused why 0 triples
+   had been recorded despite the open grant — the ACTION CAPABILITIES
+   prompt still carried the pre-grant static text "until a grant exists …
+   do not spam api_call attempts", actively suppressing the only action
+   type that could produce the triples. `_api_call_capability_text` now
+   renders the block dynamically from the permission registry + allowlist:
+   open gate → ">>> GATE OPEN <<<" + ready-to-use endpoint listed;
+   closed gate → discourage text kept. Live prompt verified; 653 tests.)
 5. Commit + update self-model state
 
 **Recommendation for first bridge endpoint: `gh` (GitHub).** Reason: a
