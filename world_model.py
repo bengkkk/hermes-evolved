@@ -75,6 +75,13 @@ logger = logging.getLogger(__name__)
 # from the triple.
 _MAX_PARAM_VALUE_LEN = 300
 
+# Punctuation stripped from discrepancy-theme keywords at extraction time so
+# word-boundary matching in format_action_guidance() is reliable ("check:"
+# -> "check", "auto-default:" -> "auto-default"). Internal punctuation
+# (hyphens, dots) is preserved.
+_THEME_PUNCT = ":.,;!?()[]{}'\"`"
+
+
 # ── Schema ────────────────────────────────────────────────────────
 
 # Monotonically incrementing counter for unique IDs within the same timestamp
@@ -1494,19 +1501,45 @@ class WorldModel:
             last_obs = max(timestamps) if timestamps else ""
 
             # Extract common keywords from action descriptions (words that
-            # appear in >30% of the high-error triples of this type)
+            # appear in >30% of the distinct high-error descriptions of this
+            # type, with a floor of 2 distinct descriptions).
+            #
+            # False-positive guard (observed 2026-08-01): a recurring
+            # "State check: list current goals and their statuses" command
+            # run 4x made every generic word in it ("list", "state",
+            # "current", "goals") a shell theme, which then flagged an
+            # unrelated safe action whose description merely contained
+            # "list". Two structural fixes:
+            #   1. Keyword counting is description-deduped — running the SAME
+            #      command N times is one failure mode, not N votes for every
+            #      word in it. (The pattern's ``count`` still reports all N;
+            #      the repeated command itself is surfaced precisely via
+            #      ``recurring_description``.)
+            #   2. A keyword must appear in >= 2 DISTINCT failing
+            #      descriptions — words unique to one description are that
+            #      command's identity, not a common theme, and words shared
+            #      across the whole type (generic verbs like "list") do not
+            #      discriminate failures from successes.
+            #   3. Tokens are punctuation-normalized ("check:" -> "check") so
+            #      word-boundary matching in format_action_guidance works.
+            seen_descs: set = set()
             all_words: List[str] = []
             for t in triples:
                 desc = (t.get("action_description", "") or "").lower()
+                if desc in seen_descs:
+                    continue
+                seen_descs.add(desc)
                 all_words.extend(
-                    w for w in desc.split()
-                    if len(w) > 3 and w not in ("with", "from", "that", "this", "into")
+                    w.strip(_THEME_PUNCT) or w
+                    for w in desc.split()
+                    if len(w) > 3
+                    and w not in ("with", "from", "that", "this", "into")
                 )
 
             word_counts: Dict[str, int] = {}
             for w in all_words:
                 word_counts[w] = word_counts.get(w, 0) + 1
-            threshold = max(1, len(triples) * 0.3)
+            threshold = max(2, int(len(seen_descs) * 0.3))
             common_themes = sorted(
                 [w for w, c in word_counts.items() if c >= threshold],
                 key=lambda w: word_counts[w],
@@ -1873,8 +1906,30 @@ class WorldModel:
             for pat in patterns:
                 if pat.get("action_type") != action_type:
                     continue
+                # 2a. Recurring-command check — the strongest, most precise
+                # signal. A command that failed identically >= min_recurrence
+                # times is flagged when the same phrase is about to run again.
+                # Keyword themes only approximate this; matching the full
+                # phrase keeps it exact, so a generic word in the recurring
+                # command (e.g. "list") never flags an unrelated action.
+                rec = pat.get("recurring_description")
+                if rec and re.search(
+                    rf"\b{re.escape(rec.strip().lower())}\b", desc_lower
+                ):
+                    parts.append(
+                        f"  ⚠ Recurring failing command: {rec!r} "
+                        f"({pat['count']} failures, avg err {pat['avg_error']:.2f})"
+                    )
+                    continue
                 themes = pat.get("common_themes", [])
-                matched_keywords = [kw for kw in themes if kw in desc_lower]
+                # Word-boundary match, not substring: theme "list" must not
+                # flag an unrelated "List saved /tmp evidence files" action,
+                # and "check" must not match "checkout". Themes are
+                # punctuation-normalized at extraction so \b is reliable.
+                matched_keywords = [
+                    kw for kw in themes
+                    if re.search(rf"\b{re.escape(kw)}\b", desc_lower)
+                ]
                 if matched_keywords:
                     parts.append(
                         f"  ⚠ Keyword match in discrepancy pattern: "

@@ -1283,6 +1283,43 @@ class TestActionGuidance:
         guidance = wm.format_action_guidance("write_file", "write something")
         assert guidance is None
 
+    def test_recurring_command_does_not_poison_generic_keywords(self):
+        """A command repeated N times must not turn its generic words into
+        themes that flag unrelated actions (observed false positive 2026-08-01:
+        the word "list" from a recurring "State check: list current goals"
+        command flagged a safe "List saved /tmp evidence files" action)."""
+        wm = WorldModel()
+        for i in range(8):
+            wm.record_action_complete(
+                "shell", f"safe maintenance task {i}",
+                "exit=0: done", "should succeed",
+            )
+        for _ in range(4):
+            wm.record_action_complete(
+                "shell", "State check: list current goals and their statuses",
+                "exit=1: failed", "should succeed",
+            )
+        for i in range(2):
+            wm.record_action_complete(
+                "shell", f"post maintenance task {i}",
+                "exit=0: done", "should succeed",
+            )
+        # The exact recurring command is still flagged via recurring_description.
+        g1 = wm.format_action_guidance(
+            "shell", "State check: list current goals and their statuses"
+        )
+        assert g1 is not None
+        assert "Recurring failing command" in g1
+        # ...but an unrelated action merely containing the generic word "list"
+        # is NOT flagged, and no generic keyword themes survive.
+        g2 = wm.format_action_guidance("shell", "List saved /tmp evidence files")
+        assert g2 is None
+        themes = [
+            w for p in wm.get_discrepancy_patterns()
+            for w in p.get("common_themes", [])
+        ]
+        assert "list" not in themes
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Formatting methods
