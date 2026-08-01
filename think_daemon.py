@@ -2072,6 +2072,49 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                 # completed_sessions.outcomes stays a clean list.
                 _r["outcomes_list"] = [str(_ol)] if _ol else []
 
+    # The same bug class extends to the goal and memory record blocks,
+    # which _apply_insights feeds straight into data_layer persistence:
+    # an int ``new_goal.gap_reference`` was the 2026-08-01 06:17 cycle
+    # crash (``AttributeError: 'int' object has no attribute 'strip'``
+    # in ``_find_similar_active_goal``). data_layer now defends the
+    # persistence boundary with ``_coerce_stripped_str``, but coercing
+    # here keeps non-string types out of the goal and memory stores
+    # entirely — otherwise an int ``episodic_record.summary`` is stored
+    # raw and crashes readers later (``format_context`` slices
+    # ``e['summary'][:80]``; ``get_semantic_by_topic`` calls
+    # ``.lower()`` on topic/fact), and an int ``new_goal.title`` passes
+    # the truthy gate in _apply_insights and persists as a garbage
+    # "123" goal. Numeric fields (priority, salience, confidence) coerce
+    # to int/float; unconvertible values fall back to the schema default
+    # so downstream range comparisons never TypeError.
+    for _rec, _str_flds in (
+        ("new_goal", ("title", "description", "rationale",
+                      "gap_reference", "verification_criteria")),
+        ("goal_action", ("goal_id", "new_status", "note")),
+        ("episodic_record", ("mtype", "summary", "details")),
+        ("semantic_record", ("topic", "fact", "source")),
+        ("procedural_record", ("pattern", "trigger", "procedure")),
+    ):
+        _r = parsed.get(_rec)
+        if isinstance(_r, dict):
+            for _fld in _str_flds:
+                _v = _r.get(_fld)
+                if _v is not None and not isinstance(_v, str):
+                    _r[_fld] = str(_v).strip()
+            _prio = _r.get("priority")
+            if _prio is not None and not isinstance(_prio, int):
+                try:
+                    _r["priority"] = int(_prio)
+                except (TypeError, ValueError):
+                    _r["priority"] = 3
+            for _num_fld, _default in (("salience", 0.5), ("confidence", 0.7)):
+                _nv = _r.get(_num_fld)
+                if _nv is not None and not isinstance(_nv, (int, float)):
+                    try:
+                        _r[_num_fld] = float(_nv)
+                    except (TypeError, ValueError):
+                        _r[_num_fld] = _default
+
 
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""

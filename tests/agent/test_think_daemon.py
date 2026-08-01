@@ -2686,6 +2686,146 @@ class TestCoerceLlmResponseFields:
         prompt = td._build_thinking_prompt(state)  # must not raise TypeError
         assert "real commitment" in prompt
 
+    def test_new_goal_gap_reference_int_coerced(self, evolve_env: Dict) -> None:
+        """Exact 2026-08-01 06:17 crash reproduction: an int
+        ``new_goal.gap_reference`` must be coerced to a string so
+        ``propose_goal`` → ``_find_similar_active_goal`` can never hit
+        ``'int' object has no attribute 'strip'`` again."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "new_goal": {
+                "title": "Finish Phase 2", "description": "Close all gaps",
+                "gap_reference": 6,  # the crash value (emitted as int)
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        ng = parsed["new_goal"]
+        assert ng["gap_reference"] == "6"
+        assert isinstance(ng["gap_reference"], str)
+
+    def test_new_goal_all_string_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "new_goal": {
+                "title": 123,
+                "description": {"nested": True},
+                "rationale": ["list"],
+                "gap_reference": 8,
+                "verification_criteria": 0,
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        ng = parsed["new_goal"]
+        assert ng["title"] == "123"
+        assert ng["description"] == "{'nested': True}"
+        assert ng["rationale"] == "['list']"
+        assert ng["gap_reference"] == "8"
+        assert ng["verification_criteria"] == "0"
+
+    def test_new_goal_priority_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "new_goal": {"title": "t", "description": "d", "priority": "2"},
+        }
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["new_goal"]["priority"] == 2
+        parsed2: Dict[str, Any] = {
+            "new_goal": {"title": "t", "description": "d", "priority": "high"},
+        }
+        td._coerce_llm_response_fields(parsed2)
+        assert parsed2["new_goal"]["priority"] == 3  # schema default
+
+    def test_goal_action_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "goal_action": {
+                "goal_id": 123, "new_status": ["active"], "note": {"n": 1},
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        ga = parsed["goal_action"]
+        assert ga["goal_id"] == "123"
+        assert ga["new_status"] == "['active']"
+        assert ga["note"] == "{'n': 1}"
+
+    def test_episodic_record_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "episodic_record": {
+                "mtype": 42, "summary": {"s": 1}, "details": None,
+                "salience": "high",
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        er = parsed["episodic_record"]
+        assert er["mtype"] == "42"
+        assert er["summary"] == "{'s': 1}"
+        assert er["details"] is None  # None preserved
+        assert er["salience"] == 0.5  # unconvertible → schema default
+
+    def test_semantic_record_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "semantic_record": {
+                "topic": 7, "fact": ["x"], "source": {"src": 1},
+                "confidence": "n/a",
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        sr = parsed["semantic_record"]
+        assert sr["topic"] == "7"
+        assert sr["fact"] == "['x']"
+        assert sr["source"] == "{'src': 1}"
+        assert sr["confidence"] == 0.7  # unconvertible → schema default
+
+    def test_procedural_record_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "procedural_record": {
+                "pattern": 1, "trigger": {"t": 2}, "procedure": ["p"],
+            },
+        }
+        td._coerce_llm_response_fields(parsed)
+        pr = parsed["procedural_record"]
+        assert pr["pattern"] == "1"
+        assert pr["trigger"] == "{'t': 2}"
+        assert pr["procedure"] == "['p']"
+
+    def test_apply_insights_goal_and_memory_blocks_no_crash(self, evolve_env: Dict) -> None:
+        """Full pipeline: an int ``new_goal.gap_reference`` AND an int
+        ``episodic_record.summary`` from the LLM must land in the goal and
+        memory stores as strings (the 06:17 crash class) instead of
+        killing the cycle or polluting stores with non-string rows."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "new_goal": {
+                "title": "Type-guard test goal", "description": "Verify coercion",
+                "gap_reference": 6,
+            },
+            "episodic_record": {"summary": 42, "mtype": "observation"},
+            "action": None,
+        }
+        td._coerce_llm_response_fields(parsed)
+        state = {
+            "timeline": {"version": 1, "past": {}, "present": {}, "future": {}},
+            "self_model": {"version": 1, "identity": {}, "state": {},
+                           "capabilities": {}, "commitments": {}},
+            "orientation": None,
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+            "world_model": None,
+        }
+        updates = td._apply_insights(parsed, state)  # must not raise
+        # Episodic memory persisted with the coerced string summary
+        import json as _json
+        mem_path = evolve_env["paths"]["evolve_dir"].parent / "memory.json"
+        if mem_path.exists():
+            mem = _json.loads(mem_path.read_text(encoding="utf-8"))
+            for e in mem.get("episodic", []):
+                if e.get("summary") is not None:
+                    assert isinstance(e["summary"], str), e
+        # Timeline unchanged (no event/outcome/commitment in parsed)
+        assert "timeline" in updates
+
 
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).
