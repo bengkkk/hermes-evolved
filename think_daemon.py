@@ -1989,11 +1989,15 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
 
     # ── Actions (Gap 10) ──
     act = result.get("action")
-    # Auto-default action for cycle 1+ to prevent null-action drift.
-    # Skip auto-default in fallback (local-analysis) mode — the LLM
-    # didn't produce an action because it's unavailable, not because
-    # it chose not to. Auto-defaulting would pollute the world model
-    # with synthetic action triples (spamming noisy "ls" entries).
+    # Auto-default action for tick 10+ to prevent null-action drift.
+    # NOTE: the auto-default RUNS in fallback (local-analysis) mode too —
+    # the action is marked "Exploratory:" so outage-cycle triples are
+    # identifiable as exploration rather than LLM-directed work.  The LLM
+    # didn't produce an action because it's unavailable, not because it
+    # chose not to; the rotating actions are low-risk and keep collecting
+    # diverse world-model data during outages.  (In practice _local_analysis
+    # always supplies a state-check action, so this fallback path is a
+    # robustness net for fallback results without an action.)
     #
     # _ROTATING_AUTOS is the module-level constant defined near the top
     # of this file — every entry is guard-tested (TestRotatingAutoCommands)
