@@ -1,8 +1,8 @@
 # Gap 10 — Real Action Bridge: Design
 
-**Status:** Level 1 steps 1-2 done (permission registry in self-model +
-`api_call` action type with deny-by-default pre-flight validation); steps
-3-5 remain
+**Status:** Level 1 steps 1-4 done; step 5 (commit + self-model state) in
+progress. First real external action executed and recorded as a world-model
+triple 2026-08-01.
 **Owner:** think_daemon self-directed evolution
 **Target:** Turn the daemon from a sandboxed local actor into an economic actor
 with real-world permissions, keeping every action verifiable through the
@@ -117,7 +117,26 @@ not an assistant.
    renders the block dynamically from the permission registry + allowlist:
    open gate → ">>> GATE OPEN <<<" + ready-to-use endpoint listed;
    closed gate → discourage text kept. Live prompt verified; 653 tests.)
-5. Commit + update self-model state
+   FIRST LIVE TRIPLE 2026-08-01 19:06:55Z: the daemon itself fired
+   `GET https://api.github.com/` through the bridge and recorded
+   `act_20260801190655_2` (expected "HTTP 200: JSON body listing GitHub
+   API endpoint fields" → actual `exit=0: {"status": 200, "bytes": 2262,
+   "body": "{\"current_user_url\":...}"}`). The bridge is proven
+   end-to-end from inside the daemon's own loop: pre-flight allowlist +
+   permission gate passed, execution delegated to the host, structured
+   outcome returned, triple persisted automatically — no explicit
+   evidence write_file was needed. CALIBRATION FIX: the raw-string error
+   scorer gave this fully-correct prediction 0.5 ("mixed") because the
+   mutual exit=0 heuristic requires an `exit=` marker on the expected
+   side, while api_call predictions phrase success as "HTTP 200".
+   `_compute_prediction_error` now has a mutual HTTP-status heuristic
+   (expected 2xx + observed 2xx → 0.15; hundreds-digit class match so a
+   predicted 200 vs observed 404 still falls through). Recomputed error
+   for the stored triple: 0.5 → 0.15. 211 world-model + daemon tests pass.)
+5. ✅ Commit + update self-model state (DONE 2026-08-01 — live triple
+   validated, scoring fixed, unknown_areas resolved: api_call IS wired into
+   the action loop and gated by allowlist + permission registry; outcomes
+   ARE auto-recorded as world-model triples)
 
 **Recommendation for first bridge endpoint: `gh` (GitHub).** Reason: a
 classic PAT is already stored in `~/.git-credentials` on the host — zero new
@@ -130,7 +149,11 @@ code repositories are one of the highest-value Gap 10 resources.
   endpoints rejected with a clear error and NO execution
 - World model records external-action triples with avg error < 0.3
 - Existing test suite still passes (401 tests); daemon cycles stay healthy
-- Timeline shows an audit entry for every external call
+- Audit trail per external call: world-model triple + host-side
+  `bridge_audit.log` entry (executed AND blocked decisions; verified for
+  the first live call 2026-08-01 19:06:55Z). Note: the daemon timeline is
+  LLM-curated milestones (via `event_to_record`), NOT a per-action log —
+  per-call audit lives in the triple + bridge log, not the timeline.
 
 ## 7. Open questions
 

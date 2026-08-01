@@ -235,6 +235,31 @@ def _compute_prediction_error(
     ):
         return 0.15
 
+    # ── Mutual HTTP-status success heuristic (api_call outcomes) ──
+    # The host bridge wraps api_call results as
+    #   exit=0: {"status": 200, "bytes": N, "body": "..."}
+    # while daemon predictions phrase success as "HTTP 200: ..." — no
+    # exit= marker — so the mutual exit=0 heuristic above cannot fire
+    # and a fully successful call scores 0.5 ("mixed") purely because
+    # the JSON body dwarfs the prediction text (observed 2026-08-01 on
+    # the first real GitHub read: expected "HTTP 200: JSON body listing
+    # GitHub API endpoint fields" vs actual exit=0/status 200/2262 bytes
+    # scored 0.5, making the Gap 10 calibration target of avg error <
+    # 0.3 unreachable for a *correct* prediction).  Treat expected 2xx +
+    # observed 2xx as the api_call equivalent of mutual exit=0: the
+    # success/failure level was predicted correctly.  Compares the
+    # hundreds digit (2xx vs 4xx/5xx), so a predicted 200 against an
+    # observed 404 still falls through to content comparison.
+    _http_re = re.compile(r"\bhttp(?:/\d(?:\.\d)?)?\s*([1-5]\d\d)\b")
+    _exp_status_m = _http_re.search(e_lower)
+    _act_status_m = _http_re.search(a_lower) or re.search(
+        r'"status"\s*:\s*([1-5]\d\d)\b', a_lower
+    )
+    if _exp_status_m and _act_status_m:
+        if _exp_status_m.group(1)[0] == _act_status_m.group(1)[0]:
+            return 0.15
+
+
     # ── Exit-code observation (ground truth for command success/failure) ──
     # The exit code tells us whether the command itself succeeded, but NOT
     # whether the OUTCOME matched the PREDICTION.  We therefore observe it

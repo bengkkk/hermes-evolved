@@ -184,6 +184,52 @@ class TestComputePredictionError:
     # A message like "Process exited with code 1" is NOT matched
     # by the current regex (no colon after exit=N).
 
+    # ── HTTP-status heuristics (api_call) ──
+
+    def test_http_200_mutual_success(self):
+        """Expected HTTP 200 + bridge result exit=0/status 200 → 0.15.
+
+        Regression for the first real GitHub read (2026-08-01): the
+        bridge result 'exit=0: {"status": 200, ...}' has no exit=
+        marker on the expected side ('HTTP 200: ...'), so the mutual
+        exit=0 heuristic never fired and a fully successful call scored
+        0.5 ("mixed").  With this heuristic the Gap 10 calibration
+        target (avg api_call error < 0.3) is reachable for correct
+        predictions.
+        """
+        err = _compute_prediction_error(
+            "HTTP 200: JSON body listing GitHub API endpoint fields "
+            "(current_user_url, repository_url, etc.)",
+            'exit=0: {"status": 200, "bytes": 2262, "body": '
+            '"{\\"current_user_url\\":\\"https://api.github.com/user\\",..."}',
+        )
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    def test_http_200_status_in_wrapper(self):
+        """Expected 2xx + wrapper status 2xx → 0.15 (status key form)."""
+        err = _compute_prediction_error(
+            "HTTP 200 with repo data",
+            'exit=0: {"status": 200, "bytes": 512, "body": '
+            '"{\\"full_name\\":\\"NousResearch/hermes-agent\\"}"}',
+        )
+        assert err == pytest.approx(0.15, abs=0.01)
+
+    def test_http_predicted_200_observed_404(self):
+        """Predicted 2xx but observed 4xx → heuristic must NOT fire."""
+        err = _compute_prediction_error(
+            "HTTP 200: fetch repository",
+            'exit=1: {"status": 404, "bytes": 120, "body": '
+            '"{\\"message\\":\\"Not Found\\"}"}',
+        )
+        # exit=1 floors at 0.5 and "not found" is a failure keyword → 0.85
+        assert err == pytest.approx(0.85, abs=0.01)
+
+    def test_http_expected_without_observed_status(self):
+        """Expected mentions HTTP but actual carries no status → falls through."""
+        err = _compute_prediction_error("HTTP 200 expected", "connection refused")
+        # No exit code, no keyword match, no token overlap → 1.0
+        assert err >= 0.5
+
     # ── Tool failure/success keywords ──
 
     def test_tool_failure_keyword(self):
