@@ -29,7 +29,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # ── Ensure Hermes modules are importable ──
 _HERMES_ROOT = Path(__file__).resolve().parent
@@ -2859,6 +2859,12 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     # await; the "_fresh" marker distinguishes real calls from test fakes).
     _call_started = time.time()
     _backoff_slept = 0.0
+    # Per-attempt telemetry (P3): one entry per attempt with the attempt
+    # number, the backoff waited BEFORE it (0.0 for attempt 1), and the
+    # outcome reason. Persisted into the world-model llm_call triple's
+    # parameters so retry behavior is observable attempt-by-attempt, not
+    # just as aggregates (attempts_used / backoff_slept_s).
+    _attempt_log: List[Dict[str, Any]] = []
     _last_llm_call_stats.clear()
     _last_llm_call_stats.update({
         "_fresh": True,
@@ -2871,6 +2877,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         "policy_tier": _llm_policy_tier,
         "max_retries": max_retries,
         "per_attempt_timeout": per_attempt_timeout,
+        "attempts": _attempt_log,
     })
     if max_retries <= 0:
         # Extended-outage skip (see _llm_retry_policy): no probe this cycle,
@@ -2888,6 +2895,9 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         return None
     last_error = None
     for attempt in range(1, max_retries + 1):
+        # Backoff accumulated BEFORE this attempt (0.0 for attempt 1) —
+        # the wait this attempt had to endure after the previous failure.
+        _wait_before = _backoff_slept
         try:
             response = await asyncio.wait_for(
                 async_call_llm(
@@ -2914,22 +2924,36 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
+                _attempt_log.append({
+                    "attempt": attempt,
+                    "outcome": "success",
+                    "wait_s": _wait_before,
+                    "reason": None,
+                })
                 _last_llm_call_stats.update({
                     "success": True,
                     "attempts_used": attempt,
                     "duration_s": time.time() - _call_started,
                     "backoff_slept_s": _backoff_slept,
+                    "attempts": list(_attempt_log),
                 })
                 return response.choices[0].message.content
             # Fallback: dict-style
             if isinstance(response, dict):
                 choices = response.get("choices", [])
                 if choices:
+                    _attempt_log.append({
+                        "attempt": attempt,
+                        "outcome": "success",
+                        "wait_s": _wait_before,
+                        "reason": None,
+                    })
                     _last_llm_call_stats.update({
                         "success": True,
                         "attempts_used": attempt,
                         "duration_s": time.time() - _call_started,
                         "backoff_slept_s": _backoff_slept,
+                        "attempts": list(_attempt_log),
                     })
                     return choices[0].get("message", {}).get("content", "")
             logger.warning("Unexpected response shape: %s", type(response).__name__)
@@ -2940,11 +2964,18 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             # though the call really consumed attempts and hit a distinct
             # failure class (misleading calibration data for the adaptive
             # retry policy's predict→observe loop).
+            _attempt_log.append({
+                "attempt": attempt,
+                "outcome": "unexpected_response_shape",
+                "wait_s": _wait_before,
+                "reason": type(response).__name__,
+            })
             _last_llm_call_stats.update({
                 "attempts_used": attempt,
                 "last_error": "unexpected_response_shape",
                 "duration_s": time.time() - _call_started,
                 "backoff_slept_s": _backoff_slept,
+                "attempts": list(_attempt_log),
             })
             return None
         except asyncio.TimeoutError:
@@ -2952,9 +2983,21 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                 "LLM call attempt %d/%d timed out after %ss",
                 attempt, max_retries, per_attempt_timeout,
             )
+            _attempt_log.append({
+                "attempt": attempt,
+                "outcome": "timeout",
+                "wait_s": _wait_before,
+                "reason": f"timeout after {per_attempt_timeout}s",
+            })
             last_error = "timeout"
         except Exception as e:
             logger.warning("LLM call attempt %d/%d failed: %s", attempt, max_retries, e)
+            _attempt_log.append({
+                "attempt": attempt,
+                "outcome": "error",
+                "wait_s": _wait_before,
+                "reason": str(e)[:200],
+            })
             last_error = str(e)
         if attempt < max_retries:
             _sleep_s = 2 ** attempt  # exponential backoff: 2s, 4s, 8s
@@ -2965,6 +3008,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         "last_error": last_error,
         "duration_s": time.time() - _call_started,
         "backoff_slept_s": _backoff_slept,
+        "attempts": list(_attempt_log),
     })
     logger.error("LLM call failed after %d retries: %s", max_retries, last_error)
     return None

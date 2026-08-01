@@ -2385,6 +2385,86 @@ class TestLlmRetryPolicy:
         assert slept["total"] == 2.0
         assert stats.get("_fresh") is True
 
+    def test_call_llm_records_per_attempt_telemetry(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3: per-attempt retry values (attempt, wait, reason) are recorded
+        into ``_last_llm_call_stats[\"attempts\"]`` so the world-model
+        ``llm_call`` triple carries observable attempt-by-attempt policy
+        behavior, not just aggregates."""
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(0)  # healthy: 2 retries × 90s
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        import agent.auxiliary_client as _aux
+
+        calls = {"n": 0}
+
+        async def _flakey(**kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise asyncio.TimeoutError("simulated first-attempt timeout")
+            return type("_R", (), {"choices": [type("_C", (), {
+                "message": type("_M", (), {"content": '{"insight": "ok"}'}),
+            })()]})()
+        monkeypatch.setattr(_aux, "async_call_llm", _flakey)
+
+        async def _noop_sleep(seconds: float) -> None:
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+        assert result is not None
+        attempts = list(td._last_llm_call_stats.get("attempts", []))
+        assert len(attempts) == 2, f"expected 2 per-attempt entries, got {attempts}"
+        # Attempt 1: failed with a timeout, waited nothing before it.
+        assert attempts[0]["attempt"] == 1
+        assert attempts[0]["outcome"] == "timeout"
+        assert attempts[0]["wait_s"] == 0.0
+        assert "timeout" in attempts[0]["reason"]
+        # Attempt 2: succeeded after the 2s backoff (2**1).
+        assert attempts[1]["attempt"] == 2
+        assert attempts[1]["outcome"] == "success"
+        assert attempts[1]["wait_s"] == 2.0
+        assert attempts[1]["reason"] is None
+        # Aggregates remain consistent with the per-attempt log.
+        assert td._last_llm_call_stats.get("attempts_used") == 2
+        assert td._last_llm_call_stats.get("backoff_slept_s") == 2.0
+
+    def test_call_llm_records_per_attempt_log_on_total_failure(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3: every failed attempt is present in the per-attempt log even
+        when the call exhausts its retry budget (the terminal path)."""
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(0)  # healthy: 2 retries × 90s
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        import agent.auxiliary_client as _aux
+
+        async def _always_fail(**kwargs: Any) -> Any:
+            raise RuntimeError("endpoint down")
+        monkeypatch.setattr(_aux, "async_call_llm", _always_fail)
+
+        async def _noop_sleep(seconds: float) -> None:
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+        assert result is None
+        attempts = list(td._last_llm_call_stats.get("attempts", []))
+        assert len(attempts) == 2
+        assert [a["outcome"] for a in attempts] == ["error", "error"]
+        assert [a["wait_s"] for a in attempts] == [0.0, 2.0]
+        assert all("endpoint down" in a["reason"] for a in attempts)
+        assert td._last_llm_call_stats.get("last_error") == "endpoint down"
+
     def test_call_llm_skip_records_tier_and_zero_backoff(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
     ) -> None:
