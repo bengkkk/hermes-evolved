@@ -477,6 +477,44 @@ class TestCodeDriftDetection:
         assert ds["interval_seconds"] == 900
         assert "code_drift" not in ds
 
+    def test_mark_startup_resets_inherited_outage_counter(
+        self, evolve_env: Dict
+    ) -> None:
+        """A fresh daemon must not inherit the previous process's LLM-outage
+        counter.
+
+        ``consecutive_fallback_cycles`` is evidence gathered by the
+        (now-dead) process that last held the lock.  If a fresh process
+        inherited a skip-tier value (>= 3) it would skip LLM probes for
+        up to 4 more cycles even after the provider recovered — a
+        needless blind window after every drift/manual restart.  The
+        reset targets the probe tier (4 → one bounded 90 s attempt), so
+        a still-down endpoint costs exactly one bounded probe before the
+        skip tier re-engages.
+        """
+        td = evolve_env["module"]
+        head = td._git_head()
+        # Extended-outage state left behind by a dead daemon (observed
+        # 2026-08-01: drift-restart inherited counter=10, then ticks
+        # 304-305 skipped probes while a direct _call_llm probe returned
+        # PONG in 2.9 s).
+        ds = {"consecutive_fallback_cycles": 10}
+        td._mark_startup(ds, 900, head)
+        assert ds["consecutive_fallback_cycles"] == 4  # probe tier
+
+    def test_mark_startup_keeps_healthy_counter_untouched(
+        self, evolve_env: Dict
+    ) -> None:
+        """A healthy/warm counter (0-2) is first-hand evidence for the
+        fresh process only when it is small; values below the extended-
+        outage skip tier (>= 3) are left alone."""
+        td = evolve_env["module"]
+        head = td._git_head()
+        for healthy in (0, 1, 2):
+            ds = {"consecutive_fallback_cycles": healthy}
+            td._mark_startup(ds, 900, head)
+            assert ds["consecutive_fallback_cycles"] == healthy
+
 
 class TestDriftAutoRestart:
     """_schedule_drift_restart hands a stale daemon over to fresh code."""

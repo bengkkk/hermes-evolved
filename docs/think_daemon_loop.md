@@ -27,6 +27,15 @@ the PID-lock re-verification protects.
 > `_apply_insights` moved 1743 → 1767 and everything from
 > `_auto_detect_provider_from_env` (2311) onward is +3. The world-model.py
 > map is unaffected (world_model.py untouched by that commit).
+>
+> Third drift (2026-08-01, startup-outage-counter reset): `_mark_startup`
+> now resets an inherited `consecutive_fallback_cycles >= 3` to the probe
+> tier (4) so a fresh daemon re-tests LLM health on its first cycle
+> instead of inheriting the dead process's extended-outage blindness.
+> The function body grew, so `run_daemon` 3750 → 3770, `_run_verification`
+> 3832 → 3852, `bootstrap_evolve_data` 3980 → 4000, `_show_status`
+> 4158 → 4178, `main` 4295 → 4315 (+20 past `_mark_startup`). The
+> world-model.py map is unaffected.
 
 ## Process model
 
@@ -294,12 +303,12 @@ state helpers, code-drift detection, PID lock; the loop lives in
 | `_validate_shell_command(cmd)` | 3355 | Pre-flight shell validation (unbalanced quotes, compile check) |
 | `_execute_shell_action(cmd, timeout)` | 3421 | Runs shell action, returns `exit=<code>: <out>` canonical outcome |
 | `_run_cycle_body(result, ds)` | 3442 | **The core cycle** (steps 1–8 in “One cycle” above) |
-| `_mark_startup(ds, interval, head)` | 3735 | Stamp `startup_head`, clear stale `code_drift` block |
-| `run_daemon(interval, max_cycles)` | 3750 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
-| `_run_verification()` | 3832 | No-LLM self-test of the predict→act→observe→learn cycle |
-| `bootstrap_evolve_data()` | 3980 | Seed evolve JSON files (idempotent) |
-| `_show_status()` | 4158 | `--status` snapshot |
-| `main()` | 4295 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
+| `_mark_startup(ds, interval, head)` | 3735 | Stamp `startup_head`, clear stale `code_drift` block, reset inherited extended-outage counter to probe tier |
+| `run_daemon(interval, max_cycles)` | 3770 | **Persistent loop**: re-verify lock → drift check → cycle → shutdown check → sleep |
+| `_run_verification()` | 3852 | No-LLM self-test of the predict→act→observe→learn cycle |
+| `bootstrap_evolve_data()` | 4000 | Seed evolve JSON files (idempotent) |
+| `_show_status()` | 4178 | `--status` snapshot |
+| `main()` | 4315 | argparse dispatch: `--verify` / `--bootstrap` / `--status` / `--once` / daemon |
 
 Action-execution call sites inside `_apply_insights` (current lines):
 `_action_params_from_act` 2105 (predict path) / 2139 (record path),
@@ -324,14 +333,26 @@ same way.
   (2026-07-31 23:02) — the ≥3 extended-outage tier (0-attempt skip +
   every-4th-cycle 90 s probe) engages at tick 297 by design; recovery
   detection is expected within 4 cycles of the provider returning.
-  **Observed through tick 303 (2026-08-01 00:49):** the outage deepened to
-  10 consecutive fallback cycles — the longest continuous outage recorded.
-  The extended-outage tier has now run for 7+ cycles (297→303); the
-  periodic probes at ticks 297 and 301 both failed, confirming the tier is
-  working as designed (cycle budget preserved for local analysis + action
-  execution instead of dead LLM time) and that the provider had not yet
-  recovered. The next probe fires at tick 305. Cycles 301–303 were pure
-  local-analysis + action-execution cycles per daemon_state/last_output.
+  **Observed through tick 305 (2026-08-01 01:19):** the outage deepened to
+  11 consecutive fallback cycles — the longest continuous outage recorded.
+  The periodic probes (fired when the counter hits a multiple of 4) at
+  ticks 298 and 302 both failed, confirming the tier is working as
+  designed (cycle budget preserved for local analysis + action execution
+  instead of dead LLM time) and that the provider had not yet recovered.
+  The next probe fires at tick 306 (counter 12). Ticks 297/301/303-305
+  were pure local-analysis + action-execution cycles per daemon_state/
+  last_output; ticks 298 and 302 each burned one bounded 90 s probe.
+- **Startup outage-counter inheritance (FIXED 2026-08-01)**: a restarted
+  daemon inherited `consecutive_fallback_cycles` from the dead process,
+  so after the 01:04 drift-restart (which inherited counter=10) ticks
+  304-305 skipped LLM probes even though a direct `_call_llm` probe from
+  the workspace venv returned PONG in 2.9 s at 01:22 — the provider had
+  recovered but the fresh process stayed blind until the counter would
+  reach 12. `_mark_startup` now resets an inherited counter ≥ 3 to the
+  probe tier (4), so the first cycle after any restart re-tests LLM
+  health with one bounded 90 s attempt; a still-down endpoint costs only
+  that single attempt before the skip tier re-engages (counter → 5).
+  Regression-tested in `TestCodeDriftDetection`.
 - **Daemon code drift (auto-restart working, observed 22:28)**: the daemon
   drifted 83618253f → feb075dde and `_schedule_drift_restart` auto-restarted
   it; `daemon_state.startup_head = feb075dde`, `code_drift = null` as of

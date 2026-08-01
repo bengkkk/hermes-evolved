@@ -3741,11 +3741,31 @@ def _mark_startup(ds: Dict[str, Any], interval_seconds: int, head: Optional[str]
     ``daemon_state.json`` and launcher ``status`` claiming drift after
     the daemon was restarted onto the current HEAD — clear it so the
     marker only exists while the daemon is genuinely behind the repo.
+
+    The same reasoning applies to ``consecutive_fallback_cycles``: the
+    counter is evidence gathered by the *previous* process.  A fresh
+    process inheriting a skip-tier value (>= 3) would skip LLM probes
+    for up to 4 more cycles even after the provider recovered — a
+    needless blind window after every restart (observed 2026-08-01:
+    the 01:04 drift-restart inherited counter=10; ticks 304-305
+    skipped probes while a direct ``_call_llm`` probe returned PONG in
+    2.9 s).  Reset an inherited extended-outage counter to the probe
+    tier (4 = one bounded 90 s attempt, see ``_llm_retry_policy``) so
+    the first cycle after any restart probes recovery immediately; a
+    still-down endpoint costs only that single bounded attempt before
+    the skip tier re-engages (counter becomes 5 on failure).
     """
     ds["interval_seconds"] = interval_seconds
     ds["status"] = "running"
     ds["startup_head"] = head  # baseline for code-drift detection
     ds.pop("code_drift", None)
+    if ds.get("consecutive_fallback_cycles", 0) >= 3:
+        logger.info(
+            "Startup: resetting inherited extended-outage counter %d → 4 "
+            "(probe tier) so the first cycle re-tests LLM health",
+            ds["consecutive_fallback_cycles"],
+        )
+        ds["consecutive_fallback_cycles"] = 4
 
 async def run_daemon(interval_seconds: int = 600, max_cycles: int = 0):
     """Run the daemon loop.
