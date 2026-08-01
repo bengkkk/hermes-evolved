@@ -944,6 +944,32 @@ def _live_root_prompt_note(
     return note
 
 
+def _bridge_liveness() -> str:
+    """Probe the host bridge health endpoint; return a compact status string.
+
+    Gap 10 step 5: the daemon must know whether the host bridge is ACTUALLY
+    up before proposing api_call actions. Before this probe the capability
+    text said "GATE OPEN" but gave no liveness signal, so the LLM kept
+    planning to "start the bridge integration" while the bridge was already
+    running — burning cycles instead of firing its first real api_call.
+    Stdlib urllib only, short timeout, never raises into the cycle.
+    """
+    from urllib import request as _request
+    from urllib.error import URLError as _URLError
+
+    url = _API_BRIDGE_URL.rstrip("/") + "/bridge/v1/health"
+    try:
+        with _request.urlopen(url, timeout=2.0) as resp:
+            body = resp.read(512).decode("utf-8", "replace")
+            if getattr(resp, "status", 200) == 200 and '"ok":true' in body:
+                return "UP (probed)"
+            return f"UP? (status {getattr(resp, 'status', '?')})"
+    except _URLError as e:
+        return "DOWN (" + str(getattr(e, "reason", e))[:40] + ")"
+    except Exception as e:  # never raise into the cycle
+        return "DOWN (" + str(e)[:40] + ")"
+
+
 def _api_call_capability_text(perm_entries: Any) -> str:
     """Render the api_call capability block for the thinking prompt.
 
@@ -955,6 +981,9 @@ def _api_call_capability_text(perm_entries: Any) -> str:
     them. If any resource has a read grant AND a matching allowlist entry,
     the LLM is told the gate is open and pointed at the exact endpoints;
     otherwise the discourage text is kept so it does not spam doomed calls.
+    Step 5 addition: when the gate is open, the live bridge liveness is
+    appended so the LLM sees the bridge is already up and verified and
+    should propose api_call NOW instead of planning to stand it up.
     """
     granted = {
         res: entry
@@ -985,6 +1014,9 @@ def _api_call_capability_text(perm_entries: Any) -> str:
         lines += [f"      - {r}" for r in ready]
         lines.append("    Propose api_call actions against these to gather real external")
         lines.append("    data — they WILL pass pre-flight and calibrate the new type.")
+        lines.append("    Host bridge liveness: " + _bridge_liveness())
+        lines.append("    If UP: fire api_call now — the bridge is already running and")
+        lines.append("    verified; do NOT spend cycles planning to stand it up.")
         return "\n".join(lines)
     return (
         "- api_call: external read-only HTTP via the host bridge (set endpoint + method,\n"

@@ -884,9 +884,13 @@ class TestBuildThinkingPrompt:
         assert "Currently NO read grants are open" in prompt
         assert "do not spam" in prompt
 
-    def test_prompt_api_call_capabilities_open_gate(self, evolve_env: Dict) -> None:
+    def test_prompt_api_call_capabilities_open_gate(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """github.read granted + allowlisted endpoint -> prompt advertises api_call."""
         td = evolve_env["module"]
+        # Stub the live probe: the bridge may or may not be up in the test env.
+        monkeypatch.setattr(td, "_bridge_liveness", lambda: "UP (probed)")
         state = self._make_state()
         state["self_model"]["permissions"] = {
             "github": {"read": True, "write": False, "act": False, "cap": None},
@@ -897,9 +901,13 @@ class TestBuildThinkingPrompt:
         # The old static discouragement must NOT appear when the gate is open.
         assert "do not spam" not in prompt
 
-    def test_api_call_capability_text_unit(self, evolve_env: Dict) -> None:
+    def test_api_call_capability_text_unit(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Helper directly: empty/malformed permissions never crash."""
         td = evolve_env["module"]
+        # Stub the live probe so the unit test is deterministic (no network).
+        monkeypatch.setattr(td, "_bridge_liveness", lambda: "UP (probed)")
         assert "NO read grants" in td._api_call_capability_text(None)
         assert "NO read grants" in td._api_call_capability_text({})
         assert "NO read grants" in td._api_call_capability_text(
@@ -908,6 +916,71 @@ class TestBuildThinkingPrompt:
         out = td._api_call_capability_text({"github": {"read": True}})
         assert "GATE OPEN" in out
         assert "https://api.github.com/" in out
+
+    def test_api_call_capability_text_reports_liveness(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Open-gate text must include the live bridge liveness signal.
+
+        Gap 10 step 5: without it the LLM plans to "start the bridge
+        integration" even when the bridge is already up and verified.
+        """
+        td = evolve_env["module"]
+        monkeypatch.setattr(td, "_bridge_liveness", lambda: "UP (probed)")
+        out = td._api_call_capability_text({"github": {"read": True}})
+        assert "Host bridge liveness: UP (probed)" in out
+        assert "fire api_call now" in out
+        # Closed gate: no liveness signal, still discourages doomed calls.
+        monkeypatch.setattr(td, "_bridge_liveness", lambda: "DOWN (refused)")
+        closed = td._api_call_capability_text({"github": {"read": False}})
+        assert "Host bridge liveness" not in closed
+
+    def test_bridge_liveness_probe(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_bridge_liveness maps health responses to compact status strings."""
+        td = evolve_env["module"]
+
+        class _FakeResp:
+            def __init__(self, status: int = 200, body: bytes = b'{"ok":true}'):
+                self.status = status
+                self._body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self, n: int = -1) -> bytes:
+                return self._body
+
+        import urllib.request as _ur
+        import urllib.error as _uer
+
+        monkeypatch.setattr(
+            _ur, "urlopen",
+            lambda url, timeout: _FakeResp(200, b'{"ok":true,"pid":1}'),
+        )
+        assert td._bridge_liveness() == "UP (probed)"
+
+        monkeypatch.setattr(
+            _ur, "urlopen",
+            lambda url, timeout: _FakeResp(500, b"boom"),
+        )
+        assert "UP?" in td._bridge_liveness()
+
+        def _refused(url, timeout):
+            raise _uer.URLError("Connection refused")
+
+        monkeypatch.setattr(_ur, "urlopen", _refused)
+        assert td._bridge_liveness().startswith("DOWN (")
+
+        def _boom(url, timeout):
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(_ur, "urlopen", _boom)
+        assert td._bridge_liveness().startswith("DOWN (")
 
     def test_prompt_includes_commitments(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
