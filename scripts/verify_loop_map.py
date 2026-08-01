@@ -6,10 +6,14 @@ for think_daemon.py and world_model.py at the current HEAD, so the docs'
 navigation-map tables can be re-verified after each code change.
 """
 import ast
+import signal
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Exit cleanly when piped into head/less (BrokenPipeError -> SIGPIPE default)
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 
 def dump(path: Path) -> None:
