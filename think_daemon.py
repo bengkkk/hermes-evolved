@@ -1518,6 +1518,27 @@ def _prune_self_model(
                 "Test plan A/B is complete (commit 829f6af8e); the world-model test harness is known and passing",
             ))
 
+        # Pattern 10: Summarize-vs-execute self-flagellation class — the LLM
+        # regenerates the same behavioral self-criticism every cycle with new
+        # phrasing ("still at risk of summarizing instead of executing",
+        # "slip into orientation-summary output", "deferring the patch to
+        # 'next cycle'", "summary-only cycles", "announcing next steps instead
+        # of executing").  Observed 2026-08-01: 8/8 live weaknesses were the
+        # same class with <50% word overlap pairwise, so neither the substring
+        # rule nor the word-overlap rule collapsed them and the self-model's
+        # 8-slot weakness budget filled with one idea.  Pattern-based removal
+        # (like Patterns 1-9) keeps the prompt clean; if the behavior is still
+        # real the next cycle regenerates a single instance.
+        if daemon_state.get("tick_count", 0) >= 10:
+            stale_patterns.append((
+                r"instead of executing|instead of acting|summary-?only cycles"
+                r"|announcing next steps|deferring (?:the patch|implementation)"
+                r"|orientation[- ]summary|orientation notes|summary instead of",
+                "Summarize-vs-execute self-flagellation is a recurring template, "
+                "not a distinct weakness; collapsed to keep the weakness budget "
+                "available for genuinely new signals",
+            ))
+
         for pattern, reason in stale_patterns:
             weaknesses = caps.get("weaknesses", [])
             before = len(weaknesses)

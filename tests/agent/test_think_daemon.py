@@ -1353,6 +1353,50 @@ class TestPruneSelfModel:
         assert removed == 1, "Expected 1 weakness removed as duplicate"
         assert len(sm["capabilities"]["weaknesses"]) == 1
 
+    def test_prune_collapses_summarize_instead_of_execute_class(self, evolve_env: Dict) -> None:
+        """Pattern 10: recurring self-flagellation variants must not fill the
+        weakness budget — all phrasings of the same class collapse to zero
+        (the LLM regenerates one fresh instance if the behavior is still real),
+        while a genuinely distinct weakness survives."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Still at risk of summarizing instead of executing; must treat the read as an immediate command.",
+                    "Can still slip into orientation-summary output while deferring code reads/edits.",
+                    "Still prone to one or more summary-only cycles before executing; must treat the next cycle as a patch-writing cycle.",
+                    "Still at risk of deferring the patch to 'next cycle' after seeing grep output.",
+                    "Still prone to announcing next steps instead of executing them; must treat the action field as the immediate command.",
+                    "Still at risk of turning a completed inspection into a summary instead of a patch.",
+                    "I keep deferring implementation after orientation notes; this cycle I bind the plan to a concrete patch step.",
+                    "Still at risk of writing orientation notes instead of executing concrete code reads/edits.",
+                    "My predictions for database migrations are systematically overconfident (0.8 avg error)",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 340, "last_output": {"fallback": False}})
+        remaining = sm["capabilities"]["weaknesses"]
+        # All 8 self-flagellation variants removed; the distinct weakness survives.
+        assert removed == 8, f"Expected 8 template weaknesses removed, got {removed}"
+        assert len(remaining) == 1, f"Expected 1 remaining weakness, got {remaining!r}"
+        assert "database migrations" in remaining[0]
+
+    def test_prune_pattern10_gated_on_tick_count(self, evolve_env: Dict) -> None:
+        """Pattern 10 must not fire on early cycles (tick < 10) so the
+        self-model is not over-pruned before the daemon accumulates context."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "Still at risk of summarizing instead of executing; must patch now.",
+                ],
+            },
+        }
+        removed = td._prune_self_model(sm, daemon_state={"tick_count": 3, "last_output": {"fallback": False}})
+        assert removed == 0, f"Pattern 10 fired too early: removed {removed}"
+        assert len(sm["capabilities"]["weaknesses"]) == 1
+
+
     def test_caps_commitments_to_eight(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         sm = {
