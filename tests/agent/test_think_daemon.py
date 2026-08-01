@@ -2015,6 +2015,53 @@ class TestLlmRetryPolicy:
         assert result is None
         assert called["n"] == 0
 
+    def test_call_llm_passes_timeout_into_auxiliary_client(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``_call_llm`` must forward its per-attempt timeout INTO
+        ``async_call_llm``, not just wrap it in an outer ``wait_for``.
+
+        Regression guard for the 2026-08-01 outage-blindness fix: the
+        auxiliary client applies its internal ``_DEFAULT_AUX_TIMEOUT`` (30 s)
+        to the HTTP request when no ``timeout=`` is passed, cutting off
+        healthy-but-slow completions (opencode-go observed up to 31 s)
+        before the daemon's outer 90 s cap can help. The daemon then
+        records a fallback even though the endpoint was merely slow.
+        """
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(4)  # extended-outage probe: (1, 90.0)
+        assert td._llm_max_retries == 1
+        assert td._llm_attempt_timeout == 90.0
+
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        captured = {}
+
+        import agent.auxiliary_client as _aux
+
+        async def _fake_async_call_llm(**kwargs: Any) -> Any:
+            captured["timeout"] = kwargs.get("timeout")
+            captured["task"] = kwargs.get("task")
+            captured["provider"] = kwargs.get("provider")
+            captured["model"] = kwargs.get("model")
+            return type("_R", (), {"choices": [type("_C", (), {
+                "message": type("_M", (), {"content": '{"insight": "ok"}'}),
+            })()]})()
+
+        monkeypatch.setattr(_aux, "async_call_llm", _fake_async_call_llm)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+
+        assert captured.get("timeout") == 90.0, (
+            "async_call_llm must receive the daemon's per-attempt timeout; "
+            f"got {captured.get('timeout')!r}"
+        )
+        assert captured.get("task") == "thinking"
+        assert result is not None
+
 
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).

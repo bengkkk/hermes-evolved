@@ -205,6 +205,15 @@ def _llm_retry_policy(
       were observed up to 31 s on 2026-07-31), extending outage blindness
       by another 4 cycles.
 
+    IMPORTANT (2026-08-01): the 90 s cap alone was NOT enough — it only
+    bounded the outer wait_for, while async_call_llm still applied its own
+    internal 30 s timeout to the HTTP request, cutting off healthy-but-slow
+    completions (31 s) before the cap could help. ``_call_llm`` therefore
+    passes ``timeout=per_attempt_timeout`` through to ``async_call_llm`` so
+    the inner request timeout matches the cap. If that pass-through is ever
+    removed, probes will regress to failing on slow-but-healthy endpoints
+    exactly as before.
+
     The skip tier exists because each probe costs ~45-60 s of dead time
     (the auxiliary client's internal retry + fallback stages); during a
     multi-cycle outage that is most of the 200 s cycle budget, repeatedly,
@@ -2488,6 +2497,18 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     max_tokens=2048,
                     provider=_RUNTIME_PROVIDER or None,
                     model=_RUNTIME_MODEL or None,
+                    # Pass the daemon's per-attempt timeout INTO the auxiliary
+                    # client, not just as an outer wait_for cap. Without this,
+                    # async_call_llm applies its internal _DEFAULT_AUX_TIMEOUT
+                    # (30s) to the HTTP request itself, so a healthy-but-slow
+                    # completion (opencode-go observed up to 31s) is cut off
+                    # inside the auxiliary client before the outer 90s cap can
+                    # ever help — the daemon then records a fallback even
+                    # though the endpoint was merely slow, keeping it
+                    # "outage-blind" for many cycles. (The outer wait_for
+                    # remains the authoritative total-attempt bound: the inner
+                    # client's one same-provider retry can still exceed it.)
+                    timeout=per_attempt_timeout,
                 ),
                 timeout=per_attempt_timeout,  # Per-call timeout: reasoning models can take 30-60s to begin generating
             )
