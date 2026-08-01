@@ -28,7 +28,25 @@ HERMES_HOME="${HERMES_HOME:-$HOME/.hermes-evolved}"
 EVOLVE_DIR="$HERMES_HOME/evolve"
 LOCK_FILE="$EVOLVE_DIR/daemon.lock"
 LAUNCHER_LOG="$EVOLVE_DIR/daemon_launcher.log"
+BRIDGE_PID_FILE="$EVOLVE_DIR/bridge.pid"
+BRIDGE_LOG="$EVOLVE_DIR/bridge.log"
+BRIDGE_TOKEN_FILE="$EVOLVE_DIR/bridge_token"
+BRIDGE_PORT="${HERMES_EVOLVED_BRIDGE_PORT:-8791}"
 INTERVAL=900
+
+# Shared bridge token: one file, chmod 600, used by BOTH the daemon (which
+# forwards it as Bearer auth) and the bridge (which validates it). Generated
+# on first use; persists across restarts so daemon/bridge stay in sync.
+_ensure_bridge_token() {
+    if [ ! -f "$BRIDGE_TOKEN_FILE" ]; then
+        .venv/bin/python3 - "$BRIDGE_TOKEN_FILE" <<'PY' 2>/dev/null || true
+import secrets, sys
+with open(sys.argv[1], "w") as f:
+    f.write(secrets.token_hex(32) + "\n")
+PY
+        chmod 600 "$BRIDGE_TOKEN_FILE" 2>/dev/null || true
+    fi
+}
 
 _pid_alive() {
     local pid="$1"
@@ -103,6 +121,12 @@ cmd_start() {
         rm -f "$LOCK_FILE"
     fi
     mkdir -p "$EVOLVE_DIR"
+    # Ensure the shared bridge token exists BEFORE launching the daemon so
+    # the daemon inherits it (HERMES_EVOLVED_BRIDGE_TOKEN) and can
+    # authenticate against the bridge once it is started.
+    _ensure_bridge_token
+    export HERMES_EVOLVED_BRIDGE_TOKEN
+    HERMES_EVOLVED_BRIDGE_TOKEN="$(cat "$BRIDGE_TOKEN_FILE" 2>/dev/null || true)"
     # Detach: new session (setsid), ignore SIGHUP (nohup), no stdin.
     # The daemon writes its own daemon.log via logging.FileHandler; this
     # launcher log captures stray stdout/stderr (startup tracebacks etc.).
@@ -150,6 +174,68 @@ cmd_restart() {
     cmd_start
 }
 
+# ── host bridge (Gap 10 step 3) ──────────────────────────────────────────
+_bridge_pid() {
+    [ -f "$BRIDGE_PID_FILE" ] || { echo ""; return; }
+    cat "$BRIDGE_PID_FILE" 2>/dev/null | tr -d '[:space:]'
+}
+
+cmd_bridge_start() {
+    local pid port="${BRIDGE_PORT}"
+    pid="$(_bridge_pid)"
+    if [ -n "$pid" ] && _pid_alive "$pid"; then
+        echo "bridge already running (PID $pid) on port $port"
+        return 0
+    fi
+    _ensure_bridge_token
+    export HERMES_EVOLVED_BRIDGE_TOKEN
+    HERMES_EVOLVED_BRIDGE_TOKEN="$(cat "$BRIDGE_TOKEN_FILE" 2>/dev/null || true)"
+    setsid nohup .venv/bin/python3 evolve_bridge.py --port "$port" \
+        </dev/null >>"$BRIDGE_LOG" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$BRIDGE_PID_FILE"
+    echo "started host bridge (PID $new_pid, port $port, token file $BRIDGE_TOKEN_FILE)"
+    echo "  bridge log: $BRIDGE_LOG"
+    sleep 2
+    if _pid_alive "$new_pid"; then
+        echo "  OK: process alive after 2s"
+    else
+        echo "  WARNING: bridge not alive after 2s — check log"
+        tail -5 "$BRIDGE_LOG" 2>/dev/null
+    fi
+}
+
+cmd_bridge_stop() {
+    local pid
+    pid="$(_bridge_pid)"
+    if [ -z "$pid" ] || ! _pid_alive "$pid"; then
+        echo "no running bridge to stop"
+        rm -f "$BRIDGE_PID_FILE"
+        return 1
+    fi
+    echo "sending SIGTERM to bridge PID $pid"
+    kill -TERM "$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
+    for _ in $(seq 1 10); do
+        _pid_alive "$pid" || break
+        sleep 1
+    done
+    _pid_alive "$pid" && kill -9 "$pid" 2>/dev/null
+    rm -f "$BRIDGE_PID_FILE"
+    echo "  bridge stopped"
+}
+
+cmd_bridge_status() {
+    local pid
+    pid="$(_bridge_pid)"
+    if [ -n "$pid" ] && _pid_alive "$pid"; then
+        echo "BRIDGE RUNNING: PID $pid (port $BRIDGE_PORT)"
+        echo "  log: $BRIDGE_LOG"
+        return 0
+    fi
+    echo "bridge STOPPED"
+    return 1
+}
+
 case "${1:-status}" in
     start)
         # optional --interval N
@@ -171,8 +257,25 @@ case "${1:-status}" in
     stop)
         cmd_stop
         ;;
+    bridge)
+        case "${2:-status}" in
+            start)
+                if [ "${3:-}" = "--port" ]; then
+                    BRIDGE_PORT="${4:-$BRIDGE_PORT}"
+                fi
+                cmd_bridge_start
+                ;;
+            stop)    cmd_bridge_stop ;;
+            status)  cmd_bridge_status ;;
+            restart)
+                cmd_bridge_stop || true
+                cmd_bridge_start
+                ;;
+            *) echo "usage: $0 bridge {start [--port N] | stop | status | restart}" >&2; exit 2 ;;
+        esac
+        ;;
     *)
-        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop}" >&2
+        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop | bridge {start [--port N] | stop | status | restart}}" >&2
         exit 2
         ;;
 esac
