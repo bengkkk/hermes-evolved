@@ -2283,6 +2283,51 @@ class TestLlmRetryPolicy:
         assert captured.get("task") == "thinking"
         assert result is not None
 
+    def test_call_llm_records_unexpected_response_shape_in_stats(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An anomalous auxiliary-client response must be recorded accurately.
+
+        Regression guard (2026-08-01): the unexpected-response-shape path used
+        to ``return None`` without touching ``_last_llm_call_stats``, so the
+        cycle body persisted a world-model ``llm_call`` triple claiming
+        ``failed: unknown`` with ``attempts_used: 0`` — even though the call
+        really consumed attempt(s) and hit a distinct failure class. That
+        mislabeled calibration data for the adaptive retry policy's
+        predict→observe loop.
+        """
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(0)  # full budget: 2 retries × 90s
+        assert td._llm_max_retries == 2
+
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        import agent.auxiliary_client as _aux
+
+        async def _weird_response(**kwargs: Any) -> Any:
+            return {"no": "choices", "here": True}  # dict WITHOUT choices
+
+        monkeypatch.setattr(_aux, "async_call_llm", _weird_response)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+
+        assert result is None
+        stats = dict(td._last_llm_call_stats)
+        assert stats.get("_fresh") is True, "real call must set the freshness marker"
+        assert stats.get("success") is False
+        assert stats.get("attempts_used") == 1, (
+            "the anomalous attempt must be counted, got "
+            f"{stats.get('attempts_used')}"
+        )
+        assert stats.get("last_error") == "unexpected_response_shape", (
+            "the distinct failure class must be recorded, got "
+            f"{stats.get('last_error')!r}"
+        )
+        assert stats.get("duration_s", 0.0) >= 0.0
+
 
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).

@@ -2657,6 +2657,18 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     })
                     return choices[0].get("message", {}).get("content", "")
             logger.warning("Unexpected response shape: %s", type(response).__name__)
+            # Record the failure cause and attempt count BEFORE returning: the
+            # cycle body persists _last_llm_call_stats into the world model as
+            # an llm_call triple, and without this update an anomalous response
+            # would be recorded as "failed: unknown" with attempts_used=0 even
+            # though the call really consumed attempts and hit a distinct
+            # failure class (misleading calibration data for the adaptive
+            # retry policy's predict→observe loop).
+            _last_llm_call_stats.update({
+                "attempts_used": attempt,
+                "last_error": "unexpected_response_shape",
+                "duration_s": time.time() - _call_started,
+            })
             return None
         except asyncio.TimeoutError:
             logger.warning(
