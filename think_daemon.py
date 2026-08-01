@@ -95,6 +95,7 @@ _EVOLVE_TRACKED_PATHS: list[str] = [
     "scripts/evolve_check.py",
     "scripts/test_evolved.py",
     "scripts/update_self_model.py",
+    "scripts/verify_loop_map.py",
     "evolve_daemon.sh",
     "Dockerfile.evolved",
     "docker-compose.evolved.yml",
