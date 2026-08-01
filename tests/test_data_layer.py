@@ -777,6 +777,105 @@ class TestGoals:
         assert gid2 != gid1
         assert len(g.data["goals"]) == 2
 
+    def test_dedupe_completed_collapses_near_identical(self) -> None:
+        """Pre-guard duplicate COMPLETED goals are collapsed into the most
+        recent record, keeping notes; active goals are untouched.
+
+        Regression for the 5 identical 'Investigate shell prediction
+        failures' goals observed 2026-08-01: the propose() suppression
+        stopped new duplicates but never removed the ones already in the
+        store. dedupe_completed() must self-heal that store.
+
+        The duplicates are injected directly into the store (not via
+        propose(), which now suppresses them) to simulate goals created
+        before the guard existed.
+        """
+        g = Goals()
+        title = (
+            "Investigate shell prediction failures "
+            "(keywords: auto-default, sibling, dirs)"
+        )
+        now = datetime.now(timezone.utc)
+        # Three near-identical completed goals (the pre-guard spam shape)
+        ids = []
+        for i in range(3):
+            gid = f"goal_dupe_{i}"
+            g.data.setdefault("goals", []).append({
+                "id": gid,
+                "title": title,
+                "description": f"Desc {i}",
+                "status": "completed",
+                "gap_reference": "6",
+                "priority": 3,
+                "created_at": (now - timedelta(hours=5)).isoformat(),
+                "completed_at": (now - timedelta(hours=3 - i)).isoformat(),
+                "notes": f"investigation {i}",
+            })
+            ids.append(gid)
+        # A distinct completed goal must survive untouched
+        other_id = "goal_other"
+        g.data["goals"].append({
+            "id": other_id,
+            "title": "Refactor daemon loop",
+            "description": "Desc",
+            "status": "completed",
+            "gap_reference": "8",
+            "priority": 3,
+            "created_at": now.isoformat(),
+            "completed_at": now.isoformat(),
+            "notes": "",
+        })
+        assert len(g.data["goals"]) == 4
+
+        removed = g.dedupe_completed()
+        assert removed == 2
+        remaining = g.data["goals"]
+        assert len(remaining) == 2
+        assert other_id in [x["id"] for x in remaining]
+        # Survivor is the most recently completed duplicate (i == 2)
+        survivor = [x for x in remaining if x["id"] == ids[2]]
+        assert len(survivor) == 1
+        assert "investigation 2" in survivor[0].get("notes", "")
+        # Idempotent: a second pass removes nothing
+        assert g.dedupe_completed() == 0
+        assert len(g.data["goals"]) == 2
+
+    def test_dedupe_completed_leaves_active_untouched(self) -> None:
+        """Near-identical ACTIVE goals are live work, not cleanup targets."""
+        g = Goals()
+        now = datetime.now(timezone.utc)
+        g.data["goals"] = [
+            {
+                "id": "goal_active_1",
+                "title": "Investigate shell prediction failures (keywords: auto)",
+                "description": "Desc",
+                "status": "completed",
+                "gap_reference": "6",
+                "priority": 3,
+                "created_at": (now - timedelta(hours=2)).isoformat(),
+                "completed_at": (now - timedelta(hours=1)).isoformat(),
+                "notes": "",
+            },
+            {
+                "id": "goal_active_2",
+                "title": "Investigate shell prediction failures (keywords: auto) again",
+                "description": "Desc",
+                "status": "proposed",
+                "gap_reference": "6",
+                "priority": 3,
+                "created_at": now.isoformat(),
+                "completed_at": None,
+                "notes": "",
+            },
+        ]
+        assert len(g.data["goals"]) == 2
+        # Only ONE completed goal → nothing to collapse even though the
+        # proposed sibling is near-identical (live work, not cleanup).
+        assert g.dedupe_completed() == 0
+        assert len(g.data["goals"]) == 2
+        assert g.data["goals"][0]["status"] == "completed"
+        assert g.data["goals"][1]["status"] == "proposed"
+
     def test_update_status_valid(self) -> None:
         g = Goals()
         gid = g.propose("Test", "Desc", "", "", "", 3)

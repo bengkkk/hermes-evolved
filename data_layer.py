@@ -1122,6 +1122,96 @@ class Goals:
 
         return None
 
+    def dedupe_completed(self) -> int:
+        """Collapse near-identical completed goals into their most recent record.
+
+        Regression cleanup for the 5 identical 'Investigate shell
+        prediction failures' goals observed 2026-08-01: the propose()
+        suppression (commit 0fdc26496) stopped NEW duplicates but never
+        removed the ones already in the store. This pass groups
+        completed goals by significant-word overlap (>0.85 Jaccard, the
+        same near-exact threshold ``_similar_goal_id`` applies to
+        verbatim re-proposals) and keeps only the most recently
+        completed goal in each group, merging the removed goals' notes
+        into the survivor's notes.
+
+        Only ``completed`` goals are ever touched — proposed/active/
+        in_progress goals are left alone even when similarly titled
+        (they represent distinct live work). Idempotent: a second call
+        on an already-clean store removes nothing.
+
+        Returns the number of goals removed.
+        """
+        goals = self.data.get("goals", [])
+        completed = [g for g in goals if g.get("status") == "completed"]
+        if len(completed) < 2:
+            return 0
+
+        def _words(g: Dict[str, Any]) -> set:
+            return self._extract_significant_words(g.get("title", ""))
+
+        def _completed_ts(g: Dict[str, Any]) -> datetime:
+            ts = g.get("completed_at")
+            if not ts:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            try:
+                parsed = datetime.fromisoformat(str(ts))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
+            except ValueError:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        # Group near-identical completed goals (same near-exact threshold
+        # as the propose-time verbatim-loop suppression).
+        groups: List[List[Dict[str, Any]]] = []
+        for g in completed:
+            w = _words(g)
+            placed = False
+            for group in groups:
+                rep_words = _words(group[0])
+                if not w or not rep_words:
+                    continue
+                inter = w & rep_words
+                union = w | rep_words
+                if len(inter) / max(len(union), 1) > 0.85:
+                    group.append(g)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([g])
+
+        removed_ids: set = set()
+        for group in groups:
+            if len(group) < 2:
+                continue
+            survivor = max(group, key=_completed_ts)
+            merged_notes = []
+            for dup in group:
+                if dup is survivor:
+                    continue
+                removed_ids.add(dup.get("id"))
+                if dup.get("notes"):
+                    merged_notes.append(str(dup["notes"]))
+            if merged_notes:
+                existing = survivor.get("notes") or ""
+                survivor["notes"] = (
+                    existing + "\n" + "Merged from duplicate: "
+                    + " | ".join(merged_notes)
+                ).strip()
+
+        if not removed_ids:
+            return 0
+        self.data["goals"] = [
+            g for g in goals if g.get("id") not in removed_ids
+        ]
+        logger.info(
+            "Goals.dedupe_completed: removed %d duplicate completed goal(s), "
+            "kept %d",
+            len(removed_ids), len(self.data["goals"]),
+        )
+        return len(removed_ids)
+
     def update_status(self, goal_id: str, new_status: str, note: str = "") -> bool:
         """Update a goal's lifecycle status.
 

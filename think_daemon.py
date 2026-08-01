@@ -3197,8 +3197,32 @@ def _reconcile_goals_with_world(
             return 0
         save_on_exit = True
 
+    # Regression cleanup: collapse near-identical COMPLETED goals that
+    # predate the propose() suppression guard (observed 2026-08-01: 5
+    # identical 'Investigate shell prediction failures' goals). The guard
+    # stops new duplicates; this pass removes the existing ones, keeping
+    # the most recent record per group. Only completed goals are touched.
+    dedupe_count = 0
+    if save_on_exit:
+        try:
+            dedupe_count = goals_obj.dedupe_completed()
+        except Exception as e:
+            logger.warning("Completed-goal dedupe failed (non-blocking): %s", e)
+
     active = goals_obj.get_active()
     if not active:
+        # Persist the dedupe even when there is nothing to reconcile —
+        # the early return must not drop a cleanup that already happened.
+        if save_on_exit and dedupe_count > 0:
+            try:
+                goals_obj.save()
+                logger.info(
+                    "Goal reconciliation: %d duplicate completed goal(s) "
+                    "collapsed (no active goals)",
+                    dedupe_count,
+                )
+            except Exception as e:
+                logger.warning("Failed to save deduped goals: %s", e)
         return 0
 
     per_type = wm.get_per_type_accuracy()
@@ -3322,11 +3346,17 @@ def _reconcile_goals_with_world(
                     )
                     completed_count += 1
 
-    # Persist if we loaded from disk
-    if save_on_exit and completed_count > 0:
+    # Persist if we loaded from disk and anything changed (completed
+    # duplicates reconciled, or pre-guard duplicate completed goals
+    # collapsed by dedupe_completed).
+    if save_on_exit and (completed_count > 0 or dedupe_count > 0):
         try:
             goals_obj.save()
-            logger.info("Goal reconciliation: %d goal(s) auto-completed", completed_count)
+            logger.info(
+                "Goal reconciliation: %d goal(s) auto-completed, "
+                "%d duplicate completed goal(s) collapsed",
+                completed_count, dedupe_count,
+            )
         except Exception as e:
             logger.warning("Failed to save reconciled goals: %s", e)
 
@@ -3365,11 +3395,30 @@ def _auto_activate_goals() -> int:
             logger.info("Reloaded data_layer module to pick up newly added Goals class")
 
         goals_obj = _Goals.load()
+
+        # Regression cleanup (same as _reconcile_goals_with_world):
+        # collapse pre-guard duplicate completed goals so the store
+        # self-heals on every goal touchpoint, not just proposals.
+        try:
+            dedupe_count = goals_obj.dedupe_completed()
+        except Exception as e:
+            logger.warning("Completed-goal dedupe failed (non-blocking): %s", e)
+            dedupe_count = 0
+
         all_goals = goals_obj.data.get("goals", [])
 
         # Find proposed goals (not yet active/in_progress/completed/abandoned)
         proposed = [g for g in all_goals if g.get("status") == "proposed"]
         if not proposed:
+            if dedupe_count > 0:
+                try:
+                    goals_obj.save()
+                    logger.info(
+                        "Goal auto-activate: collapsed %d duplicate completed goal(s)",
+                        dedupe_count,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to save deduped goals: %s", e)
             return 0
 
         # Find currently active / in_progress goals
