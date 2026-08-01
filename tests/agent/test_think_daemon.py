@@ -2306,6 +2306,111 @@ class TestLlmRetryPolicy:
         assert td._llm_max_retries == 2
         assert td._llm_attempt_timeout == 90.0
 
+    def test_tier_names_match_policy_budgets(self, evolve_env: Dict) -> None:
+        """Invariant: tier name and applied budget can never drift.
+
+        ``_llm_retry_policy`` derives its budget from ``_LLM_RETRY_BUDGETS``
+        via ``_llm_retry_tier``, so for every outage depth the tier name
+        must map back to exactly the budget the policy applies. This pins
+        the single-source-of-truth relationship (P3 telemetry), not a
+        value snapshot.
+        """
+        td = evolve_env["module"]
+        for n in range(-1, 14):
+            tier = td._llm_retry_tier(n)
+            assert tier in td._LLM_RETRY_BUDGETS, f"unknown tier {tier!r} for n={n}"
+            assert td._LLM_RETRY_BUDGETS[tier] == td._llm_retry_policy(n), (
+                f"tier {tier} budget mismatch for n={n}"
+            )
+
+    def test_setter_records_policy_tier(self, evolve_env: Dict) -> None:
+        """_set_llm_retry_policy records the chosen tier for telemetry."""
+        td = evolve_env["module"]
+        assert td._llm_policy_tier == "healthy"  # fresh import default
+        td._set_llm_retry_policy(1)
+        assert td._llm_policy_tier == "warm"
+        td._set_llm_retry_policy(2)
+        assert td._llm_policy_tier == "deep"
+        td._set_llm_retry_policy(3)
+        assert td._llm_policy_tier == "extended_skip"
+        td._set_llm_retry_policy(4)
+        assert td._llm_policy_tier == "extended_probe"
+        td._set_llm_retry_policy(0)
+        assert td._llm_policy_tier == "healthy"
+
+    def test_call_llm_records_tier_and_backoff_in_stats(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Retry-path telemetry: tier, attempt count, and backoff time are
+        recorded into ``_last_llm_call_stats`` (which the cycle body persists
+        as the world-model ``llm_call`` triple's parameters)."""
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(0)  # healthy: 2 retries × 90s
+        assert td._llm_policy_tier == "healthy"
+
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        import agent.auxiliary_client as _aux
+
+        calls = {"n": 0}
+
+        async def _flakey(**kwargs: Any) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise asyncio.TimeoutError("simulated first-attempt timeout")
+            return type("_R", (), {"choices": [type("_C", (), {
+                "message": type("_M", (), {"content": '{"insight": "ok"}'}),
+            })()]})()
+        monkeypatch.setattr(_aux, "async_call_llm", _flakey)
+
+        # Neutralize the real 2s backoff sleep — record it instead.
+        slept = {"total": 0.0}
+
+        async def _fast_sleep(seconds: float) -> None:
+            slept["total"] += seconds
+        monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+
+        assert result is not None
+        stats = dict(td._last_llm_call_stats)
+        assert stats.get("policy_tier") == "healthy"
+        assert stats.get("success") is True
+        assert stats.get("attempts_used") == 2
+        assert stats.get("max_retries") == 2
+        assert stats.get("backoff_slept_s") == 2.0  # 2**1 between attempts
+        assert slept["total"] == 2.0
+        assert stats.get("_fresh") is True
+
+    def test_call_llm_skip_records_tier_and_zero_backoff(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A skip-cycle _call_llm records tier + zero backoff in stats."""
+        td = evolve_env["module"]
+        td._set_llm_retry_policy(3)  # extended_skip: 0 attempts
+        assert td._llm_policy_tier == "extended_skip"
+        monkeypatch.setattr(td, "_ensure_runtime_main", lambda: None)
+
+        import agent.auxiliary_client as _aux
+
+        async def _boom(*a: Any, **k: Any) -> None:
+            raise AssertionError("async_call_llm must not be called on a skip cycle")
+        monkeypatch.setattr(_aux, "async_call_llm", _boom)
+
+        async def _run() -> Optional[str]:
+            return await td._call_llm([{"role": "user", "content": "x"}])
+
+        result = asyncio.run(_run())
+        assert result is None
+        stats = dict(td._last_llm_call_stats)
+        assert stats.get("skipped") is True
+        assert stats.get("policy_tier") == "extended_skip"
+        assert stats.get("backoff_slept_s") == 0.0
+        assert stats.get("attempts_used") == 0
+
     def test_call_llm_skips_probe_when_policy_is_zero(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
     ) -> None:

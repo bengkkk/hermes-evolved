@@ -92,6 +92,7 @@ _EVOLVE_TRACKED_PATHS: list[str] = [
     "agent/self_evolve.py",
     "docs/think_daemon_loop.md",
     "docs/gap10-bridge-design.md",
+    "core_loop_outline.md",
     "scripts/bootstrap_world_model.py",
     "scripts/evolve_check.py",
     "scripts/test_evolved.py",
@@ -157,6 +158,11 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
+# Tier name of the most recent _set_llm_retry_policy application. Populated
+# by the setter, read by _call_llm into _last_llm_call_stats so every
+# llm_call world-model triple records which outage tier produced the
+# outcome (P3: retry-path telemetry — skip decisions must be observable).
+_llm_policy_tier: str = "healthy"
 # Wall-clock cap for a single cycle (seconds). None = unlimited (persistent
 # daemon mode). Set by main() for --once runs so a cron-launched single
 # cycle fits inside the 3-minute cron hard limit instead of being killed
@@ -195,6 +201,40 @@ def _clamp_retry_budget(
     return retries, timeout
 
 
+def _llm_retry_tier(consecutive_fallback_cycles: int) -> str:
+    """Name the outage tier for telemetry (single source of truth).
+
+    Mirrors exactly the branch conditions of ``_llm_retry_policy``; the
+    budget lookup is driven by this tier so the tier NAME and the budget
+    can never drift apart. Tiers:
+
+      - ``healthy``:        0 (or negative/corrupt) consecutive fallbacks —
+                            full budget, 2 retries × 90 s
+      - ``warm``:           1 — single retry with a 60 s cap
+      - ``deep``:           2 — one probe attempt with a 45 s cap
+      - ``extended_probe``: >=3, even — bounded 90 s probe every 2nd cycle
+      - ``extended_skip``:  >=3, odd — 0 attempts (budget to local analysis)
+    """
+    if consecutive_fallback_cycles <= 0:
+        return "healthy"
+    if consecutive_fallback_cycles == 1:
+        return "warm"
+    if consecutive_fallback_cycles == 2:
+        return "deep"
+    if consecutive_fallback_cycles % 2 == 0:
+        return "extended_probe"
+    return "extended_skip"
+
+
+_LLM_RETRY_BUDGETS: Dict[str, tuple] = {
+    "healthy": (2, 90.0),
+    "warm": (1, 60.0),
+    "deep": (1, 45.0),
+    "extended_probe": (1, 90.0),
+    "extended_skip": (0, 0.0),
+}
+
+
 def _llm_retry_policy(
     consecutive_fallback_cycles: int, budget_seconds: Optional[float] = None
 ) -> tuple:
@@ -208,13 +248,17 @@ def _llm_retry_policy(
     - Extended outage (>=3): skip the LLM probe on odd cycles (0 attempts)
       so alternating cycles give the full budget to local analysis + action
       execution, but probe every 2nd cycle with a 90 s cap so recovery is
-      still detected within a bounded number of cycles. The cap is 90 s (not
-      30 s) because the auxiliary client's internal transport timeout
-      (~30 s) plus its one in-client retry (~30 s) must fit inside it;
-      with a 30 s cap the probe was cut off mid-retry and failed even
-      when the endpoint was merely slow (healthy opencode-go latencies
-      were observed up to 31 s on 2026-07-31), extending outage blindness
-      by another 4 cycles.
+      still detected within a bounded number of cycles. Every-2nd (not
+      every-4th) since 2026-08-01: the endpoint was observed intermittent
+      on a ~15 min period (fresh-process probes PONG'd in 2.8-3.0 s while
+      daemon probes timed out), so the 4-cycle cadence sampled that signal
+      below its Nyquist rate and left the daemon blind for up to 60 min
+      during up-windows. The cap is 90 s (not 30 s) because the auxiliary
+      client's internal transport timeout (~30 s) plus its one in-client
+      retry (~30 s) must fit inside it; with a 30 s cap the probe was cut
+      off mid-retry and failed even when the endpoint was merely slow
+      (healthy opencode-go latencies were observed up to 31 s on
+      2026-07-31), extending outage blindness by another 4 cycles.
 
     IMPORTANT (2026-08-01): the 90 s cap alone was NOT enough — it only
     bounded the outer wait_for, while async_call_llm still applied its own
@@ -238,26 +282,8 @@ def _llm_retry_policy(
     cycles survive the 3-minute cron hard limit (the persistent daemon
     passes None and is unaffected).
     """
-    if consecutive_fallback_cycles <= 0:
-        retries, timeout = 2, 90.0
-    elif consecutive_fallback_cycles == 1:
-        retries, timeout = 1, 60.0
-    elif consecutive_fallback_cycles == 2:
-        retries, timeout = 1, 45.0
-    elif consecutive_fallback_cycles % 2 == 0:
-        # Probe cycle: bounded probe so recovery is detected within 2
-        # cycles. 90s (not 30s): the auxiliary client's internal transport
-        # timeout (~30s) + its one in-client retry (~30s) must fit inside
-        # the cap, and healthy opencode-go latencies have been observed at
-        # 31s. A 30s cap failed probes on endpoints that were merely slow,
-        # extending outage blindness by another 2 cycles. Every-2nd (not
-        # every-4th) since 2026-08-01: the endpoint was observed
-        # intermittent on a ~15 min period (fresh-process probes PONG'd in
-        # 2.8-3.0s while daemon probes timed out), so the 4-cycle cadence
-        # left the daemon blind for up to 60 min during up-windows.
-        retries, timeout = 1, 90.0
-    else:
-        retries, timeout = 0, 0.0
+    tier = _llm_retry_tier(consecutive_fallback_cycles)
+    retries, timeout = _LLM_RETRY_BUDGETS[tier]
     return _clamp_retry_budget(retries, timeout, budget_seconds)
 
 
@@ -275,9 +301,13 @@ def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
     """Apply the adaptive retry policy for the current cycle.
 
     Must be called once per cycle before ``_call_llm``. Returns the
-    applied ``(max_retries, timeout)`` tuple for logging.
+    applied ``(max_retries, timeout)`` tuple for logging. Also records
+    the chosen outage tier in ``_llm_policy_tier`` so ``_call_llm`` can
+    attach it to the per-call telemetry — the world-model ``llm_call``
+    triple then shows which tier produced the outcome (P3).
     """
-    global _llm_max_retries, _llm_attempt_timeout
+    global _llm_max_retries, _llm_attempt_timeout, _llm_policy_tier
+    _llm_policy_tier = _llm_retry_tier(consecutive_fallback_cycles)
     _llm_max_retries, _llm_attempt_timeout = _llm_retry_policy(
         consecutive_fallback_cycles, _cycle_budget_seconds
     )
@@ -2715,6 +2745,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     # Fresh outcome stats for this call (read by _run_cycle_body after the
     # await; the "_fresh" marker distinguishes real calls from test fakes).
     _call_started = time.time()
+    _backoff_slept = 0.0
     _last_llm_call_stats.clear()
     _last_llm_call_stats.update({
         "_fresh": True,
@@ -2723,6 +2754,8 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         "attempts_used": 0,
         "last_error": None,
         "duration_s": 0.0,
+        "backoff_slept_s": 0.0,
+        "policy_tier": _llm_policy_tier,
         "max_retries": max_retries,
         "per_attempt_timeout": per_attempt_timeout,
     })
@@ -2731,9 +2764,9 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
         # straight to local analysis. Keeps the cycle budget for data
         # collection instead of burning 45-60s on a dead endpoint.
         logger.info(
-            "LLM probe skipped (retry policy %d attempts) — "
+            "LLM probe skipped (retry policy %d attempts, tier %s) — "
             "straight to local analysis",
-            max_retries,
+            max_retries, _llm_policy_tier,
         )
         _last_llm_call_stats.update({
             "skipped": True,
@@ -2772,6 +2805,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                     "success": True,
                     "attempts_used": attempt,
                     "duration_s": time.time() - _call_started,
+                    "backoff_slept_s": _backoff_slept,
                 })
                 return response.choices[0].message.content
             # Fallback: dict-style
@@ -2782,6 +2816,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                         "success": True,
                         "attempts_used": attempt,
                         "duration_s": time.time() - _call_started,
+                        "backoff_slept_s": _backoff_slept,
                     })
                     return choices[0].get("message", {}).get("content", "")
             logger.warning("Unexpected response shape: %s", type(response).__name__)
@@ -2796,6 +2831,7 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
                 "attempts_used": attempt,
                 "last_error": "unexpected_response_shape",
                 "duration_s": time.time() - _call_started,
+                "backoff_slept_s": _backoff_slept,
             })
             return None
         except asyncio.TimeoutError:
@@ -2808,11 +2844,14 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             logger.warning("LLM call attempt %d/%d failed: %s", attempt, max_retries, e)
             last_error = str(e)
         if attempt < max_retries:
-            await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
+            _sleep_s = 2 ** attempt  # exponential backoff: 2s, 4s, 8s
+            _backoff_slept += _sleep_s
+            await asyncio.sleep(_sleep_s)
     _last_llm_call_stats.update({
         "attempts_used": max_retries,
         "last_error": last_error,
         "duration_s": time.time() - _call_started,
+        "backoff_slept_s": _backoff_slept,
     })
     logger.error("LLM call failed after %d retries: %s", max_retries, last_error)
     return None
