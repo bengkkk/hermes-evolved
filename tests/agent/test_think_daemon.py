@@ -2544,6 +2544,98 @@ class TestPlaceholderPlanGuard:
         assert plan["steps"][0]["description"] == "Run the world-model test suite"
 
 
+class TestCycleBodyLlmCallWorldModelRecording:
+    """Gap 8: the adaptive retry policy's outcome must reach the world model.
+
+    ``_run_cycle_body`` records the LLM call as an ``llm_call`` action triple
+    (expected = applied retry budget, actual = observed outcome) so endpoint
+    reliability feeds per-type accuracy and the calibration curve instead of
+    vanishing after the cycle. The recording is guarded by a single-use
+    ``_fresh`` marker that only the real ``_call_llm`` sets — a monkeypatched
+    ``_call_llm`` (as used across this test file) must never produce
+    synthetic triples.
+    """
+
+    _VALID_JSON = json.dumps({
+        "insight": "test insight",
+        "self_model_update": [],
+        "timeline_update": {"events": []},
+        "goals_update": [],
+        "search_query": "",
+        "action": None,
+        "prediction": None,
+    })
+
+    async def _run_cycle(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch,
+        populate_stats: bool,
+    ) -> Dict[str, Any]:
+        td = evolve_env["module"]
+
+        async def _fake_llm(messages: list, task: str = "thinking") -> str:
+            if populate_stats:
+                # Mimic what the real _call_llm now does: fresh outcome stats.
+                td._last_llm_call_stats.clear()
+                td._last_llm_call_stats.update({
+                    "_fresh": True,
+                    "success": True,
+                    "skipped": False,
+                    "attempts_used": 1,
+                    "last_error": None,
+                    "duration_s": 1.5,
+                    "max_retries": 2,
+                    "per_attempt_timeout": 90.0,
+                })
+            return self._VALID_JSON
+
+        monkeypatch.setattr(td, "_call_llm", _fake_llm)
+
+        result = {"status": "ok", "tick_duration": 0, "insight": None, "error": None}
+        ds = td.load_daemon_state()
+        ds.setdefault(
+            "cycle_stats",
+            {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
+             "avg_duration": 0.0, "max_duration": 0.0},
+        )
+        return await td._run_cycle_body(result, ds)
+
+    def test_success_outcome_recorded_as_llm_call_triple(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real-style call records a completed triple with low error."""
+        td = evolve_env["module"]
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch, populate_stats=True))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 1, f"expected 1 llm_call triple, got {len(triples)}"
+        t = triples[0]
+        assert t["completed"] is True
+        assert t["prediction_error"] is not None
+        assert t["prediction_error"] <= 0.25, (
+            f"success phrasing must score low, got {t['prediction_error']}"
+        )
+        assert "succeeded on attempt 1" in t["actual_outcome"]
+        assert "2 attempt(s)" in t["expected_outcome"]
+        assert t["action_parameters"]["max_retries"] == 2
+        assert "_fresh" not in t["action_parameters"], (
+            "freshness marker must not persist into stored params"
+        )
+
+    def test_monkeypatched_llm_without_stats_records_nothing(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-fresh (monkeypatched) call must not create a synthetic triple."""
+        td = evolve_env["module"]
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch, populate_stats=False))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert triples == [], "monkeypatched _call_llm must not record llm_call triples"
+
+
 class TestAutoCreatePlanGuard:
     """The bootstrap auto-create must not duplicate or re-plan a goal that
     already has an active or completed plan.

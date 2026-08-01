@@ -161,6 +161,15 @@ _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
 # cycle fits inside the 3-minute cron hard limit instead of being killed
 # mid-flight (see docs/think_daemon_loop.md, "Cron --once vs 200s timeout").
 _cycle_budget_seconds: Optional[float] = None
+# Outcome stats of the most recent _call_llm invocation. Populated by the
+# real function only — every real call sets the "_fresh" marker, so the
+# cycle body can distinguish genuine outcomes from a monkeypatched
+# _call_llm (tests patch td._call_llm with (messages, task) fakes, which
+# never touch this dict). Recorded into the world model as an "llm_call"
+# action triple so the adaptive retry policy's outcomes feed prediction
+# calibration instead of vanishing after the cycle (Gap 8: retry/budget
+# decisions must be observable, not just applied).
+_last_llm_call_stats: Dict[str, Any] = {}
 
 
 def _clamp_retry_budget(
@@ -2513,6 +2522,20 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
 
     max_retries = _llm_max_retries
     per_attempt_timeout = _llm_attempt_timeout
+    # Fresh outcome stats for this call (read by _run_cycle_body after the
+    # await; the "_fresh" marker distinguishes real calls from test fakes).
+    _call_started = time.time()
+    _last_llm_call_stats.clear()
+    _last_llm_call_stats.update({
+        "_fresh": True,
+        "success": False,
+        "skipped": False,
+        "attempts_used": 0,
+        "last_error": None,
+        "duration_s": 0.0,
+        "max_retries": max_retries,
+        "per_attempt_timeout": per_attempt_timeout,
+    })
     if max_retries <= 0:
         # Extended-outage skip (see _llm_retry_policy): no probe this cycle,
         # straight to local analysis. Keeps the cycle budget for data
@@ -2522,6 +2545,10 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             "straight to local analysis",
             max_retries,
         )
+        _last_llm_call_stats.update({
+            "skipped": True,
+            "duration_s": time.time() - _call_started,
+        })
         return None
     last_error = None
     for attempt in range(1, max_retries + 1):
@@ -2551,11 +2578,21 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             )
             # response is an OpenAI-style response object
             if hasattr(response, "choices") and response.choices:
+                _last_llm_call_stats.update({
+                    "success": True,
+                    "attempts_used": attempt,
+                    "duration_s": time.time() - _call_started,
+                })
                 return response.choices[0].message.content
             # Fallback: dict-style
             if isinstance(response, dict):
                 choices = response.get("choices", [])
                 if choices:
+                    _last_llm_call_stats.update({
+                        "success": True,
+                        "attempts_used": attempt,
+                        "duration_s": time.time() - _call_started,
+                    })
                     return choices[0].get("message", {}).get("content", "")
             logger.warning("Unexpected response shape: %s", type(response).__name__)
             return None
@@ -2570,6 +2607,11 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
             last_error = str(e)
         if attempt < max_retries:
             await asyncio.sleep(2 ** attempt)  # 2s, 4s, 8s
+    _last_llm_call_stats.update({
+        "attempts_used": max_retries,
+        "last_error": last_error,
+        "duration_s": time.time() - _call_started,
+    })
     logger.error("LLM call failed after %d retries: %s", max_retries, last_error)
     return None
 
@@ -3627,6 +3669,57 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
             ds.get("consecutive_fallback_cycles", 0), _retries, _attempt_tmo,
         )
     raw = await _call_llm(messages)
+
+    # 3.25 World model: record the LLM-call outcome as an action triple.
+    # The adaptive retry policy makes the applied budget a *prediction*
+    # about endpoint behavior ("LLM responds within N attempts × Ts");
+    # observing the actual outcome closes the predict→observe→compare loop
+    # for the daemon's own infra, so per-type accuracy and the calibration
+    # curve track endpoint reliability over time instead of staying blind
+    # to it. Guarded on the "_fresh" marker: a monkeypatched _call_llm
+    # (tests) never sets it, so no synthetic triples are recorded in test
+    # cycles. wm.save() at the end of the cycle persists the triple.
+    _llm_stats = dict(_last_llm_call_stats)
+    # Pop the freshness marker from the SOURCE dict (single-use): a real
+    # _call_llm sets it every call and the cycle body consumes it, so a
+    # later monkeypatched _call_llm can never replay stale stats as fresh.
+    if _last_llm_call_stats.pop("_fresh", False) and wm is not None:
+        _llm_stats.pop("_fresh", None)  # never persist the marker in params
+        try:
+            _expected_llm = (
+                f"success: LLM responds within {_retries} attempt(s) × "
+                f"{_attempt_tmo:.0f}s budget"
+            )
+            if _llm_stats.get("success"):
+                _actual_llm = (
+                    f"succeeded on attempt {_llm_stats.get('attempts_used', 1)} "
+                    f"({_llm_stats.get('duration_s', 0.0):.1f}s)"
+                )
+            elif _llm_stats.get("skipped"):
+                _actual_llm = "skipped: no probe (extended-outage cycle)"
+            elif _llm_stats.get("last_error") == "timeout":
+                _actual_llm = (
+                    "failed: timeout after "
+                    f"{_llm_stats.get('attempts_used', _retries)} attempt(s)"
+                )
+            else:
+                _actual_llm = (
+                    "failed: "
+                    + str(_llm_stats.get("last_error") or "unknown")[:120]
+                )
+            _llm_triple_id = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                _expected_llm,
+                expected_source="daemon",
+                parameters=_llm_stats,
+            )
+            wm.complete_action(_llm_triple_id, _actual_llm)
+            logger.info("World model: recorded LLM-call outcome: %s", _actual_llm)
+        except Exception as e:
+            logger.warning(
+                "LLM-call world-model record failed (non-blocking): %s", e
+            )
 
     # ── Consecutive fallback tracking ──
     # Track how many cycles the LLM has been unavailable in a row.
