@@ -807,6 +807,25 @@ _DEFAULT_GOALS: Dict[str, Any] = {
 _goals_id_counter: int = 0
 
 
+def _coerce_stripped_str(value: Any) -> str:
+    """Coerce an LLM-derived value to a stripped string.
+
+    The daemon's LLM occasionally emits numbers where strings are
+    expected (e.g. ``gap_reference: 8`` instead of ``"8"``).  Any value
+    that reaches goal persistence or comparison must be normalized first
+    so ``.strip()`` can never hit a non-str — the 2026-08-01 daemon
+    crash: ``AttributeError: 'int' object has no attribute 'strip'`` in
+    ``_find_similar_active_goal``.  ``None`` becomes ``""`` (matching the
+    previous ``(value or "")`` behavior); numbers/other scalars are
+    stringified so they compare and store as their canonical form.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
 class Goals:
     """Self-generated goal store with lifecycle tracking.
 
@@ -842,6 +861,20 @@ class Goals:
         LLM-generated goals where every cycle proposes a slight
         rephrasing of 'integrate goal lifecycle into think_daemon').
         """
+        # LLM JSON is untrusted: the daemon's parsed `new_goal` blocks
+        # sometimes carry numbers where strings are expected (and string
+        # priorities). Normalize at the persistence boundary so storage is
+        # schema-consistent and comparisons below never hit a non-str.
+        # (2026-08-01 daemon crash: 'int' object has no attribute 'strip'.)
+        title = _coerce_stripped_str(title)
+        description = _coerce_stripped_str(description)
+        rationale = _coerce_stripped_str(rationale)
+        gap_reference = _coerce_stripped_str(gap_reference)
+        verification_criteria = _coerce_stripped_str(verification_criteria)
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            priority = 3
         existing_id = self._find_similar_active_goal(title, gap_reference)
         if existing_id is not None:
             # Refresh metadata from the new proposal but keep original
@@ -930,7 +963,7 @@ class Goals:
         if not proposed_words:
             return None
 
-        proposed_gap = (gap_reference or "").strip()
+        proposed_gap = _coerce_stripped_str(gap_reference)
         ACTIVE_STATUSES = {"proposed", "active", "in_progress"}
 
         for g in self.data.get("goals", []):
@@ -943,7 +976,7 @@ class Goals:
             if not existing_words:
                 continue
 
-            existing_gap = (g.get("gap_reference", "") or "").strip()
+            existing_gap = _coerce_stripped_str(g.get("gap_reference", ""))
 
             # Jaccard similarity on significant words
             intersection = proposed_words & existing_words

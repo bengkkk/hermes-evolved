@@ -653,6 +653,48 @@ class TestGoals:
         assert goal["gap_reference"] == "6"
         assert goal["verification_criteria"] == "Tests pass"
 
+    def test_propose_non_string_llm_fields(self) -> None:
+        """LLM JSON may emit numbers where strings are expected.
+
+        Regression for the 2026-08-01 daemon crash in
+        ``_find_similar_active_goal``: ``AttributeError: 'int' object has
+        no attribute 'strip'`` when the parsed ``new_goal`` block carried
+        ``gap_reference: 8`` (an int) instead of ``"8"``.
+        """
+        g = Goals()
+        gid = g.propose(
+            "Build world model v2",
+            "Desc",
+            gap_reference=8,       # int — as emitted by the LLM
+            priority="2",          # string priority must not break comparisons
+        )
+        goal = g.data["goals"][0]
+        assert goal["gap_reference"] == "8"   # canonical string form
+        assert goal["priority"] == 2          # coerced to int
+
+    def test_propose_int_gap_ref_dedup_matches_existing(self) -> None:
+        """An int gap_reference should dedup against a goal stored with
+        the equivalent string form (boundary coercion normalizes both)."""
+        g = Goals()
+        gid1 = g.propose(
+            "Consolidate memory files", "Desc", gap_reference="6"
+        )
+        gid2 = g.propose(
+            "Consolidate memory files", "Desc2", gap_reference=6
+        )
+        assert gid2 == gid1  # deduplicated, not duplicated
+        assert len(g.data["goals"]) == 1
+
+    def test_existing_goal_with_int_gap_reference(self) -> None:
+        """Legacy persisted data with an int gap_reference must not crash
+        the dedup scan (defensive read-site coercion)."""
+        g = Goals()
+        gid1 = g.propose("Refactor daemon loop", "Desc", gap_reference="8")
+        g.data["goals"][0]["gap_reference"] = 8  # simulate legacy int
+        gid2 = g.propose("Refactor daemon loop", "Desc2", gap_reference="8")
+        assert gid2 == gid1
+        assert len(g.data["goals"]) == 1
+
     def test_update_status_valid(self) -> None:
         g = Goals()
         gid = g.propose("Test", "Desc", "", "", "", 3)
