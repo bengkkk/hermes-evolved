@@ -1046,7 +1046,14 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
 
     # Commitments (from timeline + self_model)
     tl_commits = present.get("commitments", [])
-    active_commits = [c for c in tl_commits if c.get("status") == "active"]
+    # Only string whats can be joined — a non-string what (legacy row
+    # predating the _coerce_llm_response_fields record-block guard) would
+    # raise TypeError inside "; ".join and kill the whole cycle in the
+    # prompt-building phase, before the LLM call.
+    active_commits = [
+        c for c in tl_commits
+        if c.get("status") == "active" and isinstance(c.get("what"), str)
+    ]
     timeline_commit_text = "; ".join(c["what"] for c in active_commits[:3]) if active_commits else "(none)"
 
     # Filter out stale/self-referential promised_features that trap the LLM in loops.
@@ -2026,6 +2033,33 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                 _pred["confidence"] = float(_pc)
             except (TypeError, ValueError):
                 _pred["confidence"] = 0.5
+
+    # Structured record blocks (event/outcome/commitment/session_record) flow
+    # into the timeline, whose prompt builder re-reads them next cycle:
+    # ``"; ".join(c["what"] ...)`` at _build_thinking_prompt raises TypeError
+    # on an int ``what``, killing the cycle in the prompt-building phase
+    # BEFORE the LLM call. Coerce the string-typed inner fields here, once,
+    # so the timeline never persists a non-string summary/type/impact/what/
+    # deadline/focus, and ``outcomes_list`` is always a list. ``None`` is
+    # preserved (the prompt allows null for these blocks).
+    for _rec, _flds in (
+        ("event_to_record", ("summary", "type", "impact")),
+        ("outcome_to_record", ("summary", "impact", "event_id")),
+        ("commitment", ("what", "deadline")),
+        ("session_record", ("focus",)),
+    ):
+        _r = parsed.get(_rec)
+        if isinstance(_r, dict):
+            for _fld in _flds:
+                _v = _r.get(_fld)
+                if _v is not None and not isinstance(_v, str):
+                    _r[_fld] = str(_v).strip()
+            _ol = _r.get("outcomes_list")
+            if _ol is not None and not isinstance(_ol, list):
+                # A single scalar outcome is wrapped into a one-item list;
+                # empty/non-list values degrade to [] so the timeline's
+                # completed_sessions.outcomes stays a clean list.
+                _r["outcomes_list"] = [str(_ol)] if _ol else []
 
 
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:

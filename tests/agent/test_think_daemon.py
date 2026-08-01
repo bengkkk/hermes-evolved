@@ -2594,6 +2594,98 @@ class TestCoerceLlmResponseFields:
         assert parsed["confidence"] == 0.7
         assert parsed["prediction"]["confidence"] == 0.3
 
+    def test_event_record_inner_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "event_to_record": {"summary": 42, "type": {"nested": True}, "impact": None},
+        }
+        td._coerce_llm_response_fields(parsed)
+        ev = parsed["event_to_record"]
+        assert ev["summary"] == "42"
+        assert ev["type"] == "{'nested': True}"
+        assert ev["impact"] is None  # None preserved
+
+    def test_outcome_record_inner_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "outcome_to_record": {"summary": ["done", "well"], "impact": 7, "event_id": {"x": 1}},
+        }
+        td._coerce_llm_response_fields(parsed)
+        oc = parsed["outcome_to_record"]
+        assert oc["summary"] == "['done', 'well']"
+        assert oc["impact"] == "7"
+        assert isinstance(oc["event_id"], str)
+
+    def test_commitment_inner_fields_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "commitment": {"what": 42, "deadline": {"d": "2026-08-01"}},
+        }
+        td._coerce_llm_response_fields(parsed)
+        cm = parsed["commitment"]
+        assert cm["what"] == "42"
+        assert cm["deadline"] == "{'d': '2026-08-01'}"
+
+    def test_session_record_focus_and_outcomes_list_coerced(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "session_record": {"focus": {"f": 1}, "outcomes_list": "single outcome"},
+        }
+        td._coerce_llm_response_fields(parsed)
+        ss = parsed["session_record"]
+        assert ss["focus"] == "{'f': 1}"
+        assert ss["outcomes_list"] == ["single outcome"]
+
+    def test_session_record_empty_non_list_outcomes_degrade_to_list(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {
+            "session_record": {"focus": "ok", "outcomes_list": {}},
+        }
+        td._coerce_llm_response_fields(parsed)
+        assert parsed["session_record"]["outcomes_list"] == []
+
+    def test_apply_insights_persists_coerced_commitment(self, evolve_env: Dict) -> None:
+        """The full pipeline: an int ``commitment.what`` from the LLM must land
+        in the timeline as a string, so the next cycle's prompt builder
+        (``"; ".join(c["what"] ...)``) cannot raise TypeError."""
+        td = evolve_env["module"]
+        parsed: Dict[str, Any] = {"commitment": {"what": 42}, "action": None}
+        td._coerce_llm_response_fields(parsed)
+        state = {
+            "timeline": {"version": 1, "past": {}, "present": {}, "future": {}},
+            "self_model": {"version": 1, "identity": {}, "state": {},
+                           "capabilities": {}, "commitments": {}},
+            "orientation": None,
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+        }
+        updates = td._apply_insights(parsed, state)
+        commits = updates["timeline"]["present"]["commitments"]
+        assert len(commits) == 1
+        assert commits[0]["what"] == "42"
+        assert isinstance(commits[0]["what"], str)
+
+    def test_prompt_builder_skips_non_string_commitment_what(self, evolve_env: Dict) -> None:
+        """Legacy non-string commitment rows (predating the record-block
+        guard) must not crash the prompt builder — they are filtered out
+        while valid string commitments still appear."""
+        td = evolve_env["module"]
+        state = {
+            "daemon_state": {"status": "initialized", "tick_count": 0},
+            "timeline": {
+                "version": 1, "past": {}, "future": {},
+                "present": {"commitments": [
+                    {"what": 42, "status": "active"},
+                    {"what": "real commitment", "status": "active"},
+                ]},
+            },
+            "self_model": {"version": 1, "identity": {}, "state": {},
+                           "capabilities": {}, "commitments": {}},
+            "orientation": None,
+            "world_model": None,
+        }
+        prompt = td._build_thinking_prompt(state)  # must not raise TypeError
+        assert "real commitment" in prompt
+
 
 class TestShellPreflightValidation:
     """Pre-flight shell command validation (``_validate_shell_command``).
