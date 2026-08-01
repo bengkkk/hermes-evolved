@@ -202,6 +202,26 @@ def _clamp_retry_budget(
     return retries, timeout
 
 
+def _budget_metrics(duration_s: float) -> Dict[str, Any]:
+    """Budget-consumed telemetry for the llm_call world-model triple (P3).
+
+    Expresses the LLM phase's wall time relative to the cycle budget in
+    force (``_cycle_budget_seconds``, set by ``_apply_cycle_budget`` for
+    ``--once`` cron runs; None in persistent daemon mode) so the triple
+    records whether the applied retry budget actually FIT the wall-clock
+    cap that ``_clamp_retry_budget`` optimizes against. ``budget_fraction``
+    is capped at 1.0 (over-budget still records as 1.0) and None when no
+    budget is set or the duration is unavailable.
+    """
+    budget = _cycle_budget_seconds
+    if not budget or duration_s <= 0:
+        return {"cycle_budget_s": budget, "budget_fraction": None}
+    return {
+        "cycle_budget_s": budget,
+        "budget_fraction": round(min(duration_s / budget, 1.0), 4),
+    }
+
+
 def _llm_retry_tier(consecutive_fallback_cycles: int) -> str:
     """Name the outage tier for telemetry (single source of truth).
 
@@ -4449,6 +4469,13 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     if _last_llm_call_stats.pop("_fresh", False) and wm is not None:
         _llm_stats.pop("_fresh", None)  # never persist the marker in params
         try:
+            # Budget-consumed telemetry (P3): express the LLM phase's wall
+            # time relative to the cycle budget in force so the triple
+            # records whether the applied retry budget FIT the cap
+            # _clamp_retry_budget optimizes against (single merge point —
+            # covers skip/success/failure paths uniformly since every path
+            # sets duration_s before returning).
+            _llm_stats.update(_budget_metrics(_llm_stats.get("duration_s", 0.0)))
             if _llm_stats.get("skipped"):
                 # Deliberate policy skip (extended-outage cycle): the skip IS
                 # the applied policy, so expected == actual. Without this the

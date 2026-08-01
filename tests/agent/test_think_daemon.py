@@ -2811,6 +2811,50 @@ class TestLlmRetryPolicy:
         assert stats.get("duration_s", 0.0) >= 0.0
 
 
+class TestBudgetMetrics:
+    """``_budget_metrics``: budget-consumed telemetry for the llm_call triple.
+
+    P3 completion: the retry/budget telemetry already records wall time
+    (``duration_s``) but never expressed it relative to the cycle budget in
+    force (``_cycle_budget_seconds``, set for ``--once`` cron runs) — the
+    exact cap ``_clamp_retry_budget`` optimizes against. These tests pin the
+    pure mapping: fraction = duration / budget, capped at 1.0, None when no
+    budget is set or the duration is unavailable.
+    """
+
+    def test_budget_metrics_no_budget(self, evolve_env: Dict) -> None:
+        """No cycle budget (persistent daemon mode) → fraction None."""
+        td = evolve_env["module"]
+        td._cycle_budget_seconds = None
+        assert td._budget_metrics(40.0) == {
+            "cycle_budget_s": None,
+            "budget_fraction": None,
+        }
+
+    def test_budget_metrics_with_budget(self, evolve_env: Dict) -> None:
+        """Budget set → fraction is duration / budget (rounded to 4dp)."""
+        td = evolve_env["module"]
+        td._cycle_budget_seconds = 200.0
+        assert td._budget_metrics(40.0) == {
+            "cycle_budget_s": 200.0,
+            "budget_fraction": 0.2,
+        }
+        assert td._budget_metrics(1.5)["budget_fraction"] == round(1.5 / 200.0, 4)
+
+    def test_budget_metrics_caps_at_one(self, evolve_env: Dict) -> None:
+        """Over-budget LLM phase still records fraction 1.0, not >1."""
+        td = evolve_env["module"]
+        td._cycle_budget_seconds = 200.0
+        assert td._budget_metrics(500.0)["budget_fraction"] == 1.0
+
+    def test_budget_metrics_nonpositive_duration(self, evolve_env: Dict) -> None:
+        """Zero/unknown duration (e.g. skip path) → fraction None."""
+        td = evolve_env["module"]
+        td._cycle_budget_seconds = 200.0
+        assert td._budget_metrics(0.0)["budget_fraction"] is None
+        assert td._budget_metrics(-1.0)["budget_fraction"] is None
+
+
 class TestCoerceLlmResponseFields:
     """Type-guard for LLM response fields (``_coerce_llm_response_fields``).
 
@@ -3739,8 +3783,11 @@ class TestCycleBodyLlmCallWorldModelRecording:
     async def _run_cycle(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch,
         populate_stats: bool, skip: bool = False,
+        budget_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
         td = evolve_env["module"]
+        if budget_seconds is not None:
+            td._cycle_budget_seconds = budget_seconds
 
         async def _fake_llm(messages: list, task: str = "thinking") -> Optional[str]:
             if populate_stats:
@@ -3851,6 +3898,42 @@ class TestCycleBodyLlmCallWorldModelRecording:
             "a deliberate policy skip is its own prediction: expected == actual"
         )
         assert t["action_parameters"]["max_retries"] == 0
+
+    def test_llm_call_triple_records_budget_fraction(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a cycle budget in force, the llm_call triple records how much
+        of it the LLM phase consumed (budget-consumed telemetry, P3)."""
+        td = evolve_env["module"]
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch, populate_stats=True,
+                                    budget_seconds=200.0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 1, f"expected 1 llm_call triple, got {len(triples)}"
+        params = triples[0]["action_parameters"]
+        # Fake stats use duration_s = 1.5, budget 200.0 → fraction 0.0075.
+        assert params.get("cycle_budget_s") == 200.0
+        assert params.get("budget_fraction") == round(1.5 / 200.0, 4), params
+        assert "_fresh" not in params
+
+    def test_llm_call_triple_budget_fraction_none_without_budget(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without a cycle budget (persistent daemon mode), the triple records
+        cycle_budget_s=None and budget_fraction=None — no phantom numbers."""
+        td = evolve_env["module"]
+        td._cycle_budget_seconds = None  # explicit: daemon mode default
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch, populate_stats=True))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 1, f"expected 1 llm_call triple, got {len(triples)}"
+        params = triples[0]["action_parameters"]
+        assert params.get("cycle_budget_s") is None
+        assert params.get("budget_fraction") is None
 
 
 class TestAutoCreatePlanGuard:
