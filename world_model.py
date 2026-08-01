@@ -1363,7 +1363,9 @@ class WorldModel:
 
     # ── Discrepancy pattern detection (Gap 6) ────────────────────
 
-    def _update_discrepancy_patterns(self, min_samples: int = 2) -> None:
+    def _update_discrepancy_patterns(
+        self, min_samples: int = 2, min_recurrence: int = 3
+    ) -> None:
         """Analyze completed triples with high prediction error for recurring patterns.
 
         Groups high-error triples (prediction_error >= 0.4) by action type and
@@ -1378,6 +1380,15 @@ class WorldModel:
           - Action type with chronic high error (systematic prediction bias)
           - Frequent keywords in mispredicted actions (topic-level bias)
           - Number of affected triples and avg error for prioritization
+
+        Recurrence exception: when the *same* action description fails with
+        high error at least *min_recurrence* times (default 3), the pattern is
+        emitted even if the type-level ratio-decay check would suppress it.
+        The ratio check exists to hide scattered old outliers, but it must not
+        hide an active systematic failure (e.g. 5 identical state-check
+        commands erroring at 0.6 while the daemon keeps re-running the same
+        broken command). The recency-decay check still applies, so a resolved
+        recurring failure decays once the specific action succeeds again.
 
         Called automatically from :meth:`_update_accuracy_stats`.
         """
@@ -1401,17 +1412,39 @@ class WorldModel:
             if len(triples) < min_samples:
                 continue
 
+            # ── Recurrence detection: identical descriptions failing repeatedly ──
+            # The same action description appearing >= min_recurrence times among
+            # high-error triples is a systematic bias (the daemon keeps re-running
+            # a broken command), not scattered outlier noise. Track it so the
+            # ratio-decay check below does not hide an ACTIVE recurring failure.
+            desc_counts: Dict[str, int] = {}
+            for t in triples:
+                desc = (t.get("action_description", "") or "").strip()
+                if desc:
+                    desc_counts[desc] = desc_counts.get(desc, 0) + 1
+            recurring_descs = [
+                d for d, c in desc_counts.items() if c >= min_recurrence
+            ]
+            is_recurring = bool(recurring_descs)
+
             # ── Decay check: suppress pattern if type's overall accuracy has improved ──
             # A pattern where 3/14 actions failed (old, resolved failures) should not
             # persist when the type's overall avg_error is low.  Without this check,
             # old high-error actions (e.g. exploratory shell commands from early cycles)
             # create permanent discrepancy patterns that keep triggering action guidance
             # warnings and reinforcing stale reasoning loops.
+            # Exception: recurring identical failures bypass this check — a low ratio
+            # of high-error actions with a repeated description is a live systematic
+            # failure, not historical noise.
             total_of_type = sum(1 for t in completed if t.get("action_type") == atype)
             high_error_ratio = len(triples) / max(total_of_type, 1)
             high_error_avg = sum(t["prediction_error"] for t in triples) / len(triples)
 
-            if high_error_ratio < 0.5 and high_error_avg < 0.7:
+            if (
+                not is_recurring
+                and high_error_ratio < 0.5
+                and high_error_avg < 0.7
+            ):
                 # Fewer than half of the actions of this type are high-error,
                 # AND the high-error group's avg is < 0.7 → likely old outliers
                 continue
@@ -1464,10 +1497,15 @@ class WorldModel:
                 "total_completed": sum(1 for t in completed if t.get("action_type") == atype),
                 "avg_error": round(avg_err, 4),
                 "common_themes": common_themes[:5],
+                "recurring_description": recurring_descs[0] if recurring_descs else None,
                 "description": (
                     f"{len(triples)}/{sum(1 for t in completed if t.get('action_type') == atype)} "
                     f"{atype} actions with high prediction error "
                     f"(avg {avg_err:.2f})"
+                    + (
+                        f"; recurring: {recurring_descs[0][:80]!r}"
+                        if recurring_descs else ""
+                    )
                 ),
                 "last_observed": last_obs,
             })

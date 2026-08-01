@@ -141,6 +141,11 @@ still go through the same world-model data-driven prediction path
 
 ## Change Log
 
+- 2026-08-01: Verified the structural markers from `THINK_DAEMON_OUTLINE.md`
+  against the function bodies at HEAD: `_clamp_retry_budget` (166),
+  `_llm_retry_policy` (188), `_apply_cycle_budget` (254),
+  `_set_llm_retry_policy` (264) — all line numbers exact, full signatures
+  confirmed (see §6). Removed the redundant scratch outline.
 - 2026-08-01: Added `_build_prediction_feedback_line` helper; wired prediction
   feedback into the failure/timeout action paths (previously only successful
   actions closed the prediction loop). Added

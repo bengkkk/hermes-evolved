@@ -481,6 +481,88 @@ class TestDiscrepancyPatterns:
         # Either no patterns or at least data is tracked correctly
         assert len(patterns) == 0
 
+    def test_recurring_identical_description_surfaces_despite_low_ratio(self) -> None:
+        """A repeated identical failing action is a live systematic failure.
+
+        Regression: the ratio-decay check (high_error_ratio < 0.5 AND
+        high_error_avg < 0.7) suppressed patterns even when the SAME action
+        description failed repeatedly — the production case where a broken
+        state-check command errored 5x identically over 5 hours while the
+        daemon kept re-running it. Recurring descriptions (>= min_recurrence)
+        must bypass the ratio-decay check (recency decay still applies).
+        """
+        wm = WorldModel()
+        # 8 good shell actions → low high-error ratio for the type
+        for i in range(8):
+            tid = wm.record_action("shell", f"healthy probe {i}", "probe succeeds")
+            wm.complete_action(tid, "probe succeeds")
+        # 3 IDENTICAL failing descriptions with high error
+        for _ in range(3):
+            tid = wm.record_action(
+                "shell",
+                "State check: list current goals and their statuses",
+                "exit=0: list of goals with statuses",
+            )
+            wm.complete_action(tid, "exit=1: goals listing incomplete")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) >= 1, (
+            "recurring identical failure must surface despite low type-level ratio"
+        )
+        shell_pattern = next((p for p in patterns if p["action_type"] == "shell"), None)
+        assert shell_pattern is not None
+        assert shell_pattern["count"] == 3
+        assert shell_pattern.get("recurring_description") == (
+            "State check: list current goals and their statuses"
+        )
+        assert "recurring" in shell_pattern["description"]
+
+    def test_recurring_below_threshold_still_decayed(self) -> None:
+        """2 identical failures (< min_recurrence=3) stay suppressed by the ratio check."""
+        wm = WorldModel()
+        for i in range(8):
+            tid = wm.record_action("shell", f"healthy probe {i}", "probe succeeds")
+            wm.complete_action(tid, "probe succeeds")
+        for _ in range(2):
+            tid = wm.record_action(
+                "shell", "State check: list current goals", "exit=0: list of goals with statuses"
+            )
+            wm.complete_action(tid, "exit=1: goals listing incomplete")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) == 0, (
+            "two identical failures are below min_recurrence and must stay suppressed"
+        )
+
+    def test_recurring_pattern_decays_after_resolution(self) -> None:
+        """A resolved recurring failure disappears once recent actions succeed.
+
+        The recurrence exception bypasses the ratio-decay check but NOT the
+        recency-decay check: once the 5 most recent actions of the type are
+        all low-error, the pattern decays (the failure was fixed).
+        """
+        wm = WorldModel()
+        for i in range(8):
+            tid = wm.record_action("shell", f"healthy probe {i}", "probe succeeds")
+            wm.complete_action(tid, "probe succeeds")
+        for _ in range(3):
+            tid = wm.record_action(
+                "shell",
+                "State check: list current goals and their statuses",
+                "exit=0: list of goals with statuses",
+            )
+            wm.complete_action(tid, "exit=1: goals listing incomplete")
+        # Pattern is present while the failure is recent
+        assert len(wm.get_discrepancy_patterns()) >= 1
+        # Now the daemon fixes the command: 5 recent successes follow
+        for i in range(5):
+            tid = wm.record_action(
+                "shell", f"State check probe after fix {i}", "exit=0: goals"
+            )
+            wm.complete_action(tid, "exit=0: goals")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) == 0, (
+            "resolved recurring failure must decay after recent successes"
+        )
+
     def test_context_includes_patterns_section(self) -> None:
         wm = WorldModel()
         for i in range(3):
