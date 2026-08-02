@@ -1798,6 +1798,34 @@ _DOCUMENTED_SUBJECTS: tuple = (
             re.IGNORECASE,
         ),
     ),
+    # Gap 10 Level 2 write ramp — resolved 2026-08-02 (the github.write
+    # grant landed, both allowlisted docs were published through the
+    # bridge: plan sha 273306d..., evidence sha 7efe838...;
+    # bridge_audit.log shows exec PUT entries for
+    # docs/gap10-level2-plan.md and evidence/gap10-level1.md, and the
+    # fire_gap10_write.py path-alias gap is fixed in f784e42b7).
+    # Commitments still promising to fire the evidence write, verify the
+    # audit trail, or sustain the read-gate steady state restate
+    # established facts, as do "do not re-verify the committed L2 path"
+    # bookkeeping notes — all were observed live in self_model.json on
+    # 2026-08-02 after the ramp completed.  The keyword gate keeps
+    # genuinely new gap10 work (Level 3 grants, new write targets) alive
+    # because it lacks the completed-ramp vocabulary.
+    (
+        ("gap10", "gap 10", "level 2", "level-2", "l2 path", "write ramp",
+         "allowlisted write", "allowlisted bridge", "fire_gap10_write",
+         "github.write", "github write", "read-gate", "read gate",
+         "steady state", "steady-state"),
+        "scripts/fire_gap10_write.py",
+        "evidence/gap10-level1.md",
+        re.compile(
+            r"fire|publish|re-verif|supersede|read-gate|read gate|steady|"
+            r"verify (?:audit|the audit|bridge_audit)|audit (?:entries|trail)|"
+            r"close the ramp|post-ramp|ramp is complete|second allowlisted|"
+            r"both (?:level 2|allowlisted)",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _RESOLVED_FACT_KEYWORDS = re.compile(
     r"path|locat|line count|structure|internal|loop|read|outline|unresolved",

@@ -1949,6 +1949,72 @@ class TestPruneSelfModel:
         assert sm["capabilities"]["unknown_areas"] == []
         assert sm["commitments"]["promised_features"] == []
 
+    def test_subject_is_resolved_covers_gap10_l2_ramp(
+        self, evolve_env: Dict
+    ) -> None:
+        """The Gap 10 Level 2 write-ramp evidence gap is resolved.
+
+        Regression for the 2026-08-02 stale-commitment accumulation: after
+        the github.write grant landed and both allowlisted docs were
+        published (plan sha 273306d..., evidence sha 7efe838...;
+        bridge_audit.log shows exec PUT entries for both), the live
+        self_model.json still carried 6 promised_features, 5 of which
+        restated the completed ramp (fire the evidence write, verify the
+        audit trail, sustain the read-gate steady state, never re-verify
+        the committed L2 path).  Those must now resolve so _prune_self_model
+        removes them and _apply_insights blocks re-adding them, while the
+        durable bridge-recovery policy and genuinely new Level 3 design
+        questions survive.
+        """
+        td = evolve_env["module"]
+        stale_commitments = [
+            "Supersede any stale bounded-verify scheduler.py/think_daemon.py "
+            "preflight commitment: that wiring is fulfilled and committed "
+            "(0de506ab7, facbda171); do not re-verify it while the "
+            "github.write grant is pending.",
+            "Reserve the single action slot for the primary steady-state "
+            "action each cycle (GET api_call if bridge UP; targeted recovery "
+            "probe if bridge DOWN); encode secondary advancing slices as "
+            "plan/goal bookkeeping or timeline decisions, and never "
+            "re-verify the committed L2 path.",
+            "Fire the second allowlisted write (PUT evidence/gap10-level1.md) "
+            "next cycle via scripts/fire_gap10_write.py evidence1; then the "
+            "Level 2 ramp is complete and Gap 10's remaining work is "
+            "post-ramp verification.",
+            "Publish evidence/gap10-level1.md via the allowlisted bridge and "
+            "verify bridge_audit.log shows exec PUT entries for both Level 2 "
+            "docs.",
+            "Keep the Level 2 write ramp moving to completion: fire the "
+            "evidence write, verify audit entries, then close the ramp "
+            "without re-verifying committed wiring.",
+        ]
+        keep_commitments = [
+            # Durable operational policy — no gap10/L2 vocabulary.
+            "On any cycle where the bridge is DOWN, spend the first action "
+            "on a targeted bridge recovery probe (locate launcher/health "
+            "script, attempt restart), not on passive ls or a doomed "
+            "api_call.",
+            # Genuinely new gap10 work — lacks completed-ramp vocabulary.
+            "Request a Level 3 github.write grant for docs/ and draft the "
+            "proposal document.",
+        ]
+        for entry in stale_commitments:
+            assert td._subject_is_resolved(entry), entry[:80]
+        for entry in keep_commitments:
+            assert not td._subject_is_resolved(entry), entry[:80]
+
+        sm = {
+            "capabilities": {"weaknesses": [], "unknown_areas": []},
+            "commitments": {
+                "promised_features": list(stale_commitments) + keep_commitments
+            },
+        }
+        removed = td._prune_self_model(
+            sm, daemon_state={"tick_count": 340, "last_output": {"fallback": False}}
+        )
+        assert removed == len(stale_commitments)
+        assert sm["commitments"]["promised_features"] == keep_commitments
+
     def test_subject_is_resolved_covers_p3_retry_telemetry(
         self, evolve_env: Dict
     ) -> None:
