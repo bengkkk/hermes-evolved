@@ -1211,6 +1211,54 @@ def _api_call_capability_text(perm_entries: Any) -> str:
     )
 
 
+def _external_block_guidance(sm: Dict[str, Any]) -> str:
+    """Gap 4: bounded multi-gap fallback guidance during external blocks.
+
+    Deterministic detector: an external block exists when at least one
+    resource has a WRITE allowlist entry armed in this daemon
+    (``_API_WRITE_ALLOWLIST``) but the permission registry carries no
+    truthy ``write`` grant for it — the write path is fully built and
+    ready, and only a human can open the gate. In that state the daemon
+    must not idle: it keeps the active gap's minimal steady-state action
+    (read-gate calibration) AND advances ONE secondary proposed goal per
+    cycle, bounded (no thrash, no re-verification of proven state).
+
+    Returns ``""`` when nothing is blocked, so normal cycles are
+    byte-identical to before — the guidance only ever adds prompt text
+    while a real permission/user dependency is pending.
+    """
+    perms = sm.get("permissions") if isinstance(sm, dict) else None
+    if not isinstance(perms, dict):
+        return ""
+    blocked = sorted(
+        {
+            e.get("resource")
+            for e in _API_WRITE_ALLOWLIST
+            if e.get("resource")
+            and not (
+                isinstance(perms.get(e.get("resource")), dict)
+                and bool(perms[e.get("resource")].get("write"))
+            )
+        }
+    )
+    if not blocked:
+        return ""
+    return (
+        "  ⛔ EXTERNAL BLOCK ACTIVE (permission/user dependency): write grant"
+        " pending for " + ", ".join(blocked) + ".\n"
+        "    Policy (Gap 4 — resilient multi-gap progression):\n"
+        "      (1) Still fire the active gap's minimal steady-state action each\n"
+        "          cycle (the allowlisted read-only GET) — the read-gate must\n"
+        "          stay calibrated.\n"
+        "      (2) Each cycle ALSO pick ONE secondary proposed P2/P3 goal and take\n"
+        "          ONE bounded advancing action (investigate/improve/verify a\n"
+        "          NON-redundant slice). Never re-verify or re-patch\n"
+        "          already-proven state.\n"
+        "      (3) At most ONE secondary action per cycle — bounded, no thrashing;\n"
+        "          do not journal steady-state repeats as new decisions.\n"
+    )
+
+
 def _build_thinking_prompt(state: Dict[str, Any]) -> str:
     """Build a self-reflection prompt from current evolve state."""
     tl = state.get("timeline", {})
@@ -1315,6 +1363,14 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
             _active_count = sum(1 for g in _active if g.get("status") in ("active", "in_progress"))
             _proposed_count = sum(1 for g in _active if g.get("status") == "proposed")
             goals_text += "\n  ({} active, {} proposed)".format(_active_count, _proposed_count)
+
+            # Gap 4: when the active gap is externally blocked (write allowlist
+            # armed, no write grant), append bounded multi-gap fallback guidance
+            # so the daemon keeps the read-gate steady state AND advances ONE
+            # secondary proposed goal per cycle instead of idling on the block.
+            _ext_block = _external_block_guidance(sm)
+            if _ext_block:
+                goals_text += "\n" + _ext_block
         else:
             goals_text = "  (none)"
     except Exception as e:

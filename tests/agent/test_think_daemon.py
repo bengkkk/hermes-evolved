@@ -1037,6 +1037,105 @@ class TestBuildThinkingPrompt:
             assert section in prompt, f"Missing section: '{section}'"
 
 
+class TestExternalBlockGuidance:
+    """Gap 4: bounded multi-gap fallback guidance during external blocks.
+
+    The guidance must fire exactly when a write allowlist entry is armed
+    (the write path is ready) but the permission registry carries no
+    truthy ``write`` grant — a real permission/user dependency. Normal
+    cycles (grant present, or nothing armed) must be byte-identical.
+    """
+
+    def _blocked_state(self, write: bool = False) -> Dict[str, Any]:
+        return {
+            "daemon_state": {
+                "status": "running",
+                "tick_count": 42,
+                "interval_seconds": 600,
+                "last_tick": "2026-07-29T00:00:00",
+                "first_tick": "2026-07-01T00:00:00",
+                "last_action_output": "exit=0: read-gate GET ok",
+                "cycle_stats": {"total": 42, "ok": 40, "error": 1, "parse_error": 1},
+            },
+            "timeline": {
+                "version": 1,
+                "past": {"events": [], "completed_sessions": []},
+                "present": {},
+                "future": {"goals": []},
+            },
+            "self_model": {
+                "version": 1,
+                "identity": {"name": "Hermes", "role": "Self-evolving AI"},
+                "state": {"current_gap_focus": "Gap 10", "evolution_version": 5},
+                "capabilities": {
+                    "strengths": ["shell"],
+                    "weaknesses": [],
+                    "unknown_areas": [],
+                },
+                "commitments": {},
+                "permissions": {"github": {"read": True, "write": write}},
+            },
+            "orientation": None,
+            "world_model": None,
+        }
+
+    def test_blocked_when_write_allowlist_armed_but_no_grant(
+        self, evolve_env: Dict
+    ) -> None:
+        td = evolve_env["module"]
+        sm = {"permissions": {"github": {"read": True, "write": False}}}
+        guidance = td._external_block_guidance(sm)
+        assert "EXTERNAL BLOCK ACTIVE" in guidance
+        assert "github" in guidance
+        assert "steady-state" in guidance
+        assert "ONE secondary" in guidance
+
+    def test_empty_when_write_granted(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {"permissions": {"github": {"read": True, "write": True}}}
+        assert td._external_block_guidance(sm) == ""
+
+    def test_empty_when_no_permissions_declared(self, evolve_env: Dict) -> None:
+        """A self-model with NO permissions section at all (corrupt/absent
+        registry) must not change normal-cycle behavior."""
+        td = evolve_env["module"]
+        assert td._external_block_guidance({}) == ""
+        assert td._external_block_guidance(None) == ""
+
+    def test_blocked_when_resource_missing_from_registry(self, evolve_env: Dict) -> None:
+        """Deny-by-default: a missing resource entry is still an external block
+        while the write allowlist is armed for it."""
+        td = evolve_env["module"]
+        guidance = td._external_block_guidance({"permissions": {}})
+        assert "EXTERNAL BLOCK ACTIVE" in guidance
+        assert "github" in guidance
+
+    def test_prompt_injects_guidance_when_blocked(self, evolve_env: Dict) -> None:
+        """_build_thinking_prompt appends the Gap 4 guidance when a write
+        grant is pending and goals exist (goals section must be populated)."""
+        td = evolve_env["module"]
+        from data_layer import Goals
+
+        g = Goals()
+        g.propose(
+            "Resilient multi-gap progression during external blocks",
+            description="Advance secondary gaps while the active gap is blocked",
+            rationale="Phase 2 autonomy",
+            priority=2,
+        )
+        g.save()
+        prompt = td._build_thinking_prompt(self._blocked_state(write=False))
+        assert "EXTERNAL BLOCK ACTIVE" in prompt
+        assert "github" in prompt
+
+    def test_prompt_unchanged_when_write_granted(self, evolve_env: Dict) -> None:
+        """No EXTERNAL BLOCK text when the write grant exists — normal cycles
+        stay byte-identical."""
+        td = evolve_env["module"]
+        prompt = td._build_thinking_prompt(self._blocked_state(write=True))
+        assert "EXTERNAL BLOCK ACTIVE" not in prompt
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Reliability cycle-stat printout
 # ═══════════════════════════════════════════════════════════════════
