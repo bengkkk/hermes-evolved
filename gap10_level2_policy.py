@@ -12,7 +12,7 @@ Security invariants (must never drift from the enforcing code):
    let a crafted path (``plan.md-evil``, ``other.md``) widen to siblings.
    Earlier draft of this module used ``contents/.+$`` and would have allowed
    PUTs the bridge correctly blocks — the equivalence test
-   (tests/test_evolve_bridge.py::test_policy_matches_enforced_allowlists)
+   (tests/test_evolve_bridge.py::test_policy_reference_matches_enforced_allowlists)
    pins the two representations together so that cannot come back.
 2. **Deny-by-default.** Unknown method, unknown host, no allowlist entry, or
    a missing/false permission flag for the method's action ⇒ deny. The only
