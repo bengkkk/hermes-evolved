@@ -6,10 +6,17 @@ before executing a directive that references a file, commit, or verification
 state has already changed (committed/verified) and skip the action if stale."
 
 This module is the standalone, importable policy contract (same shape as
-gap10_level2_policy.py). It is NOT yet wired into think_daemon.py's loop —
-that wiring is a later bounded slice. The interface is designed so the
-daemon can call ``filter_stale(directives, facts)`` once per cycle with the
-directives it is considering, and only execute the ones that come back.
+gap10_level2_policy.py). It IS wired into think_daemon.py's loop (Gap 8
+slice 2, commit 241b2c452): ``_stale_guidance_skip_reason(act)`` builds a
+directive from each action's description/command/message, gathers bounded
+repo evidence (one ``git log`` for recent SHAs, one ``git status
+--porcelain`` per referenced path, ``evidence/`` markers) into a
+``RepoFacts``, and runs it through ``verdict_for``. The gate in
+``_apply_insights`` (after the action dedup gate) nulls the action on
+``SKIP_STALE`` and surfaces a ``[STALE-SKIP]`` note in the cycle output.
+The interface is designed so callers can also use ``filter_stale``
+directly with a batch of directives and only execute the ones that come
+back.
 
 Design invariants (must never drift from the enforcing code, and are pinned
 by tests/test_stale_guidance_policy.py):
