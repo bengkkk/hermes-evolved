@@ -21,6 +21,7 @@ Shares the same provider, config, and data as the main Hermes session.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -4340,6 +4341,36 @@ _API_CALL_ALLOWLIST: list[Dict[str, Any]] = [
         "resource": "github",
     },
 ]
+# Write allowlist (Gap 10 Level 2 — low-risk writes, deny-until-granted).
+# Mirrors evolve_bridge.BRIDGE_WRITE_ALLOWLIST (tests assert equality so
+# drift cannot widen execution). Entries match the FULL path exactly (NOT
+# prefix) so one file's entry can never widen to siblings. These entries
+# arm the write path NOW, but `_validate_api_call` still requires a truthy
+# ``write`` flag in the permission registry — nothing executes until the
+# explicit Level 2 user grant (see docs/gap10-level2-plan.md).
+_API_WRITE_ALLOWLIST: list[Dict[str, Any]] = [
+    {
+        "method": "PUT",
+        "host": "api.github.com",
+        "path": "/repos/bengkkk/hermes-evolved/contents/docs/gap10-level2-plan.md",
+        "resource": "github",
+    },
+    {
+        "method": "PUT",
+        "host": "api.github.com",
+        "path": "/repos/bengkkk/hermes-evolved/contents/evidence/gap10-level1.md",
+        "resource": "github",
+    },
+]
+# HTTP method → permission action (mirrors evolve_bridge._METHOD_ACTION).
+_API_METHOD_ACTION: Dict[str, str] = {
+    "GET": "read",
+    "HEAD": "read",
+    "PUT": "write",
+    "POST": "write",
+    "PATCH": "write",
+    "DELETE": "write",
+}
 # Host bridge transport (design doc §3): localhost TCP + shared token.
 # The token is a SECRET and lives only in env on the daemon side — the
 # daemon forwards it to the bridge, which is the only component that
@@ -4377,35 +4408,118 @@ def _api_call_allowlist_entry(method: str, endpoint: str) -> Optional[Dict[str, 
     return None
 
 
+def _api_call_write_allowlist_entry(
+    method: str, endpoint: str
+) -> Optional[Dict[str, Any]]:
+    """Return the matching write-allowlist entry or None (deny).
+
+    Exact match on method + host + full path (query excluded) — mirrors
+    evolve_bridge._write_allowlist_entry. A write entry names one file and
+    must never widen to sibling paths.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        p = urlparse(endpoint)
+    except Exception:
+        return None
+    host = (p.hostname or "").lower()
+    path = p.path or "/"
+    method = (method or "GET").upper()
+    for entry in _API_WRITE_ALLOWLIST:
+        if method != entry.get("method"):
+            continue
+        if host != entry.get("host"):
+            continue
+        if path != entry.get("path"):
+            continue
+        return entry
+    return None
+
+
+def _api_method_action(method: str) -> Optional[str]:
+    """Map an HTTP method to the permission action it requires.
+
+    ``None`` for unknown methods — such a method can never pass pre-flight.
+    """
+    return _API_METHOD_ACTION.get((method or "GET").upper())
+
+
+def _validate_contents_body(body: Any) -> tuple:
+    """Validate a GitHub Contents API PUT body. Returns ``(ok, error)``.
+
+    Must stay identical to evolve_bridge._validate_contents_body (the
+    bridge is authoritative, so a mismatch here can only tighten, never
+    widen): ``message`` (non-empty str) and ``content`` (non-empty base64
+    str) are required; ``sha`` optional and must be a str when present.
+    """
+    if not isinstance(body, dict):
+        return False, f"body must be a JSON object, got {type(body).__name__}"
+    msg = body.get("message")
+    content = body.get("content")
+    if not isinstance(msg, str) or not msg.strip():
+        return False, "body.message must be a non-empty string"
+    if not isinstance(content, str) or not content.strip():
+        return False, "body.content must be a non-empty base64 string"
+    try:
+        base64.b64decode(content, validate=True)
+    except Exception:
+        return False, "body.content is not valid base64"
+    if "sha" in body and body["sha"] is not None and not isinstance(body["sha"], str):
+        return False, "body.sha must be a string when present"
+    return True, ""
+
+
 def _validate_api_call(act: Dict[str, Any], permissions: Dict[str, Any]) -> tuple:
     """Pre-flight validation for an ``api_call`` action (Gap 10 step 2).
 
     Returns ``(ok, error)``; ``ok=False`` means the action MUST NOT be
-    executed. Two independent deny layers:
+    executed. Method-aware deny layers (mirrors evolve_bridge's four layers):
 
-      1. Endpoint allowlist — ``endpoint`` must match an allowlist entry
-         (method + host + path prefix), else rejected.
-      2. Permission registry — the entry's ``resource`` must carry a
-         truthy ``read`` flag in the self-model ``permissions`` dict
+      1. Endpoint allowlist — GET/HEAD must match a READ allowlist entry
+         (method + host + path prefix); PUT/POST/PATCH/DELETE must match a
+         WRITE allowlist entry (method + host + FULL exact path). Anything
+         else is rejected.
+      2. Permission registry — the entry's ``resource`` must carry a truthy
+         flag for the METHOD'S action (read for GET/HEAD, write for
+         PUT/POST/PATCH/DELETE) in the self-model ``permissions`` dict
          (mirrors ``SelfModel.check_permission`` semantics: a missing
          resource or a False flag both deny).
+      3. Write-body validation — write actions require a valid Contents API
+         body (``_validate_contents_body``) so a malformed write is rejected
+         before it ever reaches the bridge.
+
+    The Level 2 gate is layer 2/3: write allowlist entries exist NOW, but
+    without an explicit ``write`` grant the action is denied — deny until
+    granted, exactly per the Gap 10 design doc §4.
     """
-    method = str(act.get("method", "GET") or "GET")
+    method = str(act.get("method", "GET") or "GET").upper()
     endpoint = str(act.get("endpoint", "") or "")
     if not endpoint:
         return False, "api_call requires an 'endpoint'"
     if not endpoint.startswith(("http://", "https://")):
         return False, f"endpoint must be an absolute http(s) URL: {endpoint[:80]!r}"
-    entry = _api_call_allowlist_entry(method, endpoint)
-    if entry is None:
-        return False, f"endpoint not in allowlist: {method.upper()} {endpoint[:80]}"
+    action = _api_method_action(method)
+    if action is None:
+        return False, f"unsupported method: {method}"
+    if action == "write":
+        entry = _api_call_write_allowlist_entry(method, endpoint)
+        if entry is None:
+            return False, f"endpoint not in write allowlist: {method} {endpoint[:80]}"
+        _ok, _err = _validate_contents_body(act.get("body") or {})
+        if not _ok:
+            return False, f"invalid write body: {_err}"
+    else:
+        entry = _api_call_allowlist_entry(method, endpoint)
+        if entry is None:
+            return False, f"endpoint not in allowlist: {method.upper()} {endpoint[:80]}"
     resource = entry.get("resource", "")
     granted = False
     if isinstance(permissions, dict):
         res_entry = permissions.get(resource)
-        granted = bool(isinstance(res_entry, dict) and res_entry.get("read"))
+        granted = bool(isinstance(res_entry, dict) and res_entry.get(action))
     if not granted:
-        return False, f"permission denied: no read grant for resource {resource!r}"
+        return False, f"permission denied: no {action} grant for resource {resource!r}"
     return True, ""
 
 

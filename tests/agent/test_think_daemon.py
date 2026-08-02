@@ -3605,6 +3605,89 @@ class TestApiCallPreflightValidation:
         assert ok
         assert err == ""
 
+    # ── Level 2 write path (armed, deny-until-granted) ────────────────────
+    # The write allowlist exists in the daemon now, but nothing passes until
+    # the explicit ``write`` grant lands (docs/gap10-level2-plan.md §3).
+
+    def test_write_allowlisted_put_with_write_grant_passes(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/bengkkk/hermes-evolved/"
+                "contents/docs/gap10-level2-plan.md",
+                "method": "PUT",
+                "body": {"message": "test", "content": "eA=="},
+            },
+            {"github": {"read": True, "write": True}},
+        )
+        assert ok, err
+        assert err == ""
+
+    def test_write_denied_without_write_grant(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/bengkkk/hermes-evolved/"
+                "contents/docs/gap10-level2-plan.md",
+                "method": "PUT",
+                "body": {"message": "test", "content": "eA=="},
+            },
+            {"github": {"read": True, "write": False}},
+        )
+        assert not ok
+        assert "no write grant" in err
+
+    def test_write_denied_non_allowlisted_path(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/bengkkk/hermes-evolved/"
+                "contents/other.md",
+                "method": "PUT",
+                "body": {"message": "test", "content": "eA=="},
+            },
+            {"github": {"write": True}},
+        )
+        assert not ok
+        assert "write allowlist" in err
+
+    def test_write_denied_prefix_widening(self, evolve_env: Dict) -> None:
+        """Exact-path matching: an entry for plan.md never widens to siblings."""
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/bengkkk/hermes-evolved/"
+                "contents/docs/gap10-level2-plan.md-evil",
+                "method": "PUT",
+                "body": {"message": "test", "content": "eA=="},
+            },
+            {"github": {"write": True}},
+        )
+        assert not ok
+        assert "write allowlist" in err
+
+    def test_write_denied_invalid_body(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {
+                "endpoint": "https://api.github.com/repos/bengkkk/hermes-evolved/"
+                "contents/docs/gap10-level2-plan.md",
+                "method": "PUT",
+                "body": {"message": "test"},  # missing content
+            },
+            {"github": {"write": True}},
+        )
+        assert not ok
+        assert "invalid write body" in err
+
+    def test_unsupported_method_rejected(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        ok, err = td._validate_api_call(
+            {"endpoint": "https://api.github.com/x", "method": "TRACE"}, {}
+        )
+        assert not ok
+        assert "unsupported method" in err
+
     def test_action_params_extractor_includes_api_call_fields(
         self, evolve_env: Dict
     ) -> None:
