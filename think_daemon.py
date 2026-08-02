@@ -376,6 +376,64 @@ def _recent_llm_call_failures(wm) -> int:
         return 0
 
 
+# Near-budget success parsing for _recent_llm_call_near_budget: a success
+# that only cleared the bar by consuming >= _LLM_NEAR_BUDGET_FRACTION of its
+# total retry budget is a strain signal (the endpoint is degrading, not
+# healthy).  Threshold 0.85 keeps fast recoveries ("attempt 2 (128.4s)"
+# against 2×90s = 71% of budget) confident while catching full-budget
+# grinds ("attempt 2 (179.6s)" = 99.8%).
+_LLM_ACTUAL_ATTEMPT_RE = re.compile(r"succeeded on attempt (\d+) \(([\d.]+)s\)")
+_LLM_BUDGET_RE = re.compile(r"within (\d+) attempt\(s\) × ([\d.]+)s budget")
+_LLM_NEAR_BUDGET_FRACTION = 0.85
+
+
+def _recent_llm_call_near_budget(wm) -> int:
+    """Count near-budget successes among the recent completed llm_call triples.
+
+    An intermittent endpoint leaves a strain trail BEFORE it fails
+    outright: a success that consumed >= 85% of its total retry budget
+    (observed 2026-08-02 05:10: "succeeded on attempt 2 (179.6s)" against a
+    2×90s budget) signals degradation that a hard-failure window cannot
+    see — the very next cycle (06:00:40) predicted a flat "success:" into
+    a 2-attempt timeout and scored a confident 0.85 because the last 5
+    triples contained no failure.  Counting near-budget successes
+    alongside hard failures makes the healthy-tier hedge fire on the
+    degradation itself, not just the outage that follows it.
+
+    Parsing is defensive: any triple whose strings do not carry the
+    attempt/budget numbers is skipped (not strained), never a crash.
+    """
+    if wm is None:
+        return 0
+    try:
+        triples = [
+            t for t in wm.data.get("action_triples", [])
+            if t.get("action_type") == "llm_call" and t.get("completed")
+        ]
+        near = 0
+        for t in triples[-_LLM_HEALTH_WINDOW:]:
+            m = _LLM_ACTUAL_ATTEMPT_RE.search(
+                (t.get("actual_outcome") or "").lower()
+            )
+            if not m:
+                continue
+            duration_s = float(m.group(2))
+            bm = _LLM_BUDGET_RE.search(
+                (t.get("expected_outcome") or "").lower()
+            )
+            if not bm:
+                continue
+            total_budget = int(bm.group(1)) * float(bm.group(2))
+            if (
+                total_budget > 0
+                and duration_s >= _LLM_NEAR_BUDGET_FRACTION * total_budget
+            ):
+                near += 1
+        return near
+    except Exception:
+        return 0
+
+
 # ── Placeholder-plan guard ────────────────────────────────────────
 # The LLM occasionally emits plans with empty placeholder steps
 # (e.g. goal "Test", steps "Step A"/"Step B", verification "V").
@@ -4789,11 +4847,33 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                 # last _LLM_HEALTH_WINDOW calls hedges even a healthy
                 # tier (the world model's single remaining discrepancy
                 # pattern: 7 high-error llm_call triples).
+                # Near-budget hedge (2026-08-02): a hard-failure window
+                # alone still misses the degradation that precedes an
+                # intermittent timeout — 05:10's 179.6s/180s success was
+                # followed by 06:00:40's confident 0.85 timeout with a
+                # clean failure window.  Near-budget successes (>= 85% of
+                # the total retry budget) now count as strain alongside
+                # hard failures.
                 _recent_failures = _recent_llm_call_failures(wm)
-                if _llm_policy_tier != "healthy" or _recent_failures:
+                _recent_near_budget = _recent_llm_call_near_budget(wm)
+                if (
+                    _llm_policy_tier != "healthy"
+                    or _recent_failures
+                    or _recent_near_budget
+                ):
+                    _hedge_parts = []
+                    if _recent_failures:
+                        _hedge_parts.append(
+                            f"{_recent_failures}/{_LLM_HEALTH_WINDOW} "
+                            "recent calls failed"
+                        )
+                    if _recent_near_budget:
+                        _hedge_parts.append(
+                            f"{_recent_near_budget}/{_LLM_HEALTH_WINDOW} "
+                            "recent calls near-budget"
+                        )
                     _hedge_note = (
-                        f", {_recent_failures}/{_LLM_HEALTH_WINDOW} "
-                        "recent calls failed" if _recent_failures else ""
+                        ", " + ", ".join(_hedge_parts) if _hedge_parts else ""
                     )
                     _expected_llm = (
                         f"success or timeout: LLM responds within {_retries} "

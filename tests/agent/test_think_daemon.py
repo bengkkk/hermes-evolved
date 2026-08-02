@@ -4314,6 +4314,83 @@ class TestCycleBodyLlmCallWorldModelRecording:
         assert t["expected_outcome"].startswith("success:"), t["expected_outcome"]
         assert t["prediction_error"] == 0.15, t["prediction_error"]
 
+    def test_healthy_tier_near_budget_successes_hedge(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Near-budget successes must hedge a healthy tier like failures do.
+
+        Regression guard for the 2026-08-02 06:00:40 observation: a
+        179.6s success against a 2×90s budget at 05:10 (99.8% of budget)
+        left the hard-failure window clean, so the next cycle predicted a
+        flat "success:" into a 2-attempt timeout and scored 0.85.  A
+        success that consumed >= 85% of its total retry budget is a
+        strain signal — with near-budget successes in the last
+        _LLM_HEALTH_WINDOW calls, even a healthy tier must emit the
+        disjunctive hedge and score the intermediate 0.4 (honest
+        uncertainty), never a confident 0.85.
+        """
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                parameters={"success": True, "last_error": None},
+            )
+            wm.complete_action(tid, "succeeded on attempt 2 (179.6s)")
+        wm.save()
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 4, f"expected 4 llm_call triples, got {len(triples)}"
+        t = triples[-1]
+        assert "success or timeout" in t["expected_outcome"], t["expected_outcome"]
+        assert "outage tier 'healthy'" in t["expected_outcome"], t["expected_outcome"]
+        assert "3/5 recent calls near-budget" in t["expected_outcome"], t["expected_outcome"]
+        assert t["prediction_error"] == 0.4, t["prediction_error"]
+
+    def test_healthy_tier_fast_recovery_stays_confident(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 2-attempt success well under the total budget is NOT strain.
+
+        Boundary guard for the near-budget hedge: "succeeded on attempt 2
+        (128.4s)" against a 2×90s budget (71% of budget — an attempt-1
+        timeout with a fast recovery) must not flip a healthy tier to the
+        hedge; only consumption >= 85% of the total budget counts.
+        """
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                parameters={"success": True, "last_error": None},
+            )
+            wm.complete_action(tid, "succeeded on attempt 2 (128.4s)")
+        wm.save()
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        t = triples[-1]
+        assert "success or timeout" not in t["expected_outcome"], t["expected_outcome"]
+        assert t["expected_outcome"].startswith("success:"), t["expected_outcome"]
+        assert t["prediction_error"] == 0.15, t["prediction_error"]
+
     def test_llm_call_triple_budget_fraction_none_without_budget(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
     ) -> None:
