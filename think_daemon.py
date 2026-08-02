@@ -117,6 +117,7 @@ _EVOLVE_TRACKED_PATHS: list[str] = [
     "stale_guidance_policy.py",
     "gap10_level2_policy.py",
     "verify_gap10_write_path.py",
+    "scripts/fire_gap10_write.py",
 ]
 
 # ── Paths (delegated to data_layer for the base directory) ──

@@ -418,3 +418,69 @@ def test_main_refuses_to_start_without_token(monkeypatch, capsys, env):
     assert evolve_bridge.main(["--port", "9999"]) == 2
     out = capsys.readouterr().err
     assert "refusing to start without a token" in out
+
+
+# ── compact GET/PUT summary (sha surfaced for read-then-write) ─────────────
+
+def test_compact_get_summary_extracts_contents_sha():
+    """A Contents API object's blob sha + size must survive the truncation
+    (they appear AFTER the base64 content field, beyond MAX_OUTPUT_BYTES), so
+    a read-then-write flow can learn the current sha for an update PUT."""
+    body = json.dumps(
+        {
+            "type": "file",
+            "encoding": "base64",
+            "size": 12173,
+            "name": "gap10-level2-plan.md",
+            "path": "docs/gap10-level2-plan.md",
+            "content": "x" * 6000,  # beyond MAX_OUTPUT_BYTES — sha comes after
+            "sha": "deadbeef" * 5,
+            "url": "https://api.github.com/...",
+        }
+    )
+    s = evolve_bridge._compact_get_summary(200, body)
+    assert s["status"] == 200
+    assert s["sha"] == "deadbeef" * 5
+    assert s["size"] == 12173
+    assert len(s["body"]) <= evolve_bridge.MAX_OUTPUT_BYTES
+    assert "error" not in s
+
+
+def test_compact_get_summary_unwraps_put_content_wrapper():
+    """A Contents API PUT response wraps the file object under ``content``;
+    sha/size must be surfaced from there (create AND update responses)."""
+    body = json.dumps(
+        {
+            "content": {
+                "name": "gap10-level2-plan.md",
+                "path": "docs/gap10-level2-plan.md",
+                "sha": "273306db" + "0" * 32,
+                "size": 12173,
+                "url": "https://api.github.com/...",
+            },
+            "commit": {"sha": "c0ffee" * 5},
+        }
+    )
+    s = evolve_bridge._compact_get_summary(201, body)
+    assert s["status"] == 201
+    assert s["sha"] == "273306db" + "0" * 32
+    assert s["size"] == 12173
+    assert "error" not in s
+
+
+def test_compact_get_summary_shapes():
+    """Non-contents shapes degrade safely: error object → message, list →
+    count, non-JSON → status/bytes/body only."""
+    err = evolve_bridge._compact_get_summary(404, json.dumps({"message": "Not Found"}))
+    assert err["status"] == 404
+    assert err["error"] == "Not Found"
+
+    listing = evolve_bridge._compact_get_summary(200, json.dumps([{"name": "a"}, {"name": "b"}]))
+    assert listing["count"] == 2
+    assert "sha" not in listing
+
+    raw = evolve_bridge._compact_get_summary(200, "not json at all")
+    assert raw["status"] == 200
+    assert "sha" not in raw
+    assert "error" not in raw
+    assert raw["bytes"] == len("not json at all")

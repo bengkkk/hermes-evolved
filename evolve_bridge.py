@@ -280,6 +280,42 @@ def _read_git_credentials_token(host: str, path: Optional[Path] = None) -> str:
 
 # ── Execution ────────────────────────────────────────────────────────────────
 
+def _compact_get_summary(status: int, text: str) -> Dict[str, Any]:
+    """Compact summary of a GitHub API response for the bridge's output slot.
+
+    Keeps the truncated body (never unbounded payloads) and additionally
+    surfaces the fields a read-then-write flow needs: for a Contents API
+    object the current blob ``sha`` + ``size`` (so an update PUT can pass
+    the sha back without re-fetching unbounded content), for an error
+    object the ``message``, and for a list a ``count``. Non-JSON bodies
+    degrade to the status/bytes/body shape — never raises.
+    """
+    summary: Dict[str, Any] = {
+        "status": status,
+        "bytes": len(text),
+        "body": text[:MAX_OUTPUT_BYTES],
+    }
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return summary
+    if isinstance(obj, dict):
+        # Contents API PUT responses wrap the file object under ``content``
+        # (create AND update); a GET returns it at the top level. Unwrap so
+        # sha/size are surfaced for both shapes.
+        inner = obj.get("content") if isinstance(obj.get("content"), dict) else None
+        src = inner if inner is not None else obj
+        if isinstance(src.get("sha"), str):
+            summary["sha"] = src["sha"]
+        if isinstance(src.get("size"), int):
+            summary["size"] = src["size"]
+        if isinstance(obj.get("message"), str) and "sha" not in summary:
+            summary["error"] = obj["message"][:200]
+    elif isinstance(obj, list):
+        summary["count"] = len(obj)
+    return summary
+
+
 def _github_get(endpoint: str) -> Dict[str, Any]:
     """Perform the allowlisted GitHub GET. Returns ``{exit, output}``.
 
@@ -301,11 +337,10 @@ def _github_get(endpoint: str) -> Dict[str, Any]:
     try:
         with httpx.Client(timeout=OUTBOUND_TIMEOUT) as client:
             resp = client.get(_GITHUB_API_BASE + path, headers=headers)
-        body = resp.text[:MAX_OUTPUT_BYTES]
         return {
             "exit": 0 if resp.status_code < 400 else 1,
             "output": json.dumps(
-                {"status": resp.status_code, "bytes": len(resp.text), "body": body},
+                _compact_get_summary(resp.status_code, resp.text),
                 ensure_ascii=False,
             )[: MAX_OUTPUT_BYTES + 500],
         }
@@ -342,11 +377,10 @@ def _github_put(endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         with httpx.Client(timeout=OUTBOUND_TIMEOUT) as client:
             resp = client.put(_GITHUB_API_BASE + path, headers=headers, json=payload)
-        body_text = resp.text[:MAX_OUTPUT_BYTES]
         return {
             "exit": 0 if resp.status_code < 400 else 1,
             "output": json.dumps(
-                {"status": resp.status_code, "bytes": len(resp.text), "body": body_text},
+                _compact_get_summary(resp.status_code, resp.text),
                 ensure_ascii=False,
             )[: MAX_OUTPUT_BYTES + 500],
         }
