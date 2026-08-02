@@ -84,3 +84,22 @@ For any proposed write action:
   remaining step is the external user grant, after which the first write
   triple (PUT this plan via the Contents API) fires and must yield HTTP
   201 with prediction error < 0.25.
+- Live write calibration (2026-08-02T05:44Z, bridge PID 346351 / daemon
+  PID 346362, live HERMES_HOME=/root/.hermes-evolved): fired the first
+  WRITE api_call triple through the live bridge using the daemon's own
+  wire protocol (POST /bridge/v1/exec, Bearer token from the bridge env)
+  against the exact allowlisted plan.md endpoint. Result: HTTP 403
+  "BLOCKED: permission denied: no write grant for resource 'github'" —
+  allowlist entry matched (layer 2), method-aware permission gate denied
+  (layer 3), no outbound call. Recorded as world-model triple
+  act_20260802054400_1, prediction error 0.25 (categorical MATCH; the
+  0.25 is the string-diff on the "HTTP 403:" prefix, same scale as the
+  daemon's own matched triples). The security-critical sibling-path
+  invariant was also verified LIVE at 05:44:49Z: PUT to
+  contents/other.md → HTTP 403 "BLOCKED: endpoint not in allowlist"
+  (exact-path matching held; no outbound call) — triple
+  act_20260802054449_1, error 0.25. Both denials appear in the live
+  audit log (deny_permission, deny_allowlist events), satisfying the
+  "audit entry for every external call" criterion end-to-end. The daemon
+  also independently fired a live GET (audit exec, exit 0, 05:10:51Z).
+  Grant still absent: `evolve_permissions.py check github write` → exit 1.
