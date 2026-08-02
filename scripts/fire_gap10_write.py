@@ -4,6 +4,7 @@
 Usage:
   python3 scripts/fire_gap10_write.py plan        # PUT docs/gap10-level2-plan.md
   python3 scripts/fire_gap10_write.py evidence1   # PUT evidence/gap10-level1.md
+  python3 scripts/fire_gap10_write.py evidence/gap10-level1.md   # same as evidence1 (path alias)
   python3 scripts/fire_gap10_write.py --list      # show allowlisted write targets
 
 Flow (the "write triple", mirrors think_daemon._execute_api_call's path):
@@ -135,10 +136,30 @@ def _target_endpoint(name: str) -> Optional[str]:
     return None
 
 
+def _resolve_target(arg: str) -> Optional[str]:
+    """Accept either the logical target name ('evidence1') or the repo-relative
+    file path ('evidence/gap10-level1.md'). Returns the canonical target name,
+    or None if the argument matches nothing.
+
+    The daemon's LLM-generated commands have historically passed the file path
+    (e.g. ``fire_gap10_write.py evidence/gap10-level1.md``); treating the path
+    as an alias removes that failure mode (previously a usage error, exit=2).
+    """
+    if arg in _TARGETS:
+        return arg
+    norm = arg.lstrip("./")
+    for name, meta in _TARGETS.items():
+        if norm == meta["local"] or norm.endswith("/" + meta["local"]):
+            return name
+    return None
+
+
 def fire(name: str) -> int:
-    if name not in _TARGETS:
+    target = _resolve_target(name)
+    if target is None:
         print(f"ERROR: unknown target {name!r} (use --list)", file=sys.stderr)
         return 2
+    name = target
     local_path = _REPO_ROOT / _TARGETS[name]["local"]
     if not local_path.exists():
         print(f"ERROR: local file missing: {local_path}", file=sys.stderr)
@@ -220,9 +241,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             ep = _target_endpoint(name)
             print(f"{name:10s} {ep}  <-  {meta['local']}")
         return 0
-    if argv[0] in ("plan", "evidence1"):
+    if argv[0] in ("plan", "evidence1") or _resolve_target(argv[0]) is not None:
         return fire(argv[0])
-    print(f"usage: {Path(sys.argv[0]).name} {{plan|evidence1|--list}}", file=sys.stderr)
+    print(f"usage: {Path(sys.argv[0]).name} {{plan|evidence1|<file-path>|--list}}", file=sys.stderr)
     return 2
 
 
