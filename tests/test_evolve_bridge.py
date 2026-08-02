@@ -326,6 +326,55 @@ def test_allowlist_matches_daemon():
     assert evolve_bridge.BRIDGE_WRITE_ALLOWLIST == _API_WRITE_ALLOWLIST
 
 
+def test_policy_reference_matches_enforced_allowlists():
+    """gap10_level2_policy.py is the readable policy contract: its lists must
+    equal the daemon's enforced lists so the reference can never drift wider
+    than what actually executes (the exact-path write invariant included)."""
+    import gap10_level2_policy
+    from think_daemon import _API_CALL_ALLOWLIST, _API_WRITE_ALLOWLIST
+
+    assert gap10_level2_policy.READ_ALLOWLIST == _API_CALL_ALLOWLIST
+    assert gap10_level2_policy.WRITE_ALLOWLIST == _API_WRITE_ALLOWLIST
+    assert gap10_level2_policy.METHOD_ACTION == evolve_bridge._METHOD_ACTION
+
+
+def test_policy_reference_decisions_match_bridge_gate():
+    """Decision-matrix equivalence: the reference pre-flight must agree with
+    the enforced bridge gate on the exact Level 2 endpoints. The over-
+    permissive ``contents/.+`` regex draft would fail the sibling-path cases
+    here — this test is what prevents that widening from coming back."""
+    import gap10_level2_policy
+
+    read_only = {"github": {"read": True, "write": False}}
+    write = {"github": {"read": True, "write": True}}
+    empty = {}
+
+    # (endpoint, method, permissions) → expected ok/deny
+    cases = [
+        # read semantics
+        ("https://api.github.com/repos/x", "GET", read_only, True),
+        ("https://api.github.com/repos/x", "GET", empty, False),
+        ("https://api.github.com/repos/x", "GET", {"github": {"read": False, "write": True}}, False),
+        ("https://evil.example.com/", "GET", read_only, False),
+        # write semantics — exact-path allowlist + explicit write grant
+        (_WRITE_PATH, "PUT", write, True),
+        (_WRITE_PATH, "PUT", read_only, False),
+        (_WRITE_PATH, "PUT", empty, False),
+        # a write grant never widens the allowlist (the security invariant)
+        ("https://api.github.com/repos/bengkkk/hermes-evolved/contents/other.md",
+         "PUT", write, False),
+        (_WRITE_PATH + "-evil", "PUT", write, False),
+        ("https://api.github.com/repos/other/repo/contents/docs/gap10-level2-plan.md",
+         "PUT", write, False),
+        # methods/endpoints not in ANY allowlist stay denied even with a grant
+        (_WRITE_PATH, "DELETE", write, False),
+        ("https://api.github.com/repos/x", "POST", write, False),
+    ]
+    for endpoint, method, perms, expected_ok in cases:
+        ok, reason = gap10_level2_policy.method_aware_preflight(endpoint, method, perms)
+        assert ok is expected_ok, (endpoint, method, perms, ok, reason)
+
+
 def test_main_refuses_to_start_without_token(monkeypatch, capsys, env):
     monkeypatch.delenv("HERMES_EVOLVED_BRIDGE_TOKEN", raising=False)
     # also remove the token-file fallback path by pointing evolve dir at an
