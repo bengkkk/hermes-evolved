@@ -36,6 +36,7 @@ uvicorn + httpx — all already present in the project venv.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -68,6 +69,41 @@ BRIDGE_ALLOWLIST: list[Dict[str, Any]] = [
         "resource": "github",
     },
 ]
+
+# ── Write allowlist (Gap 10 Level 2 — low-risk writes, deny-until-granted) ──
+# Mirrors think_daemon._API_WRITE_ALLOWLIST (tests assert equality so drift
+# cannot widen execution). Entries match the FULL path exactly (NOT prefix):
+# a write entry names one file the daemon may PUT; prefix matching here
+# would let a crafted path escape to sibling files. Execution additionally
+# requires a truthy ``write`` flag on the resource in the permission
+# registry — these entries exist NOW so the write path is armed and ready,
+# but nothing can execute until the user issues the explicit Level 2 grant
+# (evolve_permissions.py grant github write, see docs/gap10-level2-plan.md).
+BRIDGE_WRITE_ALLOWLIST: list[Dict[str, Any]] = [
+    {
+        "method": "PUT",
+        "host": "api.github.com",
+        "path": "/repos/bengkkk/hermes-evolved/contents/docs/gap10-level2-plan.md",
+        "resource": "github",
+    },
+    {
+        "method": "PUT",
+        "host": "api.github.com",
+        "path": "/repos/bengkkk/hermes-evolved/contents/evidence/gap10-level1.md",
+        "resource": "github",
+    },
+]
+
+# HTTP method → permission action mapping (single source of truth for the
+# method-aware permission check; any method absent here can never pass).
+_METHOD_ACTION: Dict[str, str] = {
+    "GET": "read",
+    "HEAD": "read",
+    "PUT": "write",
+    "POST": "write",
+    "PATCH": "write",
+    "DELETE": "write",
+}
 
 DEFAULT_PORT = 8791
 OUTBOUND_TIMEOUT = 30.0
@@ -138,6 +174,67 @@ def _allowlist_entry(method: str, endpoint: str) -> Optional[Dict[str, Any]]:
             continue
         return entry
     return None
+
+
+def _method_action(method: str) -> Optional[str]:
+    """Map an HTTP method to the permission action it requires.
+
+    ``None`` for unknown methods — such a method can never pass pre-flight.
+    """
+    return _METHOD_ACTION.get((method or "GET").upper())
+
+
+def _write_allowlist_entry(method: str, endpoint: str) -> Optional[Dict[str, Any]]:
+    """Return the matching write-allowlist entry or None (deny).
+
+    Exact match on method + host + full path (query excluded). Unlike the
+    read allowlist's prefix match, write entries must be exact so an entry
+    for one file can never widen to sibling paths (e.g. a PUT to
+    ``.../plan.md-evil`` or ``.../other.md`` stays denied).
+    """
+    try:
+        p = urllib.parse.urlparse(endpoint)
+    except Exception:
+        return None
+    host = (p.hostname or "").lower()
+    path = p.path or "/"
+    method = (method or "GET").upper()
+    for entry in BRIDGE_WRITE_ALLOWLIST:
+        if method != entry.get("method"):
+            continue
+        if host != entry.get("host"):
+            continue
+        if path != entry.get("path"):
+            continue
+        return entry
+    return None
+
+
+def _validate_contents_body(body: Any) -> tuple:
+    """Validate a GitHub Contents API PUT body. Returns ``(ok, error)``.
+
+    Wire contract (mirrors think_daemon._validate_contents_body — the
+    bridge is authoritative, so a mismatch there can only tighten, never
+    widen): ``message`` (non-empty str) and ``content`` (non-empty base64
+    str) are required; ``sha`` is optional and, when present, must be a
+    str. Rejects non-dict bodies, missing/empty fields, and non-base64
+    content so a malformed write never reaches the wire.
+    """
+    if not isinstance(body, dict):
+        return False, f"body must be a JSON object, got {type(body).__name__}"
+    msg = body.get("message")
+    content = body.get("content")
+    if not isinstance(msg, str) or not msg.strip():
+        return False, "body.message must be a non-empty string"
+    if not isinstance(content, str) or not content.strip():
+        return False, "body.content must be a non-empty base64 string"
+    try:
+        base64.b64decode(content, validate=True)
+    except Exception:
+        return False, "body.content is not valid base64"
+    if "sha" in body and body["sha"] is not None and not isinstance(body["sha"], str):
+        return False, "body.sha must be a string when present"
+    return True, ""
 
 
 def _permission_granted(resource: str, action: str = "read") -> bool:
@@ -216,6 +313,47 @@ def _github_get(endpoint: str) -> Dict[str, Any]:
         return {"exit": 1, "output": f"github GET failed: {exc.__class__.__name__}: {exc}"[:400]}
 
 
+def _github_put(endpoint: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Perform an allowlisted GitHub Contents API PUT. Returns ``{exit, output}``.
+
+    Sends ONLY the validated subset of *body* (message/content/sha) so an
+    over-permissive daemon payload can never smuggle extra fields onto the
+    wire. Same credential + truncation rules as ``_github_get``; the token
+    is never logged or echoed back.
+    """
+    p = urllib.parse.urlparse(endpoint)
+    path = p.path or "/"
+    if p.query:
+        path += "?" + p.query
+    token = _read_git_credentials_token("github.com")
+    if not token:
+        return {"exit": 1, "output": "no github.com credential in ~/.git-credentials"}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "hermes-evolved-bridge/1.0",
+    }
+    payload: Dict[str, Any] = {
+        "message": body.get("message", ""),
+        "content": body.get("content", ""),
+    }
+    if body.get("sha") is not None:
+        payload["sha"] = body["sha"]
+    try:
+        with httpx.Client(timeout=OUTBOUND_TIMEOUT) as client:
+            resp = client.put(_GITHUB_API_BASE + path, headers=headers, json=payload)
+        body_text = resp.text[:MAX_OUTPUT_BYTES]
+        return {
+            "exit": 0 if resp.status_code < 400 else 1,
+            "output": json.dumps(
+                {"status": resp.status_code, "bytes": len(resp.text), "body": body_text},
+                ensure_ascii=False,
+            )[: MAX_OUTPUT_BYTES + 500],
+        }
+    except httpx.HTTPError as exc:
+        return {"exit": 1, "output": f"github PUT failed: {exc.__class__.__name__}: {exc}"[:400]}
+
+
 def _audit(entry: Dict[str, Any]) -> None:
     """Append one JSON line per decision (executed AND blocked)."""
     try:
@@ -253,9 +391,13 @@ async def exec_action(req: ExecRequest, request: Request) -> JSONResponse:
             content={"exit": 1, "output": "unauthorized: bad or missing bearer token"},
         )
 
-    # Layer 2 — endpoint allowlist
+    # Layer 2 — endpoint allowlist. Read entries match method + host + path
+    # PREFIX; write entries match method + host + FULL path exactly (a write
+    # entry names one file and must never widen to siblings). A request is
+    # only allowlisted when it matches one of the two lists.
     entry = _allowlist_entry(method, endpoint)
-    if entry is None:
+    write_entry = _write_allowlist_entry(method, endpoint)
+    if entry is None and write_entry is None:
         _audit({"event": "deny_allowlist", "method": method, "endpoint": endpoint[:120]})
         return JSONResponse(
             status_code=403,
@@ -264,10 +406,13 @@ async def exec_action(req: ExecRequest, request: Request) -> JSONResponse:
                 "output": f"BLOCKED: endpoint not in allowlist: {method} {endpoint[:120]}",
             },
         )
-    resource = entry.get("resource", "")
+    resource = (entry or write_entry).get("resource", "")
 
-    # Layer 3 — permission registry
-    if not _permission_granted(resource, "read"):
+    # Layer 3 — permission registry, method-aware (GET→read, PUT/POST/etc →
+    # write). The Level 2 gate lives HERE: write allowlist entries exist, but
+    # without a truthy ``write`` grant the request is blocked deny-by-default.
+    action = _method_action(method)
+    if action is None or not _permission_granted(resource, action):
         _audit(
             {
                 "event": "deny_permission",
@@ -280,13 +425,36 @@ async def exec_action(req: ExecRequest, request: Request) -> JSONResponse:
             status_code=403,
             content={
                 "exit": 1,
-                "output": f"BLOCKED: permission denied: no read grant for resource {resource!r}",
+                "output": (
+                    f"BLOCKED: permission denied: no {action or 'unknown'} "
+                    f"grant for resource {resource!r}"
+                ),
             },
         )
+
+    # Layer 4 — write-body validation (write methods only). A malformed
+    # body must be rejected before anything reaches the wire.
+    if action == "write":
+        _ok, _err = _validate_contents_body(req.body)
+        if not _ok:
+            _audit(
+                {
+                    "event": "deny_body",
+                    "method": method,
+                    "endpoint": endpoint[:120],
+                    "resource": resource,
+                }
+            )
+            return JSONResponse(
+                status_code=400,
+                content={"exit": 1, "output": f"BLOCKED: invalid body: {_err}"},
+            )
 
     # Execute
     if method == "GET":
         result = _github_get(endpoint)
+    elif method == "PUT":
+        result = _github_put(endpoint, req.body)
     else:
         result = {"exit": 1, "output": f"unsupported method: {method}"}
 

@@ -31,19 +31,27 @@ def _auth(token="test-token"):
     return {"Authorization": f"Bearer {token}"}
 
 
-def _write_self_model(env, github_read=False):
+def _write_self_model(env, github_read=False, github_write=False):
     d = env / "evolve"
     d.mkdir(exist_ok=True)
     (d / "self_model.json").write_text(
         json.dumps(
             {
                 "identity": {"name": "test"},
-                "permissions": {"github": {"read": github_read, "write": False,
+                "permissions": {"github": {"read": github_read, "write": github_write,
                                            "act": False, "cap": None}},
             }
         ),
         encoding="utf-8",
     )
+
+
+# Level 2 write target (first planned Contents API PUT — must stay in sync
+# with BRIDGE_WRITE_ALLOWLIST / _API_WRITE_ALLOWLIST).
+_WRITE_PATH = (
+    "https://api.github.com/repos/bengkkk/hermes-evolved/"
+    "contents/docs/gap10-level2-plan.md"
+)
 
 
 # ── health ───────────────────────────────────────────────────────────────
@@ -190,6 +198,109 @@ def test_audit_trail_written(client, env, monkeypatch):
     assert "ts" in json.loads(lines[0])
 
 
+# ── Level 2 write path (armed, deny-until-granted) ─────────────────────
+
+def test_write_denied_without_write_grant(client, env, monkeypatch):
+    """The Level 2 gate: allowlisted PUT + read grant is still BLOCKED."""
+    _write_self_model(env, github_read=True, github_write=False)
+    calls = []
+    monkeypatch.setattr(
+        evolve_bridge, "_github_put", lambda ep, body: calls.append((ep, body))
+    )
+    r = client.post(
+        "/bridge/v1/exec",
+        json={
+            "endpoint": _WRITE_PATH,
+            "method": "PUT",
+            "body": {"message": "test", "content": "eA=="},
+        },
+        headers=_auth(),
+    )
+    assert r.status_code == 403
+    assert "no write grant" in r.json()["output"]
+    assert calls == []  # deny must never execute
+
+
+def test_write_denied_non_allowlisted_paths(client, env, monkeypatch):
+    """A write grant does NOT widen the endpoint allowlist (exact-path match)."""
+    _write_self_model(env, github_write=True)
+    calls = []
+    monkeypatch.setattr(
+        evolve_bridge, "_github_put", lambda ep, body: calls.append((ep, body))
+    )
+    for ep in (
+        "https://api.github.com/repos/bengkkk/hermes-evolved/contents/other.md",
+        _WRITE_PATH + "-evil",  # prefix widening must stay blocked
+        "https://api.github.com/repos/other/repo/contents/docs/gap10-level2-plan.md",
+    ):
+        r = client.post(
+            "/bridge/v1/exec",
+            json={
+                "endpoint": ep,
+                "method": "PUT",
+                "body": {"message": "test", "content": "eA=="},
+            },
+            headers=_auth(),
+        )
+        assert r.status_code == 403, ep
+        assert "BLOCKED" in r.json()["output"]
+    assert calls == []
+
+
+def test_write_invalid_body_rejected(client, env, monkeypatch):
+    """Malformed write bodies are rejected before anything reaches the wire."""
+    _write_self_model(env, github_write=True)
+    calls = []
+    monkeypatch.setattr(
+        evolve_bridge, "_github_put", lambda ep, body: calls.append((ep, body))
+    )
+    for body in (
+        {"content": "eA=="},                            # missing message
+        {"message": "test"},                            # missing content
+        {"message": "", "content": "eA=="},             # empty message
+        {"message": "test", "content": "not-base64!"},  # invalid base64
+        {"message": "test", "content": "eA==", "sha": 123},  # non-str sha
+    ):
+        r = client.post(
+            "/bridge/v1/exec",
+            json={"endpoint": _WRITE_PATH, "method": "PUT", "body": body},
+            headers=_auth(),
+        )
+        assert r.status_code == 400, body
+        assert "invalid body" in r.json()["output"]
+    # Non-dict body: rejected by FastAPI's schema layer (422) — still a deny.
+    r = client.post(
+        "/bridge/v1/exec",
+        json={"endpoint": _WRITE_PATH, "method": "PUT", "body": []},
+        headers=_auth(),
+    )
+    assert r.status_code == 422
+    assert calls == []
+
+
+def test_write_executes_with_grant(client, env, monkeypatch):
+    """Allowlisted PUT + write grant + valid body executes ``_github_put``."""
+    _write_self_model(env, github_write=True)
+    seen = {}
+
+    def fake_put(endpoint, body):
+        seen["endpoint"] = endpoint
+        seen["body"] = body
+        return {"exit": 0, "output": json.dumps({"status": 201, "body": "created"})}
+
+    monkeypatch.setattr(evolve_bridge, "_github_put", fake_put)
+    body = {"message": "test", "content": "eA==", "sha": "abc"}
+    r = client.post(
+        "/bridge/v1/exec",
+        json={"endpoint": _WRITE_PATH, "method": "PUT", "body": body},
+        headers=_auth(),
+    )
+    assert r.status_code == 200
+    assert r.json()["exit"] == 0
+    assert seen["endpoint"] == _WRITE_PATH
+    assert seen["body"] == body
+
+
 # ── credential parsing ───────────────────────────────────────────────────
 
 def test_git_credentials_token_parsing(tmp_path):
@@ -209,9 +320,10 @@ def test_git_credentials_token_parsing(tmp_path):
 # ── drift guard: bridge allowlist must stay identical to the daemon's ────
 
 def test_allowlist_matches_daemon():
-    from think_daemon import _API_CALL_ALLOWLIST
+    from think_daemon import _API_CALL_ALLOWLIST, _API_WRITE_ALLOWLIST
 
     assert evolve_bridge.BRIDGE_ALLOWLIST == _API_CALL_ALLOWLIST
+    assert evolve_bridge.BRIDGE_WRITE_ALLOWLIST == _API_WRITE_ALLOWLIST
 
 
 def test_main_refuses_to_start_without_token(monkeypatch, capsys, env):
