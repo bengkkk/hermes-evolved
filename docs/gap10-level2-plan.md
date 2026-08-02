@@ -1,6 +1,6 @@
 # Gap 10 Level 2 — Real Action Bridge: Low-Risk Writes
 
-Status: DRAFT (awaiting github.write grant)
+Status: COMPLETE (both allowlisted writes fired and verified 2026-08-02)
 Owner: Hermes (evolved)
 Created: 2026-08-02
 
@@ -190,3 +190,28 @@ For any proposed write action:
   only on a changed outcome (FAIL, or GRANT ACTIVE → fire the first write
   triple deliberately with the real payload). No more per-cycle doc
   paragraphs while the state is unchanged.
+
+## Level 2 COMPLETE (2026-08-02)
+
+The github.write grant landed 2026-08-02 and both allowlisted writes were
+fired through the live host bridge and verified:
+
+| # | Endpoint | Fired (UTC) | Result | Remote sha | Prediction error |
+|---|----------|-------------|--------|------------|------------------|
+| 1 | PUT .../contents/docs/gap10-level2-plan.md | 22:33:54Z | HTTP 201 | 273306dbf0a2b88f30f48ed6d8f44d… | 0.15 |
+| 2 | PUT .../contents/evidence/gap10-level1.md | 22:54:23Z | HTTP 201 | 7efe838989f755986d076feb8f216d16f0662dec | 0.15 |
+
+Both writes were recorded as world-model action triples
+(`act_20260802223653_1`, `act_20260802225703_1`) with prediction error
+0.15 — below the 0.25 bar. The bridge audit log contains an `exec` entry
+for each accepted call plus post-write verification GETs (22:34:39Z,
+22:56:32Z), satisfying the audit-trail criterion end-to-end. A later cron
+probe (23:35Z) confirmed the remote evidence blob sha still equals the
+local file's git blob sha (7efe8389…) — the published content is current
+and byte-identical, so no re-PUT is needed.
+
+Level 2 exit criteria met: method-aware pre-flight enforced (deny-by-default
+held until the grant), both planned writes executed with HTTP 201 and
+verifiable shas, prediction error < 0.25, and the audit trail is complete.
+The Real Action Bridge now has a proven write path; Level 3 (higher-value
+actions) remains future work per docs/gap10-bridge-design.md.
