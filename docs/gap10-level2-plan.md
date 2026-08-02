@@ -62,3 +62,15 @@ For any proposed write action:
   method-aware permission gate denied (layer 3), with no outbound call.
 - Remaining: grant → first write triple (PUT this plan through the
   Contents API) → verify HTTP 201 + prediction error < 0.25.
+- Cron re-verification (2026-08-02T03:05Z): the daemon restarted since
+  the last check (now PID 334548; bridge PID 334537 on port 8791), so the
+  armed write path was re-probed against the LIVE processes: PUT to the
+  exact allowlisted plan.md endpoint returns HTTP 403 "BLOCKED:
+  permission denied: no write grant for resource 'github'" (allowlist
+  entry matched, method-aware permission gate denied, no outbound call),
+  while GET https://api.github.com/ still returns exit=0 with a live
+  2262-byte GitHub payload — bridge fully functional, only the grant
+  missing. 28/28 evolve bridge/permission tests pass
+  (tests/test_evolve_bridge.py 16✓, tests/test_evolve_permissions.py
+  12✓). State unchanged: github.write still denied, deny-by-default
+  holding.
