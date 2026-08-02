@@ -74,3 +74,13 @@ For any proposed write action:
   (tests/test_evolve_bridge.py 16✓, tests/test_evolve_permissions.py
   12✓). State unchanged: github.write still denied, deny-by-default
   holding.
+- Full bounded verification (2026-08-02 cron cycle, HEAD ed22e2d3e):
+  the complete Level 2 test surface re-run through the CI-parity runner
+  (`scripts/run_tests.sh`) — tests/test_evolve_bridge.py 16/16 and
+  tests/agent/test_think_daemon.py 213/213 (incl. the 6 daemon preflight
+  + drift-guard tests) — 229/229 green, no regressions. Live grant check
+  (`evolve_permissions.py check github write`) still exits 1: denied.
+  Local groundwork is COMPLETE and independently verified; the only
+  remaining step is the external user grant, after which the first write
+  triple (PUT this plan via the Contents API) fires and must yield HTTP
+  201 with prediction error < 0.25.
