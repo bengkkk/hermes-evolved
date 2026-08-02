@@ -2440,8 +2440,200 @@ class TestActionDedupGate:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Cycle body: empty/whitespace LLM response → local fallback
+#  Gap 8 slice 2: stale-guidance gate
 # ═══════════════════════════════════════════════════════════════════
+
+
+class TestStaleGuidanceGate:
+    """_stale_guidance_skip_reason + the _apply_insights gate skip stale directives.
+
+    The stale-guidance policy (stale_guidance_policy.py) is conservative:
+    a directive is skipped ONLY on positive evidence (commit SHA in
+    history, artifact verified, file clean). These tests pin the daemon
+    wiring: the gate returns a reason for stale directives, None for
+    everything else, and _apply_insights converts a stale action into a
+    [STALE-SKIP] last_action_output instead of executing it.
+    """
+
+    def _make_result(self, action: Optional[dict]) -> dict:
+        return {
+            "action": action,
+            "fallback": False,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {
+                "weakness": None,
+                "unknown": None,
+                "new_commitment": None,
+            },
+            "next_gap": None,
+        }
+
+    def _make_state(self) -> dict:
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        return {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+    def test_no_references_returns_none(self, evolve_env: Dict) -> None:
+        """A directive with no SHA/path/verify references can never be stale."""
+        td = evolve_env["module"]
+        assert (
+            td._stale_guidance_skip_reason(
+                {"type": "shell", "command": "ls /tmp", "description": "List temp files"}
+            )
+            is None
+        )
+
+    def test_unknown_sha_returns_none(self, evolve_env: Dict) -> None:
+        """A SHA not in git history is unknown → execute (conservative)."""
+        td = evolve_env["module"]
+        import subprocess
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {
+                    "returncode": 0,
+                    "stdout": "d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b d5ae20b\n",
+                    "stderr": "",
+                })()
+            subprocess.run = _mock_run
+            reason = td._stale_guidance_skip_reason(
+                {"type": "shell",
+                 "description": "verify that 9999999999999999999999999999999999999999 landed"}
+            )
+        finally:
+            subprocess.run = original_run
+        assert reason is None
+
+    def test_known_sha_returns_skip(self, evolve_env: Dict) -> None:
+        """A SHA present in git history is positive stale evidence → skip."""
+        td = evolve_env["module"]
+        import subprocess
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {
+                    "returncode": 0,
+                    "stdout": "d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b d5ae20b\n",
+                    "stderr": "",
+                })()
+            subprocess.run = _mock_run
+            reason = td._stale_guidance_skip_reason(
+                {"type": "shell",
+                 "description": "verify that d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b landed"}
+            )
+        finally:
+            subprocess.run = original_run
+        assert reason and "already in history" in reason
+
+    def test_gate_skips_stale_action(self, evolve_env: Dict) -> None:
+        """_apply_insights converts a stale action into a [STALE-SKIP] output."""
+        td = evolve_env["module"]
+        import subprocess
+
+        state = self._make_state()
+        result = self._make_result({
+            "type": "shell",
+            "command": "git log --oneline",
+            "description": "Verify that d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b is committed",
+        })
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {
+                    "returncode": 0,
+                    "stdout": "d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b d5ae20b\n",
+                    "stderr": "",
+                })()
+            subprocess.run = _mock_run
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        last_output = state["daemon_state"].get("last_action_output", "")
+        assert last_output.startswith("[STALE-SKIP]"), last_output
+
+    def test_gate_executes_non_stale_action(self, evolve_env: Dict) -> None:
+        """A non-stale action still executes (mocked subprocess, exit=0)."""
+        td = evolve_env["module"]
+        import subprocess
+
+        state = self._make_state()
+        result = self._make_result({
+            "type": "shell",
+            "command": "python3 -c 'print(1)'",
+            "description": "Run a harmless python one-liner",
+            "expected_outcome": "exit=0: 1",
+        })
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+            subprocess.run = _mock_run
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        last_output = state["daemon_state"].get("last_action_output", "")
+        assert "exit=0" in last_output, last_output
+
+    def test_gate_skips_commit_of_clean_file(self, evolve_env: Dict) -> None:
+        """A commit directive naming a checked-clean file is a no-op → skip."""
+        td = evolve_env["module"]
+        import subprocess
+
+        state = self._make_state()
+        result = self._make_result({
+            "type": "git_commit",
+            "message": "commit docs/gap10-level2-plan.md",
+            "description": "Commit the already-committed plan doc",
+        })
+
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                args = kw.get("args") or (a[0] if a else [])
+                stdout = ""
+                if args and args[:2] == ["git", "-C"] and "log" in args:
+                    stdout = "d5ae20b8ac6e41c9a1a2867a7676c6bb8390f70b d5ae20b\n"
+                # git status --porcelain → empty stdout = clean file
+                return type("_R", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+            subprocess.run = _mock_run
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        last_output = state["daemon_state"].get("last_action_output", "")
+        assert last_output.startswith("[STALE-SKIP]"), last_output
 
 
 class TestCycleBodyEmptyLlmResponse:

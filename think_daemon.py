@@ -111,8 +111,12 @@ _EVOLVE_TRACKED_PATHS: list[str] = [
     "tests/test_daemon_local_analysis.py",
     "tests/test_wm_self_bridge.py",
     "tests/test_goal_reconciliation.py",
+    "tests/test_stale_guidance_policy.py",
     "tests/agent/test_think_daemon.py",
     "tests/agent/test_world_model.py",
+    "stale_guidance_policy.py",
+    "gap10_level2_policy.py",
+    "verify_gap10_write_path.py",
 ]
 
 # ── Paths (delegated to data_layer for the base directory) ──
@@ -2535,6 +2539,90 @@ def _coerce_llm_response_fields(parsed: Dict[str, Any]) -> None:
                 _r["steps"] = []
 
 
+def _stale_guidance_skip_reason(act: Dict[str, Any]) -> Optional[str]:
+    """Gap 8 slice 2: return a SKIP_STALE reason when an action is stale.
+
+    Builds a directive text from the action's description/command/message
+    and runs it through the stale-guidance policy (stale_guidance_policy.py).
+    Positive evidence — a commit SHA already in git history, an artifact
+    already verified (evidence/ marker), or a file checked clean — yields a
+    skip; unknown yields execute (conservative). Bounded: zero git calls
+    when the directive references nothing; at most one ``git log`` plus one
+    ``git status --porcelain`` per referenced path when it does.
+    """
+    from stale_guidance_policy import (
+        RepoFacts,
+        extract_commit_shas,
+        extract_file_paths,
+        is_commit_directive,
+        is_verify_directive,
+        verdict_for,
+    )
+    import subprocess as _sp
+
+    parts = [
+        str(act.get("description") or ""),
+        str(act.get("command") or ""),
+        str(act.get("message") or ""),
+        str(act.get("path") or ""),
+    ]
+    directive = " ".join(p for p in parts if p).strip()
+    if not directive:
+        return None
+    # Fast path: no references at all ⇒ nothing provably stale; skip all
+    # git calls so ordinary actions never pay a subprocess tax.
+    if not (
+        extract_commit_shas(directive)
+        or extract_file_paths(directive)
+        or is_verify_directive(directive)
+        or is_commit_directive(directive)
+    ):
+        return None
+
+    commits: set = set()
+    try:
+        r = _sp.run(
+            ["git", "-C", str(_WORKSPACE_ROOT), "log", "--format=%H %h", "-n", "100"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                commits.update(line.split())
+    except Exception:
+        pass  # no evidence ⇒ EXECUTE (conservative)
+
+    clean_files: set = set()
+    for p in extract_file_paths(directive):
+        try:
+            r = _sp.run(
+                ["git", "-C", str(_WORKSPACE_ROOT), "status", "--porcelain", "--", p],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode == 0 and not r.stdout.strip():
+                clean_files.add(p)
+        except Exception:
+            pass
+
+    verified_markers: set = set()
+    try:
+        ev = _WORKSPACE_ROOT / "evidence"
+        if ev.is_dir():
+            for f in ev.iterdir():
+                if f.is_file():
+                    verified_markers.add(f.name)
+                    verified_markers.add("evidence/" + f.name)
+    except Exception:
+        pass
+
+    facts = RepoFacts(
+        commits=frozenset(commits),
+        verified_markers=frozenset(verified_markers),
+        clean_files=frozenset(clean_files),
+    )
+    verdict, reason = verdict_for(directive, facts)
+    return reason if verdict == "SKIP_STALE" else None
+
+
 def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply parsed insights to evolve state, returning updated state."""
     tl = state.get("timeline", load_timeline())
@@ -2867,7 +2955,32 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     )
         except Exception as _e:
             logger.debug("Action dedup gate bypassed: %s", _e)
-    
+
+    # ── Gap 8 slice 2: stale-guidance gate ──
+    # Before executing a directive-driven action, check whether it
+    # references state that has ALREADY changed (a commit SHA already in
+    # history, an artifact already verified, a file already clean) and
+    # skip it if stale.  The standalone policy contract is conservative —
+    # it skips ONLY on positive evidence; unknown ⇒ execute — so this
+    # gate can never drop a needed action, only redundant re-verify /
+    # re-check / re-commit directives.  When it does skip, the skip is
+    # surfaced in last_action_output so the next prompt sees why the
+    # action did not run (prevents the LLM re-proposing it next cycle).
+    if act and isinstance(act, dict) and act.get("type"):
+        try:
+            _stale_reason = _stale_guidance_skip_reason(act)
+            if _stale_reason:
+                logger.info(
+                    "Stale-guidance gate: skipping %s action — %s",
+                    act.get("type"), _stale_reason,
+                )
+                ds["last_action_output"] = (
+                    f"[STALE-SKIP] {act.get('type')}: {_stale_reason}"
+                )
+                act = None
+        except Exception as _e:
+            logger.debug("Stale-guidance gate bypassed: %s", _e)
+
     # Clean stale "no action" weaknesses when actions ARE being executed
     caps = sm.setdefault("capabilities", {})
     old_weak = caps.get("weaknesses", [])
