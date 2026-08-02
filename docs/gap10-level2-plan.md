@@ -121,3 +121,21 @@ For any proposed write action:
   gap10_level2_policy.py to the enforced allowlists). State unchanged:
   github.write still denied, deny-by-default holding. Only the external
   user grant remains.
+- Cron re-verification (2026-08-02T06:50Z, bridge PID 354226 / daemon PID
+  354237 — new process generation restarted 06:47:26, AFTER the latest
+  commit 62bc64b56, so the live processes run the current allowlists):
+  re-probed the armed write path against the LIVE processes with the
+  daemon's own wire protocol (POST /bridge/v1/exec, Bearer token). PUT to
+  the exact allowlisted plan.md endpoint → HTTP 403 "BLOCKED: permission
+  denied: no write grant for resource 'github'" (allowlist entry matched,
+  method-aware permission gate denied, no outbound call); PUT to sibling
+  contents/other.md → HTTP 403 "BLOCKED: endpoint not in allowlist"
+  (exact-path matching held); GET https://api.github.com/ → exit 0 with a
+  live 2262-byte GitHub payload (read path intact). All three events in
+  the live audit log at 06:50:52Z (deny_permission, deny_allowlist,
+  exec). `evolve_permissions.py check github write` → exit 1: denied
+  (read → exit 0: GRANTED). Bounded test suite: tests/test_evolve_bridge
+  .py + tests/test_evolve_permissions.py 30/30 green (incl. the drift
+  guards pinning gap10_level2_policy.py to the enforced allowlists).
+  State unchanged: github.write still denied, deny-by-default holding.
+  Only the external user grant remains.
