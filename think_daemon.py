@@ -45,6 +45,9 @@ logger = logging.getLogger("think_daemon")
 # ── World Model integration (Gap 6) ──
 from world_model import WorldModel, load_world_model, save_world_model
 
+# ── Gap 10 Level 2 policy contract (deny-by-default pre-flight reference) ──
+from gap10_level2_policy import method_aware_preflight
+
 # ── Auto-detect workspace root from script location ──
 # This adapts to wherever the repo is cloned (bare VM, Docker, etc.)
 _WORKSPACE_ROOT: Path = Path(__file__).resolve().parent
@@ -4743,6 +4746,15 @@ def _validate_api_call(act: Dict[str, Any], permissions: Dict[str, Any]) -> tupl
         granted = bool(isinstance(res_entry, dict) and res_entry.get(action))
     if not granted:
         return False, f"permission denied: no {action} grant for resource {resource!r}"
+    # Reference-policy cross-check (Gap 10 L2): the importable policy
+    # contract must agree before the daemon's own layers pass the action.
+    # The drift-guard test pins the policy's allowlists equal to this
+    # file's, so this check can only tighten (never widen) execution — if
+    # the two ever drift in a live tree, the action is denied at runtime,
+    # not just flagged in CI.
+    _ref_ok, _ref_err = method_aware_preflight(endpoint, method, permissions or {})
+    if not _ref_ok:
+        return False, "policy-denied: " + _ref_err
     return True, ""
 
 
