@@ -331,11 +331,16 @@ def test_policy_reference_matches_enforced_allowlists():
     equal the daemon's enforced lists so the reference can never drift wider
     than what actually executes (the exact-path write invariant included)."""
     import gap10_level2_policy
-    from think_daemon import _API_CALL_ALLOWLIST, _API_WRITE_ALLOWLIST
+    from think_daemon import (
+        _API_CALL_ALLOWLIST,
+        _API_METHOD_ACTION,
+        _API_WRITE_ALLOWLIST,
+    )
 
     assert gap10_level2_policy.READ_ALLOWLIST == _API_CALL_ALLOWLIST
     assert gap10_level2_policy.WRITE_ALLOWLIST == _API_WRITE_ALLOWLIST
     assert gap10_level2_policy.METHOD_ACTION == evolve_bridge._METHOD_ACTION
+    assert gap10_level2_policy.METHOD_ACTION == _API_METHOD_ACTION
 
 
 def test_policy_reference_decisions_match_bridge_gate():
@@ -373,6 +378,37 @@ def test_policy_reference_decisions_match_bridge_gate():
     for endpoint, method, perms, expected_ok in cases:
         ok, reason = gap10_level2_policy.method_aware_preflight(endpoint, method, perms)
         assert ok is expected_ok, (endpoint, method, perms, ok, reason)
+
+
+def test_contents_body_validator_matches_bridge_gate():
+    """think_daemon._validate_contents_body must stay behaviorally identical
+    to evolve_bridge._validate_contents_body — both docstrings claim the
+    invariant ("the bridge is authoritative, so a mismatch there can only
+    tighten, never widen"), but nothing pinned it until this test. The
+    bridge is the final gate, so a looser daemon copy is still safe; a
+    tighter one silently diverges the two pre-flight layers. Asserting a
+    decision matrix (not source text) keeps this a behavior contract."""
+    import think_daemon
+
+    bodies = [
+        None,
+        [],
+        "not-a-dict",
+        {},
+        {"message": "", "content": "eA=="},
+        {"message": "test", "content": ""},
+        {"message": "test", "content": "eA=="},
+        {"message": 42, "content": "eA=="},
+        {"message": "test", "content": "not base64!!!"},
+        {"message": "test", "content": "eA==", "sha": "abc123"},
+        {"message": "test", "content": "eA==", "sha": 123},
+        {"message": "test", "content": "eA==", "sha": None},
+    ]
+    for body in bodies:
+        bridge_ok, bridge_err = evolve_bridge._validate_contents_body(body)
+        daemon_ok, daemon_err = think_daemon._validate_contents_body(body)
+        assert daemon_ok == bridge_ok, (body, daemon_ok, bridge_ok)
+        assert daemon_err == bridge_err, (body, daemon_err, bridge_err)
 
 
 def test_main_refuses_to_start_without_token(monkeypatch, capsys, env):
