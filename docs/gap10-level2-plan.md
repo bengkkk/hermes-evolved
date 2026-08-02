@@ -176,3 +176,17 @@ For any proposed write action:
   enforced allowlists). `evolve_permissions.py check github write` →
   denied (read → GRANTED). State unchanged: github.write still denied,
   deny-by-default holding. Only the external user grant remains.
+- Cron re-verification (2026-08-02T08:07Z, bridge PID 360457 / daemon PID
+  360468 — new process generation; commit 5a643a7cf's generation had been
+  replaced): re-verified via the new state-aware script
+  `verify_gap10_write_path.py` (single command, pass/fail signal) →
+  VERIFY PASS, exit 0: P1 read=200/ok (live 2262-byte GitHub payload),
+  P3 sibling PUT → 403 deny_allowlist (exact-path invariant held),
+  P2 exact allowlisted PUT → 403 deny_permission (method-aware gate held,
+  no outbound call). Audit log entries confirmed (exec, deny_permission,
+  deny_allowlist). `evolve_permissions.py check github write` → denied.
+  **Anti-churn policy (from this cycle):** identical verification outcomes
+  carry no new information — subsequent cycles run the script and commit
+  only on a changed outcome (FAIL, or GRANT ACTIVE → fire the first write
+  triple deliberately with the real payload). No more per-cycle doc
+  paragraphs while the state is unchanged.
