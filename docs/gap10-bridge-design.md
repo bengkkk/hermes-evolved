@@ -1,10 +1,11 @@
 # Gap 10 — Real Action Bridge: Design
 
-**Status:** Level 1 complete (steps 1-5). Calibration milestone met
-2026-08-02 — 3/3 read-only api_call triples, avg prediction error 0.15
-(< 0.3 bar). Level 2 planned — see docs/gap10-level2-plan.md; blocked on
-an explicit user grant (grant CLI: `./evolve_daemon.sh permissions grant
-github write`).
+**Status:** Level 1 complete (calibration 2026-08-02, 3/3 read-only
+api_call triples, avg prediction error 0.15 < 0.3 bar) and Level 2
+COMPLETE (2026-08-02 — github.write granted; both allowlisted PUTs fired
+and verified, see docs/gap10-level2-plan.md). Level 3 (valued actions:
+Polymarket) is SCOPED — see docs/gap10-level3-scope.md; pending user
+review of the proposed allowlist + permissions.
 **Owner:** think_daemon self-directed evolution
 **Target:** Turn the daemon from a sandboxed local actor into an economic actor
 with real-world permissions, keeping every action verifiable through the
