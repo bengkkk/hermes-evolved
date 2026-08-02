@@ -37,10 +37,11 @@ For any proposed write action:
 - File appears in the repository
 
 ## Next Actions
-1. Draft this plan (local write) — DONE this cycle
+1. Draft this plan (local write) — DONE
 2. Persist Level 1 calibration evidence if not already present — DONE (evidence/gap10-level1.md)
-3. Await github.write grant
-4. Implement pre-flight + allowlist and fire the first write triple
+3. Implement method-aware pre-flight + write allowlist — DONE (commits 0de506ab7, facbda171; verified below)
+4. Await github.write grant
+5. Fire the first write triple (PUT this plan via Contents API) and verify HTTP 201 + prediction error < 0.25
 
 ## Progress (2026-08-02)
 - The write path is ARMED and deny-until-granted: `BRIDGE_WRITE_ALLOWLIST`
@@ -52,5 +53,12 @@ For any proposed write action:
   anything reaches the wire, and `_github_put` is ready on the bridge.
   Nothing executes until the user issues `evolve_permissions.py grant
   github write` — the Level 2 gate is the permission registry, unchanged.
+- Verification (2026-08-02): 28/28 evolve bridge/permission tests pass
+  (tests/test_evolve_bridge.py 16✓, tests/test_evolve_permissions.py 12✓).
+  Live check against the running bridge (restarted 01:51 with the new
+  code, PID 332294): PUT to the exact allowlisted plan.md endpoint returns
+  HTTP 403 "BLOCKED: permission denied: no write grant for resource
+  'github'" — the write-allowlist entry matched (layer 2) and the
+  method-aware permission gate denied (layer 3), with no outbound call.
 - Remaining: grant → first write triple (PUT this plan through the
   Contents API) → verify HTTP 201 + prediction error < 0.25.
