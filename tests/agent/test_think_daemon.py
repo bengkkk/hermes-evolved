@@ -4230,6 +4230,90 @@ class TestCycleBodyLlmCallWorldModelRecording:
         # have scored on the failure branch).
         assert t["prediction_error"] == 0.4, t["prediction_error"]
 
+    def test_healthy_tier_with_recent_failures_hedges(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A healthy retry tier must still hedge when recent llm_call
+        history shows failures.
+
+        Regression guard for the 2026-08-02 03:16 observation: the
+        consecutive-fallback counter reset to 0 after one successful
+        cycle, so the next timeout under a "healthy" tier was predicted
+        with flat "success: ..." and scored 0.85 — the single remaining
+        llm_call discrepancy pattern (7 high-error triples).  Recent
+        recorded outcomes are the second signal: with failures in the
+        last _LLM_HEALTH_WINDOW calls, even a healthy tier must emit the
+        disjunctive hedge and score the intermediate 0.4 (honest
+        uncertainty), never a confident 0.15 or 0.85.
+        """
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                parameters={"success": False, "last_error": "timeout"},
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        wm.save()
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        assert len(triples) == 4, f"expected 4 llm_call triples, got {len(triples)}"
+        t = triples[-1]
+        assert "success or timeout" in t["expected_outcome"], t["expected_outcome"]
+        assert "outage tier 'healthy'" in t["expected_outcome"], t["expected_outcome"]
+        assert "3/5 recent calls failed" in t["expected_outcome"], t["expected_outcome"]
+        # The fake call succeeds on attempt 1, but the hedge must still
+        # score the intermediate disjunctive error — the endpoint was
+        # known-flaky from history, so 0.15 would be overconfident.
+        assert t["prediction_error"] == 0.4, t["prediction_error"]
+
+    def test_healthy_tier_clean_history_stays_confident(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No recent failures → a healthy tier keeps the confident
+        prediction (no over-hedging).
+
+        Boundary guard for the recent-history hedge: when the last
+        _LLM_HEALTH_WINDOW llm_call triples all succeeded, a healthy
+        tier must stay confident ("success: ...") and score the
+        confident-correct 0.15 — flipping to "success or timeout" on
+        clean history would degrade calibration with phantom
+        uncertainty.
+        """
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                parameters={"success": True, "last_error": None},
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (1.5s)")
+        wm.save()
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        t = triples[-1]
+        assert "success or timeout" not in t["expected_outcome"], t["expected_outcome"]
+        assert t["expected_outcome"].startswith("success:"), t["expected_outcome"]
+        assert t["prediction_error"] == 0.15, t["prediction_error"]
+
     def test_llm_call_triple_budget_fraction_none_without_budget(
         self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -158,6 +158,14 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
 # cadence sampled that signal far below its Nyquist rate, leaving the
 # daemon blind for up to 60 min during up-windows.
 _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
+# Number of most-recent completed llm_call triples examined when deciding
+# whether to hedge a prediction.  The retry tier alone cannot see an
+# intermittent endpoint (one successful cycle resets the consecutive-
+# fallback counter to 0), so the world model's recorded outcomes are the
+# second signal: any failure inside this window hedges even a "healthy"
+# tier (2026-08-02 — 03:16Z timeout scored a confident 0.85 right after
+# a successful cycle).
+_LLM_HEALTH_WINDOW = 5
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
 # Tier name of the most recent _set_llm_retry_policy application. Populated
@@ -334,6 +342,38 @@ def _set_llm_retry_policy(consecutive_fallback_cycles: int) -> tuple:
         consecutive_fallback_cycles, _cycle_budget_seconds
     )
     return _llm_max_retries, _llm_attempt_timeout
+
+
+def _recent_llm_call_failures(wm) -> int:
+    """Count failures among the most recent completed ``llm_call`` triples.
+
+    The consecutive-fallback counter resets to 0 after a single successful
+    cycle, so the retry tier alone cannot see an intermittent endpoint: a
+    ``healthy`` tier with recent failures in the world model is still
+    overconfident (observed 2026-08-02 03:16: a confident ``success``
+    prediction scored 0.85 against a timeout on the cycle immediately
+    after a successful one).  This looks at the recorded outcomes instead
+    of the counter, so ``_run_cycle_body`` can hedge healthy-tier
+    predictions when recent history says the endpoint is flaky.
+
+    A deliberate extended-outage skip (``skipped: no probe...``) is not a
+    failure — expected == actual by construction — so it never counts.
+    """
+    if wm is None:
+        return 0
+    try:
+        triples = [
+            t for t in wm.data.get("action_triples", [])
+            if t.get("action_type") == "llm_call" and t.get("completed")
+        ]
+        failures = 0
+        for t in triples[-_LLM_HEALTH_WINDOW:]:
+            actual = (t.get("actual_outcome") or "").lower()
+            if actual.startswith("failed") or "timeout" in actual:
+                failures += 1
+        return failures
+    except Exception:
+        return 0
 
 
 # ── Placeholder-plan guard ────────────────────────────────────────
@@ -4726,25 +4766,39 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                 _expected_llm = "skipped: no probe (extended-outage cycle)"
                 _actual_llm = "skipped: no probe (extended-outage cycle)"
             else:
-                if _llm_policy_tier != "healthy":
-                    # Calibrated hedging (2026-08-01, llm_call calibration
-                    # fix): during an outage the endpoint is known
-                    # unreliable, so the applied retry budget is a hedge,
-                    # not a confident success prediction.  The flat
-                    # "success: ..." string made every real timeout score a
-                    # 0.85 surprise (observed: all 5 recorded llm_call
-                    # failures occurred under warm/deep/healthy tiers while
-                    # expected always read "success: ...") and the predictor
-                    # never learned to hedge.  A disjunctive expected
-                    # ("success or timeout: ...") is scored 0.4 by
-                    # _compute_prediction_error whichever branch realizes —
-                    # confident-correct (0.15) < hedge (0.4) < confident-
-                    # wrong (0.85) — so outage cycles report honest
-                    # uncertainty.
+                # Calibrated hedging (2026-08-01, llm_call calibration
+                # fix): during an outage the endpoint is known
+                # unreliable, so the applied retry budget is a hedge,
+                # not a confident success prediction.  The flat
+                # "success: ..." string made every real timeout score a
+                # 0.85 surprise (observed: all 5 recorded llm_call
+                # failures occurred under warm/deep/healthy tiers while
+                # expected always read "success: ...") and the predictor
+                # never learned to hedge.  A disjunctive expected
+                # ("success or timeout: ...") is scored 0.4 by
+                # _compute_prediction_error whichever branch realizes —
+                # confident-correct (0.15) < hedge (0.4) < confident-
+                # wrong (0.85) — so outage cycles report honest
+                # uncertainty.
+                # Healthy-tier hedge (2026-08-02): the tier alone still
+                # misses an intermittent endpoint — one successful cycle
+                # resets consecutive_fallback_cycles to 0, so the next
+                # timeout under a "healthy" tier scored a confident 0.85
+                # (observed 03:16Z).  Recent llm_call outcomes in the
+                # world model are the second signal: any failure in the
+                # last _LLM_HEALTH_WINDOW calls hedges even a healthy
+                # tier (the world model's single remaining discrepancy
+                # pattern: 7 high-error llm_call triples).
+                _recent_failures = _recent_llm_call_failures(wm)
+                if _llm_policy_tier != "healthy" or _recent_failures:
+                    _hedge_note = (
+                        f", {_recent_failures}/{_LLM_HEALTH_WINDOW} "
+                        "recent calls failed" if _recent_failures else ""
+                    )
                     _expected_llm = (
                         f"success or timeout: LLM responds within {_retries} "
                         f"attempt(s) × {_attempt_tmo:.0f}s budget "
-                        f"(outage tier '{_llm_policy_tier}')"
+                        f"(outage tier '{_llm_policy_tier}'{_hedge_note})"
                     )
                 else:
                     _expected_llm = (
