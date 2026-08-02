@@ -2,7 +2,9 @@
 
 **Status:** Level 1 complete (steps 1-5). Calibration milestone met
 2026-08-02 — 3/3 read-only api_call triples, avg prediction error 0.15
-(< 0.3 bar). Next: Level 2 (low-risk writes, requires explicit user grant).
+(< 0.3 bar). Level 2 planned — see docs/gap10-level2-plan.md; blocked on
+an explicit user grant (grant CLI: `./evolve_daemon.sh permissions grant
+github write`).
 **Owner:** think_daemon self-directed evolution
 **Target:** Turn the daemon from a sandboxed local actor into an economic actor
 with real-world permissions, keeping every action verifiable through the
@@ -141,10 +143,12 @@ not an assistant.
    real HTTP 200 GETs of `api.github.com/` through the host bridge, all
    with prediction error 0.15 < the 0.3 milestone bar. Level 1 calibration
    step is COMPLETE. Guidance state closed at the same moment (orientation
-   focus/next_steps updated) so the daemon does not keep re-firing sample
-   #3. Next: Level 2 (low-risk writes — Telegram/Discord send, GitHub
-   issue, Notion page), which requires an explicit user grant for write
-   actions before any write api_call can pass pre-flight.)
+   orientation focus/next_steps updated) so the daemon does not keep re-firing sample
+   #3. Level 2 (low-risk writes — Telegram/Discord send, GitHub issue,
+   Notion page) is PLANNED in docs/gap10-level2-plan.md: the grant CLI
+   (evolve_permissions.py + `evolve_daemon.sh permissions grant <res> <act>`)
+   is the explicit-grant channel, and write endpoints stay deny-until-granted
+   in both allowlists.)
 5. ✅ Commit + update self-model state (DONE 2026-08-01 — live triple
    validated, scoring fixed, unknown_areas resolved: api_call IS wired into
    the action loop and gated by allowlist + permission registry; outcomes

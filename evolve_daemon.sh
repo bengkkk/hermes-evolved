@@ -16,6 +16,9 @@
 #   ./evolve_daemon.sh restart [--interval SECONDS] # stop + start (loads new code)
 #   ./evolve_daemon.sh status                       # report current state + code drift
 #   ./evolve_daemon.sh stop                         # SIGTERM the running daemon
+#   ./evolve_daemon.sh permissions ...              # grant/revoke/check external-action
+#                                                   # permissions (Gap 10 Level 2 on-ramp)
+#                                                   # e.g. `permissions grant github write`
 #
 # Env: HERMES_HOME (default: $HOME/.hermes-evolved) selects the evolve dir.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,8 +277,15 @@ case "${1:-status}" in
             *) echo "usage: $0 bridge {start [--port N] | stop | status | restart}" >&2; exit 2 ;;
         esac
         ;;
+    permissions)
+        # Gap 10 Level 2 on-ramp — explicit user grant channel. Everything
+        # runs through data_layer.SelfModel so the daemon and bridge see
+        # exactly the same registry. Deny-by-default is never bypassed.
+        shift
+        .venv/bin/python3 evolve_permissions.py "$@"
+        ;;
     *)
-        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop | bridge {start [--port N] | stop | status | restart}}" >&2
+        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop | bridge {start [--port N] | stop | status | restart} | permissions {show | grant | revoke | check}}" >&2
         exit 2
         ;;
 esac
