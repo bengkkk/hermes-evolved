@@ -172,8 +172,10 @@ cmd_stop() {
 }
 
 cmd_restart() {
-    echo "=== restarting evolve daemon ==="
+    echo "=== restarting evolve daemon (daemon + bridge) ==="
     cmd_stop || true
+    cmd_bridge_stop || true
+    cmd_bridge_start
     cmd_start
 }
 
@@ -228,11 +230,13 @@ cmd_bridge_stop() {
 }
 
 cmd_bridge_status() {
-    local pid
+    local pid started
     pid="$(_bridge_pid)"
     if [ -n "$pid" ] && _pid_alive "$pid"; then
+        started="$(stat -c '%y' "/proc/$pid" 2>/dev/null | cut -d. -f1)"
         echo "BRIDGE RUNNING: PID $pid (port $BRIDGE_PORT)"
         echo "  log: $BRIDGE_LOG"
+        [ -n "$started" ] && echo "  started: $started (compare against repo HEAD: $(git -C "$SCRIPT_DIR" log -1 --format=%ci 2>/dev/null))"
         return 0
     fi
     echo "bridge STOPPED"
