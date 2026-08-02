@@ -1089,6 +1089,71 @@ def _bridge_liveness() -> str:
         return "DOWN (" + str(e)[:40] + ")"
 
 
+# Bridge self-healing cooldown: a failing restart must not be hammered
+# every cycle. 900s daemon interval > 600s cooldown, so a down bridge is
+# retried once per cycle, never more often.
+_BRIDGE_RESTART_COOLDOWN_S: float = 600.0
+_bridge_restart_last_attempt: float = 0.0  # time.monotonic() of last attempt
+
+
+def _bridge_ensure_running() -> str:
+    """Ensure the host bridge is up; restart it once if DOWN. Never raises.
+
+    Gap 10 self-healing: the bridge can die independently of the daemon
+    (the launcher's restart sequence stops it, the container supervisor
+    reaps it, a transient import failure kills a fresh start). Before
+    this, a down bridge silently degraded api_call actions to
+    connection-refused triples and the LLM burned cycles "locating the
+    launcher" instead of recovering it. Probes /bridge/v1/health; when
+    DOWN and outside the restart cooldown, runs ``evolve_daemon.sh
+    bridge start`` (the launcher's own start path — reuses the persisted
+    token, writes the PID file), then re-probes. Returns the final
+    liveness string. Stdlib only, short timeouts, never raises into the
+    cycle.
+    """
+    global _bridge_restart_last_attempt
+    liveness = _bridge_liveness()
+    if liveness.startswith("UP"):
+        return liveness
+    now = time.monotonic()
+    since = now - _bridge_restart_last_attempt
+    if since < _BRIDGE_RESTART_COOLDOWN_S:
+        return (
+            liveness
+            + f" (restart cooldown {int(_BRIDGE_RESTART_COOLDOWN_S - since)}s left)"
+        )
+    _bridge_restart_last_attempt = now
+    logger.warning(
+        "Host bridge DOWN (%s) — attempting restart via evolve_daemon.sh bridge start",
+        liveness,
+    )
+    try:
+        import subprocess
+
+        r = subprocess.run(
+            [str(_WORKSPACE_ROOT / "evolve_daemon.sh"), "bridge", "start"],
+            cwd=str(_WORKSPACE_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        logger.info(
+            "bridge start: exit=%s %s",
+            r.returncode,
+            (r.stdout.strip()[:200] + " " + r.stderr.strip()[:100]).strip(),
+        )
+    except Exception as e:  # never raise into the cycle
+        logger.warning("bridge restart attempt failed (non-blocking): %s", e)
+        return "DOWN (restart failed: %s)" % str(e)[:40]
+    time.sleep(2)
+    liveness2 = _bridge_liveness()
+    if liveness2.startswith("UP"):
+        logger.info("Host bridge recovered: %s", liveness2)
+    else:
+        logger.warning("Host bridge still DOWN after restart: %s", liveness2)
+    return liveness2
+
+
 def _api_call_capability_text(perm_entries: Any) -> str:
     """Render the api_call capability block for the thinking prompt.
 
@@ -2897,6 +2962,10 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
                     action_output = "BLOCKED: " + _err
                     _add_ep("action", "api_call blocked: " + _err, desc)
                 else:
+                    # Self-heal: if the bridge died between cycle start and
+                    # action execution, restart it so the allowlisted call
+                    # lands instead of recording a connection-refused triple.
+                    _bridge_ensure_running()
                     action_output = _execute_api_call(act)
                     _add_ep(
                         "action",
@@ -4690,6 +4759,15 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         "orientation": orient,
         "world_model": wm,
     }
+
+    # 1.25 Bridge self-healing: recover a DOWN host bridge BEFORE the LLM
+    # plans, so the api_call capability text reflects reality and the read
+    # gate stays calibrated without manual intervention. No-op (one health
+    # probe) when the bridge is already up.
+    try:
+        _bridge_ensure_running()
+    except Exception as e:
+        logger.warning("Bridge ensure failed (non-blocking): %s", e)
 
     # 1.75 Auto-verify predictions before the thinking cycle
     try:
