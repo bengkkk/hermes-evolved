@@ -157,3 +157,22 @@ For any proposed write action:
   drift guards pinning gap10_level2_policy.py to the enforced allowlists).
   State unchanged: github.write still denied, deny-by-default holding.
   Only the external user grant remains.
+- Cron re-verification (2026-08-02T07:44Z, bridge PID 360072 / daemon PID
+  360083 — new process generation restarted 07:38, AFTER the latest
+  commit 5c4c1410f, so the live processes run the current allowlists):
+  re-probed the armed write path against the LIVE processes with the
+  daemon's own wire protocol (POST /bridge/v1/exec, Bearer token). GET
+  https://api.github.com/ → exit 0 with a live 2262-byte GitHub payload
+  (read path intact; audit log exec entries at 07:41:00Z from daemon
+  cycle 419 plus this cycle's 07:44Z call). Write payload readiness
+  verified: docs/gap10-level2-plan.md is 9848 bytes → base64 13132 chars
+  → 13270 byte JSON body {message, content, branch: main}, ~4 orders of
+  magnitude under the GitHub 100MB limit, and the PUT endpoint matches
+  the exact-path allowlist entry byte-for-byte — the first write triple
+  is a single request away from the grant. Bounded test suite:
+  tests/test_evolve_bridge.py 18/18 + tests/test_evolve_permissions.py +
+  tests/test_wm_self_bridge.py + tests/test_world_model.py 237/237 green
+  (255 total, incl. drift guards pinning gap10_level2_policy.py to the
+  enforced allowlists). `evolve_permissions.py check github write` →
+  denied (read → GRANTED). State unchanged: github.write still denied,
+  deny-by-default holding. Only the external user grant remains.
