@@ -5822,6 +5822,81 @@ class TestPlanContinuityMonitor:
         assert log["pending_reinstantiation"] is False
         assert log["consecutive_clean"] == 1
 
+    def test_fallback_empty_slot_is_not_a_violation(
+        self, evolve_env: Dict
+    ) -> None:
+        """Outage-aware V2: during a local-analysis fallback cycle the daemon
+        cannot emit new_plan (hardcoded None), so an empty slot left by a
+        plan completion is expected — it must NOT reset the clean streak.
+
+        Without this, a plan completed by _local_plan_maintenance mid-outage
+        would flag a violation on the next fallback cycle (2026-08-03:
+        consecutive_fallback_cycles reached 5), punishing the daemon for
+        LLM-provider downtime and blocking the 20-cycle window.
+        """
+        td = evolve_env["module"]
+        # Cycle N: active plan completed; parsed carries fallback=True (the
+        # local-analysis response shape).
+        tl_n = self._timeline([
+            self._plan("p1", "complete", [
+                {"id": "step_1", "status": "complete"},
+                {"id": "step_2", "status": "complete"},
+            ]),
+        ])
+        parsed_fallback = {
+            "fallback": True,
+            "plan_action": {"step_id": "step_2", "new_status": "complete", "note": ""},
+            "new_plan": None,
+        }
+        log = td._record_plan_continuity_observation(110, parsed_fallback, "p1", tl_n)
+        obs_n = log["observations"][-1]
+        assert obs_n["ok"] is True, obs_n["violations"]
+        assert obs_n["llm_available"] is False
+        assert log["pending_reinstantiation"] is True
+        assert log["consecutive_clean"] == 1
+
+        # Cycle N+1: still in fallback, slot still empty → still NO violation.
+        log = td._record_plan_continuity_observation(
+            111, {"fallback": True, "plan_action": None, "new_plan": None}, None,
+            self._timeline([]),
+        )
+        obs_n1 = log["observations"][-1]
+        assert obs_n1["ok"] is True, obs_n1["violations"]
+        assert obs_n1["llm_available"] is False
+        assert log["consecutive_clean"] == 2
+
+    def test_llm_available_empty_slot_is_still_a_violation(
+        self, evolve_env: Dict
+    ) -> None:
+        """The outage exemption must NOT weaken the invariant when the LLM
+        is available: an LLM-backed cycle that leaves the slot empty after a
+        completion is still a V2 violation (the LLM had capacity to create a
+        replacement and did not)."""
+        td = evolve_env["module"]
+        # Cycle N: LLM-backed completion with no replacement → pending.
+        tl_n = self._timeline([
+            self._plan("p1", "complete", [
+                {"id": "step_1", "status": "complete"},
+            ]),
+        ])
+        parsed_llm = {
+            "plan_action": {"step_id": "step_1", "new_status": "complete", "note": ""},
+            "new_plan": None,
+        }
+        log = td._record_plan_continuity_observation(120, parsed_llm, "p1", tl_n)
+        assert log["observations"][-1]["ok"] is True  # deferred
+        assert log["pending_reinstantiation"] is True
+
+        # Cycle N+1: LLM available, slot still empty → violation.
+        log = td._record_plan_continuity_observation(
+            121, {"plan_action": None, "new_plan": None}, None, self._timeline([])
+        )
+        obs = log["observations"][-1]
+        assert obs["ok"] is False
+        assert obs["llm_available"] is True
+        assert any("2+ consecutive cycles" in v for v in obs["violations"])
+        assert log["consecutive_clean"] == 0
+
     def test_window_completes_after_20_clean_observations(
         self, evolve_env: Dict
     ) -> None:

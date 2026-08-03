@@ -730,9 +730,70 @@ def _plan_state(plan_steps):
 class TestLocalPlanMaintenance:
     """Verify _local_plan_maintenance emits plan_action only on real evidence."""
 
-    def test_completes_step_with_delivered_artifact(self):
-        """A pending step whose note says 'delivered' AND names an on-disk
-        artifact is auto-completed — the observed 2026-08-03 step_4 case."""
+    def test_completes_nonfinal_step_with_delivered_artifact(self):
+        """A NON-final pending step whose note says 'delivered' AND names an
+        on-disk artifact is auto-completed — the observed 2026-08-03 step_4
+        case, now with at least one further step remaining so completion
+        cannot auto-complete the plan into an empty slot mid-outage."""
+        state = _plan_state([
+            {
+                "id": "step_1",
+                "description": "Propose Level 3 allowlist entries for user review",
+                "verification": "docs/gap10-level3-scope.md exists with bounded candidates",
+                "status": "complete",
+                "note": "Proposal delivered via docs/gap10-level3-scope.md (committed b2103c9b1)",
+            },
+            {
+                "id": "step_2",
+                "description": "Wait for user review of the proposal",
+                "verification": "user acknowledges the proposal in the repo",
+                "status": "pending",
+                "note": "awaiting review",
+            },
+        ])
+        # step_1 is the only non-complete step with evidence but it is the
+        # FINAL pending step → guard defers it; no plan_action.
+        result = _local_analysis(state)
+        assert result["plan_action"] is None
+
+    def test_completes_middle_step_but_never_final_step(self):
+        """A delivery-evidenced step that is NOT the last pending step is
+        completed; the final pending step is always deferred to the LLM."""
+        state = _plan_state([
+            {
+                "id": "step_1",
+                "description": "Draft Level 3 scope",
+                "verification": "docs/gap10-level3-scope.md exists",
+                "status": "complete",
+                "note": "in progress",
+            },
+            {
+                "id": "step_2",
+                "description": "Propose Level 3 allowlist entries for user review",
+                "verification": "docs/gap10-level3-scope.md exists with bounded candidates",
+                "status": "pending",
+                "note": "Proposal delivered via docs/gap10-level3-scope.md (committed b2103c9b1)",
+            },
+            {
+                "id": "step_3",
+                "description": "Await user review of Level 3 scope",
+                "verification": "user acknowledges the proposal",
+                "status": "pending",
+                "note": "awaiting review",
+            },
+        ])
+        result = _local_analysis(state)
+        pa = result["plan_action"]
+        assert pa is not None
+        assert pa["step_id"] == "step_2"
+        assert pa["new_status"] == "complete"
+
+    def test_defers_final_step_completion_to_llm(self):
+        """Empty-slot guard: the fallback must NOT complete the FINAL pending
+        step.  Doing so auto-completes the plan and empties the active-plan
+        slot, and the fallback cannot create a replacement (new_plan=None).
+        The LLM completes the final step on recovery and reinstantiates in
+        the same response."""
         state = _plan_state([{
             "id": "step_1",
             "description": "Propose Level 3 allowlist entries for user review",
@@ -741,10 +802,7 @@ class TestLocalPlanMaintenance:
             "note": "Proposal delivered via docs/gap10-level3-scope.md (committed b2103c9b1)",
         }])
         result = _local_analysis(state)
-        pa = result["plan_action"]
-        assert pa is not None
-        assert pa["step_id"] == "step_1"
-        assert pa["new_status"] == "complete"
+        assert result["plan_action"] is None
 
     def test_no_plan_action_without_delivery_marker(self):
         """A pending step with no 'delivered/committed' marker is untouched."""

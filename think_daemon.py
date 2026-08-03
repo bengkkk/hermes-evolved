@@ -3438,6 +3438,15 @@ def _record_plan_continuity_observation(
            failed to fire — the finished-plan-still-active trap).
       V2 — after a plan completion, the active-plan slot must not stay
            empty for two consecutive cycles (replacement never created).
+           Outage-aware: during a local-analysis fallback cycle the
+           daemon provably cannot emit ``new_plan`` (the fallback
+           hardcodes ``new_plan=None``), so an empty slot is expected
+           and is NOT counted as a violation — the check fires only when
+           the LLM was available this cycle and still left the slot
+           empty.  Without this, a multi-hour LLM outage that completes
+           a plan via ``_local_plan_maintenance`` would reset the clean
+           streak (observed 2026-08-03: consecutive_fallback_cycles=5),
+           blocking the very window the monitor exists to complete.
 
     Best-effort: persistence failures are logged, never raised.
     """
@@ -3482,12 +3491,21 @@ def _record_plan_continuity_observation(
     )
     was_pending = bool(log.get("pending_reinstantiation"))
 
+    # Outage-aware V2: the local-analysis fallback cannot emit new_plan
+    # (hardcoded None in _local_analysis), so an empty slot during a
+    # fallback cycle is expected — flagging it would punish the daemon
+    # for LLM-provider downtime and reset the clean streak mid-outage.
+    # The invariant's intent is a discipline check: did the system have
+    # LLM capacity to reinstantiate and still leave the slot empty?
+    llm_available = not bool(parsed.get("fallback")) if isinstance(parsed, dict) else True
+
     # The active plan present at cycle start disappeared by cycle end
     # (completed/auto-completed) with no replacement visible on disk.
     completed_this_cycle = bool(active_plan_before and not active_after)
 
-    # V2 — empty slot persisting across two consecutive cycles.
-    if was_pending and slot_empty:
+    # V2 — empty slot persisting across two consecutive cycles, but only
+    # when the LLM was available to create a replacement this cycle.
+    if was_pending and slot_empty and llm_available:
         violations.append(
             "active-plan slot empty for 2+ consecutive cycles after a plan "
             "completion; no replacement plan was created"
@@ -3522,6 +3540,7 @@ def _record_plan_continuity_observation(
         "new_plan_issued": new_plan_issued,
         "completed_this_cycle": completed_this_cycle,
         "slot_empty": slot_empty,
+        "llm_available": llm_available,
         "pending_reinstantiation": pending_now,
         "violations": list(violations),
     })
@@ -4010,12 +4029,30 @@ def _local_plan_maintenance(tl: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     delivery ("delivered"/"committed"/"published") AND a referenced
     artifact path exists on disk. No heuristic guessing — both signals
     must be present, so a step is never completed on weak evidence.
+
+    Empty-slot guard (P3 plan-continuity, 2026-08-03): the fallback NEVER
+    completes the final pending step of the active plan.  Completing it
+    auto-completes the plan (update_plan_step), leaving the active-plan
+    slot empty; the fallback cannot emit ``new_plan`` (hardcoded None),
+    so the slot would stay empty for the rest of the outage and the
+    monitor would flag a violation the daemon had no agency to prevent.
+    The LLM completes the final step on recovery and can reinstantiate in
+    the same response (the same-response new_plan fix).
     """
     plans = (tl.get("future") or {}).get("plans", [])
     active = next((p for p in plans if p.get("status") == "active"), None)
     if not active:
         return None
-    for s in active.get("steps", []):
+    steps = active.get("steps", [])
+    # Empty-slot guard: never complete the FINAL pending step.  Find which
+    # steps are already complete; if completing the candidate would leave
+    # zero pending/in_progress steps, the plan would auto-complete and the
+    # fallback cannot create a replacement (new_plan=None) — skip it so
+    # the slot never goes empty mid-outage.
+    non_complete = [s for s in steps if s.get("status") not in ("complete",)]
+    if len(non_complete) <= 1:
+        return None
+    for s in steps:
         if s.get("status") not in ("pending", "in_progress"):
             continue
         text = "{} {}".format(s.get("note") or "", s.get("verification") or "")
