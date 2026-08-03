@@ -1627,6 +1627,96 @@ class TestPruneSelfModel:
         assert removed == 0, f"Pattern 10 fired too early: removed {removed}"
         assert len(sm["capabilities"]["weaknesses"]) == 1
 
+    def test_llm_weakness_survives_prune_when_current_cycle_llm_failed(
+        self, evolve_env: Dict
+    ) -> None:
+        """Regression (2026-08-03, cycle 501): the post-cycle prune must not
+        remove the 'LLM API unreliable' weakness in the very cycle where the
+        LLM call just failed.
+
+        The prune's fallback heuristic reads ``last_output.fallback`` which
+        reflects the PREVIOUS cycle. Cycle 500 was llm-backed
+        (fallback=False), so the heuristic concluded "LLM is working" and
+        removed the weakness — even though cycle 501's LLM call timed out
+        twice and fell back to local analysis. The fix: callers that know
+        the CURRENT cycle's outcome pass ``llm_working`` explicitly, and the
+        heuristic is bypassed.
+        """
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "LLM API unreliable: timeouts during thinking cycles",
+                ],
+            },
+        }
+        # Previous cycle was llm-backed → the stale heuristic alone would prune.
+        daemon_state = {"tick_count": 501, "last_output": {"fallback": False}}
+        # Current cycle LLM FAILED → llm_working=False → weakness must survive.
+        removed = td._prune_self_model(
+            sm, daemon_state=daemon_state, llm_working=False
+        )
+        assert removed == 0, (
+            f"LLM weakness pruned despite current-cycle LLM failure: {removed}"
+        )
+        assert len(sm["capabilities"]["weaknesses"]) == 1, (
+            f"Weakness wrongly removed: {sm['capabilities']['weaknesses']!r}"
+        )
+
+    def test_llm_weakness_pruned_when_current_cycle_llm_working(
+        self, evolve_env: Dict
+    ) -> None:
+        """Sanity companion: when the CURRENT cycle is llm-backed
+        (llm_working=True), the stale LLM-reliability weakness is pruned as
+        before — the override must not disable legitimate pruning."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "LLM API unreliable: timeouts during thinking cycles",
+                ],
+            },
+        }
+        daemon_state = {"tick_count": 501, "last_output": {"fallback": False}}
+        removed = td._prune_self_model(
+            sm, daemon_state=daemon_state, llm_working=True
+        )
+        assert removed == 1, f"Expected LLM weakness pruned, removed={removed}"
+        assert sm["capabilities"]["weaknesses"] == []
+
+    def test_llm_weakness_heuristic_unchanged_without_override(
+        self, evolve_env: Dict
+    ) -> None:
+        """Backward compatibility: callers that don't pass ``llm_working``
+        keep the previous-cycle heuristic (pre-cycle prune path and all
+        existing test call sites)."""
+        td = evolve_env["module"]
+        sm = {
+            "capabilities": {
+                "weaknesses": [
+                    "LLM API unreliable: timeouts during thinking cycles",
+                ],
+            },
+        }
+        # Previous cycle llm-backed (fallback=False) → heuristic prunes.
+        removed = td._prune_self_model(
+            sm, daemon_state={"tick_count": 501, "last_output": {"fallback": False}}
+        )
+        assert removed == 1
+        # Previous cycle fallback → heuristic keeps the weakness.
+        sm2 = {
+            "capabilities": {
+                "weaknesses": [
+                    "LLM API unreliable: timeouts during thinking cycles",
+                ],
+            },
+        }
+        removed2 = td._prune_self_model(
+            sm2, daemon_state={"tick_count": 501, "last_output": {"fallback": True}}
+        )
+        assert removed2 == 0
+        assert len(sm2["capabilities"]["weaknesses"]) == 1
+
 
     def test_caps_commitments_to_eight(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
@@ -2529,6 +2619,132 @@ class TestActionDedupGate:
         assert sm_out["capabilities"]["weaknesses"] == []
         assert sm_out["capabilities"]["unknown_areas"] == []
         assert sm_out["commitments"].get("promised_features", []) == []
+
+    def test_apply_insights_llm_weakness_survives_current_cycle_failure(
+        self, evolve_env: Dict
+    ) -> None:
+        """Integration regression (2026-08-03, cycle 501): the main loop
+        passes the CURRENT cycle's LLM outcome into _apply_insights, which
+        forwards it to the post-cycle prune. A cycle whose LLM call failed
+        must NOT have its 'LLM API unreliable' weakness removed — even when
+        the daemon_state still carries the previous cycle's llm-backed
+        (fallback=False) flag.
+
+        This guards the wiring at the call site: if a refactor drops the
+        ``llm_working`` argument (or the _apply_insights forwarding), this
+        test fails by re-introducing the regression.
+        """
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        ds = {
+            "tick_count": 501,
+            # Previous cycle (500) was llm-backed — the stale heuristic alone
+            # would conclude "LLM is working".
+            "last_output": {"fallback": False, "insight": "c500",
+                            "focus_next": "x", "confidence": 0.5,
+                            "reasoning": "r"},
+            "last_action_output": "",
+        }
+        result = {
+            "action": None,
+            "llm_fallback": True,  # CURRENT cycle LLM FAILED (2 timeouts)
+            "insight": "LLM unavailable, local fallback",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "local fallback",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {"weakness": None, "unknown": None,
+                                  "new_commitment": None},
+            "next_gap": None,
+        }
+        state = {
+            "daemon_state": ds,
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []},
+                         "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {
+                    "strengths": [],
+                    "weaknesses": [
+                        "LLM API unreliable: timeouts during thinking cycles",
+                    ],
+                    "unknown_areas": [],
+                },
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n",
+                                       "stderr": ""})()
+
+            subprocess.run = _mock_run
+            # Mirror the main loop's call exactly (step 5).
+            updates = td._apply_insights(
+                result, state,
+                llm_working=not bool(result.get("llm_fallback", False)),
+            )
+        finally:
+            subprocess.run = original_run
+
+        weaks = updates["self_model"]["capabilities"]["weaknesses"]
+        assert any("LLM API unreliable" in w for w in weaks), (
+            f"LLM weakness pruned despite current-cycle LLM failure: {weaks!r}"
+        )
+
+        # Companion: when the current cycle IS llm-backed, pruning still works.
+        state2 = {
+            "daemon_state": dict(ds),
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []},
+                         "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {
+                    "strengths": [],
+                    "weaknesses": [
+                        "LLM API unreliable: timeouts during thinking cycles",
+                    ],
+                    "unknown_areas": [],
+                },
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+        result2 = dict(result)
+        result2["llm_fallback"] = False
+        subprocess.run = lambda *a, **kw: type("_R", (), {
+            "returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+        try:
+            updates2 = td._apply_insights(
+                result2, state2,
+                llm_working=not bool(result2.get("llm_fallback", False)),
+            )
+        finally:
+            subprocess.run = original_run
+        weaks2 = updates2["self_model"]["capabilities"]["weaknesses"]
+        assert not any("LLM API unreliable" in w for w in weaks2), (
+            f"LLM weakness NOT pruned when current cycle LLM worked: {weaks2!r}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════

@@ -1910,6 +1910,7 @@ def _subject_is_resolved(text: str) -> bool:
 def _prune_self_model(
     sm: Dict[str, Any],
     daemon_state: Optional[Dict[str, Any]] = None,
+    llm_working: Optional[bool] = None,
 ) -> int:  # Returns count of removed entries
     """Remove stale/duplicate entries from self-model to keep prompts clean.
 
@@ -1931,6 +1932,14 @@ def _prune_self_model(
     Args:
         sm: Self-model dict to prune (mutated in place).
         daemon_state: Optional daemon state dict for health-aware cleanup.
+        llm_working: Override for the LLM-reliability heuristic (Pattern 1).
+            When None, the heuristic reads ``daemon_state.last_output.fallback``
+            (the *previous* cycle's outcome). Callers that already know the
+            CURRENT cycle's LLM outcome (e.g. the post-cycle prune inside
+            ``_apply_insights``) MUST pass this override: otherwise a cycle
+            whose LLM call just failed would have its "LLM API unreliable"
+            weakness pruned as "stale" because the *previous* cycle happened
+            to be llm-backed. See cycle 501 regression (2026-08-03).
 
     Returns:
         Number of entries removed across all categories.
@@ -1980,8 +1989,15 @@ def _prune_self_model(
         # Pattern 1: LLM API reliability issues (timeout was fixed)
         # Check via last_output.fallback flag — when last cycle was
         # LLM-backed (fallback=False), the API is proven reachable.
-        last_fallback = daemon_state.get("last_output", {}).get("fallback", True)
-        llm_working = not last_fallback
+        # NOTE: `last_output` reflects the PREVIOUS cycle. When the caller
+        # knows the CURRENT cycle's LLM outcome (post-cycle prune inside
+        # _apply_insights), it must pass `llm_working` explicitly — using
+        # the stale previous-cycle flag here would prune the
+        # "LLM API unreliable" weakness in the very cycle where the LLM
+        # call just failed (cycle 501 regression, 2026-08-03).
+        if llm_working is None:
+            last_fallback = daemon_state.get("last_output", {}).get("fallback", True)
+            llm_working = not last_fallback
         if llm_working:
             stale_patterns.append((
                 "llm api|api unreliable|llm.*fallback|local fallback used"
@@ -2701,8 +2717,24 @@ def _stale_guidance_skip_reason(act: Dict[str, Any]) -> Optional[str]:
     return reason if verdict == "SKIP_STALE" else None
 
 
-def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply parsed insights to evolve state, returning updated state."""
+def _apply_insights(
+    result: Dict[str, Any],
+    state: Dict[str, Any],
+    llm_working: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Apply parsed insights to evolve state, returning updated state.
+
+    Args:
+        result: Parsed LLM/local-analysis output dict.
+        state: Evolve state dict (timeline, self_model, orientation, ...).
+        llm_working: Current cycle's actual LLM outcome, forwarded to the
+            post-cycle self-model prune. When None (callers that don't know
+            the outcome), the prune falls back to the previous-cycle
+            heuristic. The daemon's main loop passes
+            ``not result.llm_fallback`` so a cycle whose LLM call just
+            failed does NOT have its "LLM API unreliable" weakness pruned
+            as stale (cycle 501 regression, 2026-08-03).
+    """
     tl = state.get("timeline", load_timeline())
     sm = state.get("self_model", load_self_model())
     orient = state.get("orientation", load_orientation())
@@ -3274,7 +3306,11 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # ── Self-model pruning: remove stale/duplicate entries ──
     _prune_count = 0
     try:
-        _prune_count = _prune_self_model(sm, daemon_state=state.get("daemon_state"))
+        _prune_count = _prune_self_model(
+            sm,
+            daemon_state=state.get("daemon_state"),
+            llm_working=llm_working,
+        )
     except Exception as e:
         logger.warning("Self-model pruning failed (non-blocking): %s", e)
     if _prune_count > 0:
@@ -5457,7 +5493,16 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     _coerce_llm_response_fields(parsed)
 
     # 5. Apply insights to state
-    updates = _apply_insights(parsed, state)
+    # Pass the CURRENT cycle's LLM outcome into the post-cycle self-model
+    # prune so a cycle whose LLM call just failed does NOT have its
+    # "LLM API unreliable" weakness removed as stale (the prune's
+    # last_output.fallback heuristic reflects the PREVIOUS cycle). Cycle 501
+    # regression (2026-08-03): LLM timed out twice, yet the post-cycle
+    # prune removed the weakness claiming "LLM API is now reachable".
+    updates = _apply_insights(
+        parsed, state,
+        llm_working=not bool(result.get("llm_fallback", False)),
+    )
 
     # 5.25 Bridge: sync world model discrepancy patterns into self-model weaknesses
     # This runs AFTER _apply_insights so the LLM's own weakness updates are applied
