@@ -154,7 +154,9 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
     # "no llm_call discrepancy pattern for 5 consecutive cycles"
     # verification a programmatic counter instead of a manual JSON read
     # every cycle (added 2026-08-03 while closing the hedge-aware decay
-    # loop; the pattern has been clean for 2 cycles as of tick 534).
+    # loop; the 5-cycle gate was reached (26 consecutive clean cycles as
+    # of tick 561) and the gated llm_call goal (goal_20260802090333_0) is
+    # completed, so the counter is now an informational health metric).
     "clean_pattern_cycles": 0,
 }
 
