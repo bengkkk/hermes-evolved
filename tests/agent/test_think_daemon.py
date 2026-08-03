@@ -4576,6 +4576,51 @@ class TestFallbackSearchQuery:
         assert result["search_query"] is None
 
 
+class TestRecordWebSearchTriple:
+    """Gap 5: an executed web search must land in the world model as a
+    completed ``web_search`` triple so info seeking is observable and its
+    reliability learnable (low error when results are returned, higher
+    error on a zero-hit search).
+    """
+
+    def _wm(self, evolve_env: Dict):
+        td = evolve_env["module"]
+        return td.WorldModel()
+
+    def test_records_results_bearing_search_low_error(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        wm = self._wm(evolve_env)
+        results = [{"title": "GitHub Docs", "href": "https://docs.github.com"}]
+        tid = td._record_web_search_triple(wm, "github api", results)
+        assert tid is not None
+        triple = [t for t in wm.data["action_triples"] if t["id"] == tid][0]
+        assert triple["action_type"] == "web_search"
+        assert triple["completed"] is True
+        assert triple["prediction_error"] <= 0.25, triple["prediction_error"]
+        assert "exit=0: 1 result(s)" in triple["actual_outcome"]
+
+    def test_records_zero_hit_search_higher_error(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        wm = self._wm(evolve_env)
+        tid = td._record_web_search_triple(wm, "no such query xyz", [])
+        assert tid is not None
+        triple = [t for t in wm.data["action_triples"] if t["id"] == tid][0]
+        assert triple["completed"] is True
+        assert triple["prediction_error"] > 0.4, triple["prediction_error"]
+        assert "exit=1: 0 results" in triple["actual_outcome"]
+
+    def test_recording_failure_is_non_blocking(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        wm = self._wm(evolve_env)
+        # A record_action that raises must not propagate — helper returns None
+        def _boom(*a, **k):
+            raise RuntimeError("simulated failure")
+        wm.record_action = _boom  # type: ignore[method-assign]
+        assert td._record_web_search_triple(wm, "query", [{"title": "t"}]) is None
+        assert len(wm.data["action_triples"]) == 0
+
+
+
 
 class TestRotatingAutoCommands:
     """Every rotating auto-default command (module-level ``_ROTATING_AUTOS``)

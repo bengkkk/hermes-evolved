@@ -3912,6 +3912,44 @@ def _fallback_search_query(sm: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _record_web_search_triple(
+    wm: "WorldModel",
+    query: str,
+    search_results: List[Any],
+) -> Optional[str]:
+    """Record a web-search execution as a completed world-model triple.
+
+    Mirrors the llm_call recording pattern so info seeking (Gap 5) is
+    observable and its reliability learnable: a results-bearing search is
+    scored low error, a zero-hit search higher error.  Uses the shell
+    exit-code convention so the shared ``_compute_prediction_error`` maps
+    the outcome cleanly instead of a nondeterministic bigram score.
+
+    Returns the triple ID, or None if recording failed (non-blocking).
+    """
+    try:
+        _tid = wm.record_action(
+            "web_search",
+            f"Web search: {query[:100]}",
+            "exit=0: web search returns at least 1 result",
+            expected_source="daemon",
+            parameters={"query": query[:200], "max_results": 4},
+        )
+        if search_results:
+            _actual = (
+                f"exit=0: {len(search_results)} result(s); "
+                f"first: {str(search_results[0].get('title', ''))[:120]}"
+            )
+        else:
+            _actual = "exit=1: 0 results - search returned no hits"
+        wm.complete_action(_tid, _actual)
+        logger.info("World model: recorded web_search outcome: %s", _actual)
+        return _tid
+    except Exception as e:
+        logger.warning("Web-search world-model record failed (non-blocking): %s", e)
+        return None
+
+
 def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a useful thinking-cycle result from local data only, no LLM call.
 
@@ -5547,6 +5585,10 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                     raise ImportError("No search module available (try: pip install duckduckgo_search)")
             with DDGS() as ddgs:
                 search_results = list(ddgs.text(sq, max_results=4))
+            # Gap 5: record the search execution as a world-model triple so
+            # info seeking is observable and its reliability learnable
+            # (mirrors the llm_call recording pattern above).
+            _record_web_search_triple(wm, sq, search_results)
             if search_results:
                 search_text = "\n".join(
                     f"- {r['title']}: {r['body'][:200]} ({r['href']})"
