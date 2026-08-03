@@ -5354,3 +5354,43 @@ class TestCleanPatternCyclesCounter:
         reloaded = td.load_daemon_state()
         assert reloaded["clean_pattern_cycles"] == 1, reloaded
 
+    def test_non_llm_pattern_does_not_reset(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A shell/api_call discrepancy pattern must not reset the llm_call
+        verification streak.
+
+        The counter exists to gate the llm_call error-reduction plan ("no
+        llm_call discrepancy pattern for 5 consecutive cycles"); an
+        unrelated pattern (e.g. a flaky shell command) would otherwise
+        keep resetting the streak and block the plan's closing gate
+        forever.  Scope the reset to action_type == "llm_call".
+        """
+        td = evolve_env["module"]
+
+        # Seed a real NON-llm_call discrepancy: 3 identical unhedged shell
+        # failures (recurrence >= 3 surfaces a shell pattern).
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "shell",
+                "State check: verify shell health",
+                expected_outcome="exit=0: command succeeds",
+                expected_source="daemon",
+                prediction_confidence=0.5,
+            )
+            wm.complete_action(tid, "exit=1: command failed")
+        wm.save()
+        patterns = wm.get_discrepancy_patterns()
+        assert any(p.get("action_type") == "shell" for p in patterns), patterns
+        assert not any(p.get("action_type") == "llm_call" for p in patterns)
+
+        # Pre-seed the counter at 4; the shell pattern must NOT reset it.
+        ds0 = td.load_daemon_state()
+        ds0["clean_pattern_cycles"] = 4
+        td.save_daemon_state(ds0)
+
+        _, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        assert ds["clean_pattern_cycles"] == 5, ds
+

@@ -140,10 +140,12 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
     "last_output": None,
     "cycle_history": [],  # list of {timestamp, status, error, duration, tick_count} — last 20
     "consecutive_fallback_cycles": 0,  # How many consecutive cycles used local fallback (LLM unavailable)
-    # How many consecutive completed cycles ended with ZERO discrepancy
-    # patterns.  Incremented once per cycle in _run_cycle_body step 7 from
-    # the world model's live discrepancy_patterns; reset to 0 the first
-    # cycle a pattern appears.  Gives the llm_call error-reduction plan's
+    # How many consecutive completed cycles ended with NO llm_call
+    # discrepancy pattern.  Incremented once per cycle in _run_cycle_body
+    # step 7 from the world model's live discrepancy_patterns (scoped to
+    # action_type == "llm_call" so unrelated patterns don't reset the
+    # llm_call verification streak); reset to 0 the first cycle an
+    # llm_call pattern appears.  Gives the llm_call error-reduction plan's
     # "no llm_call discrepancy pattern for 5 consecutive cycles"
     # verification a programmatic counter instead of a manual JSON read
     # every cycle (added 2026-08-03 while closing the hedge-aware decay
@@ -5622,14 +5624,20 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # The llm_call error-reduction plan requires "no llm_call discrepancy
     # pattern for 5 consecutive cycles" before closing the P3 goal; the
     # world model's discrepancy_patterns list is the single source of
-    # truth.  Increment once per completed cycle when the list is empty,
-    # reset on the first cycle a pattern appears.  Read fresh from the
-    # in-memory world model so both llm-backed and local-analysis cycles
-    # update it identically.
+    # truth.  Increment once per completed cycle when NO llm_call pattern
+    # is present, reset on the first cycle an llm_call pattern appears.
+    # The check is scoped to action_type == "llm_call": the counter exists
+    # to gate the llm_call plan, so an unrelated pattern (e.g. a flaky
+    # shell command) must not reset the llm_call verification streak.
+    # Read fresh from the in-memory world model so both llm-backed and
+    # local-analysis cycles update it identically.
     _patterns_now = wm.get_discrepancy_patterns()
+    _llm_pattern_now = any(
+        p.get("action_type") == "llm_call" for p in _patterns_now
+    )
     ds["clean_pattern_cycles"] = (
         ds.get("clean_pattern_cycles", 0) + 1
-        if not _patterns_now
+        if not _llm_pattern_now
         else 0
     )
     ds["last_output"] = {
