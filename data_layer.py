@@ -1388,6 +1388,16 @@ class Goals:
                 g["status"] = new_status
                 if new_status in ("completed", "abandoned"):
                     g["completed_at"] = now_iso()
+                else:
+                    # Reopen (completed/abandoned -> active/in_progress/
+                    # proposed) clears the terminal timestamp so the
+                    # invariant holds: completed_at is set <=> status is
+                    # terminal.  Observed stale state 2026-08-03:
+                    # goal_20260803174119_0 was reopened for 20-cycle
+                    # verification but kept its 18:44 completion time,
+                    # which misleads any consumer that reads completed_at
+                    # to infer goal completion.
+                    g["completed_at"] = None
                 if note:
                     g["notes"] = note
                 return True

@@ -1043,6 +1043,20 @@ class TestGoals:
         assert g.update_status(gid, "completed") is True
         assert g.data["goals"][0]["completed_at"] is not None
 
+    def test_update_status_reopen_clears_completed_at(self) -> None:
+        g = Goals()
+        gid = g.propose("Test", "Desc", "", "", "", 3)
+        g.update_status(gid, "completed")
+        assert g.data["goals"][0]["completed_at"] is not None
+        # Reopen — the stale terminal timestamp must be cleared so an
+        # in_progress goal never presents a completion time.
+        assert g.update_status(gid, "in_progress") is True
+        assert g.data["goals"][0]["status"] == "in_progress"
+        assert g.data["goals"][0]["completed_at"] is None
+        # Re-completing stamps a fresh timestamp.
+        assert g.update_status(gid, "completed") is True
+        assert g.data["goals"][0]["completed_at"] is not None
+
     def test_update_status_invalid(self) -> None:
         g = Goals()
         gid = g.propose("Test", "Desc", "", "", "", 3)
