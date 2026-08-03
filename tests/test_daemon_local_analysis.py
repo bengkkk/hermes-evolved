@@ -963,3 +963,73 @@ class TestReadGatePriority:
 
 
 
+
+
+class TestStaleFocusRefresh:
+    """_local_analysis must detect and correct a stale current_gap_focus."""
+
+    def _state_with_focus_and_orientation(self, wm, focus, gap_desc):
+        state = _make_state(wm, current_focus=focus)
+        state["orientation"] = {
+            "remaining_gaps": {
+                "Gap 10": {
+                    "priority": "TARGET",
+                    "description": gap_desc,
+                }
+            }
+        }
+        return state
+
+    def test_stale_focus_is_corrected_from_registry(self):
+        """A focus stuck on 'pending' for a verified milestone is rebuilt."""
+        wm = _make_wm_with_triples(count=6)
+        stale_focus = (
+            "Gap 10 — Real action bridge (Level 2: github.write granted "
+            "2026-08-02; first write fired; evidence write pending)"
+        )
+        registry_desc = (
+            "Real action permissions. Level 2 (low-risk GitHub writes) "
+            "implemented + verified. Level 3 SCOPED behind grant+cap+confirm."
+        )
+        state = self._state_with_focus_and_orientation(wm, stale_focus, registry_desc)
+        result = _local_analysis(state)
+
+        # The corrected focus is emitted through self_model_update["focus"]
+        # so _apply_insights persists it to self_model.state.current_gap_focus.
+        corrected = result["self_model_update"]["focus"]
+        assert corrected is not None
+        assert corrected.startswith("Gap 10 —")
+        assert "implemented + verified" in corrected
+        assert "pending" not in corrected.lower()
+
+        # focus_next must use the corrected focus, not the stale claim.
+        assert "pending" not in result["focus_next"].lower()
+        assert "Level 3 SCOPED" in result["focus_next"]
+
+    def test_non_stale_focus_is_untouched(self):
+        """A focus without unfinished-milestone markers is left alone (focus=None)."""
+        wm = _make_wm_with_triples(count=6)
+        focus = "Gap 10 — Real action bridge (Level 2 verified; Level 3 scoped)"
+        state = self._state_with_focus_and_orientation(
+            wm, focus, "Level 2 implemented + verified."
+        )
+        result = _local_analysis(state)
+        assert result["self_model_update"]["focus"] is None
+
+    def test_unknown_gap_in_focus_is_untouched(self):
+        """A focus naming a gap absent from the registry is left alone."""
+        wm = _make_wm_with_triples(count=6)
+        focus = "Gap 10 — evidence write pending"
+        state = _make_state(wm, current_focus=focus)  # no orientation registry
+        result = _local_analysis(state)
+        assert result["self_model_update"]["focus"] is None
+
+    def test_focus_without_gap_number_is_untouched(self):
+        """A focus that names no gap id cannot be registry-checked."""
+        wm = _make_wm_with_triples(count=6)
+        focus = "Fix the evidence write pending issue"
+        state = self._state_with_focus_and_orientation(
+            wm, focus, "Level 2 implemented + verified."
+        )
+        result = _local_analysis(state)
+        assert result["self_model_update"]["focus"] is None

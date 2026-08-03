@@ -994,7 +994,8 @@ Respond with a JSON object ONLY — no markdown, no explanation, no extra text.
   "self_model_update": {{
     "weakness": "New weakness or null",
     "unknown": "New unknown area or null",
-    "new_commitment": "New commitment or null"
+    "new_commitment": "New commitment or null",
+    "focus": "New current_gap_focus string or null (refresh the gap focus if it is stale)"
   }},
   "outcome_to_record": {{
     "event_id": "auto",
@@ -2972,6 +2973,16 @@ def _apply_insights(
             if not _is_near_duplicate(new_commit, commits["promised_features"]):
                 commits["promised_features"].append(new_commit)
 
+        # Optional focus refresh: the current_gap_focus string is otherwise
+        # only writable by LLM-backed self-updates, so during LLM outages a
+        # stale focus (e.g. "evidence write pending" for a milestone that has
+        # verifiably completed) propagates through every fallback cycle's
+        # focus_next.  Accept an explicit focus override from either the LLM
+        # or the local-analysis stale-focus detector (_refresh_stale_gap_focus).
+        _focus = su.get("focus")
+        if _focus and isinstance(_focus, str) and len(_focus) <= 500:
+            sm.setdefault("state", {})["current_gap_focus"] = _focus.strip()
+
     # ── Multi-type Memory (Gap 2) ──
     er = result.get("episodic_record")
     if er and isinstance(er, dict) and er.get("summary"):
@@ -4208,6 +4219,62 @@ def _record_web_search_triple(
         return None
 
 
+def _refresh_stale_gap_focus(
+    sm: Dict[str, Any],
+    orient: Dict[str, Any],
+) -> Optional[str]:
+    """Detect a stale ``current_gap_focus`` and return the corrected focus.
+
+    The focus string is only writable by LLM-backed self-updates, so during
+    LLM outages it can keep claiming a milestone is pending long after the
+    orientation gap registry records it as complete (observed 2026-08-03:
+    ``"evidence write pending"`` persisted 5+ fallback cycles after Level 2
+    verified HTTP 201).  The orientation registry is the canonical source of
+    gap status; when the focus names a gap whose registry description uses
+    completion vocabulary while the focus still carries "pending/awaiting"
+    vocabulary for that same milestone, rebuild the focus from the registry.
+
+    Returns the corrected focus string, or None when the focus is already
+    consistent with the registry (no stale claim detected).
+    """
+    try:
+        focus = (sm.get("state") or {}).get("current_gap_focus") or ""
+        if not focus or not isinstance(focus, str):
+            return None
+        low = focus.lower()
+        # Only rewrite when the focus itself carries an unfinished-milestone
+        # marker; a focus without such a marker is not demonstrably stale.
+        if not any(m in low for m in ("pending", "awaiting", "not yet", "to be done")):
+            return None
+        # Find which gap the focus names, e.g. "Gap 10".
+        m = re.search(r"gap\s+(\d+)", low)
+        if not m:
+            return None
+        gid = f"Gap {m.group(1)}"
+        gaps = orient.get("remaining_gaps") or {}
+        entry = gaps.get(gid) or {}
+        desc = entry.get("description") if isinstance(entry, dict) else None
+        if not desc or not isinstance(desc, str):
+            return None
+        dlow = desc.lower()
+        # The registry counts as "completed milestone" when it uses completion
+        # vocabulary for this gap while the focus still says pending.
+        completed_vocab = (
+            "implemented" in dlow or "verified" in dlow or "complete" in dlow
+        )
+        stale_vocab = any(m in low for m in ("pending", "awaiting", "not yet", "to be done"))
+        if completed_vocab and stale_vocab:
+            corrected = f"{gid} — {desc}"
+            if corrected != focus:
+                logger.info(
+                    "Refreshed stale gap focus -> %s", corrected[:120],
+                )
+                return corrected
+    except Exception as e:
+        logger.debug("Stale-focus refresh skipped: %s", e)
+    return None
+
+
 def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a useful thinking-cycle result from local data only, no LLM call.
 
@@ -4345,6 +4412,15 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     current_focus = sm.get("state", {}).get("current_gap_focus", "")
     remaining_gaps = sm.get("state", {}).get("remaining_gaps", [])
     next_gap = remaining_gaps[0] if remaining_gaps else None
+
+    # ── Stale-focus refresh (stale-guidance detection) ──
+    # The focus string is only writable by LLM-backed self-updates, so
+    # during outages it can keep claiming a milestone is pending after the
+    # orientation registry records it as complete.  Detect and correct it so
+    # fallback cycles stop propagating stale guidance via focus_next.
+    _focus_fix = _refresh_stale_gap_focus(sm, state.get("orientation") or {})
+    if _focus_fix:
+        current_focus = _focus_fix
 
     # ── Generate a context-aware action for fallback cycles ──
     # Instead of always returning None (which triggers the auto-default
@@ -4501,6 +4577,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             "weakness": "LLM API unreliable (timeout during thinking cycle); local fallback used. Consider alternative provider or retry.",
             "unknown": None,
             "new_commitment": None,
+            "focus": _focus_fix,
         },
         "next_gap": next_gap,
     }

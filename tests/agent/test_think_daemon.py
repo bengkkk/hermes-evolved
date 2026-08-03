@@ -2687,6 +2687,134 @@ class TestActionDedupGate:
         assert sm_out["capabilities"]["unknown_areas"] == []
         assert sm_out["commitments"].get("promised_features", []) == []
 
+    def test_self_model_update_focus_applied(self, evolve_env: Dict) -> None:
+        """_apply_insights persists an explicit focus override.
+
+        The current_gap_focus string is otherwise only writable by LLM-backed
+        self-updates; the stale-focus detector (_refresh_stale_gap_focus)
+        emits ``self_model_update.focus`` from fallback cycles so a stale
+        "pending" milestone claim is corrected even while the LLM is down.
+        """
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {
+                "weakness": None,
+                "unknown": None,
+                "new_commitment": None,
+                "focus": "Gap 10 — Real action bridge (Level 2 verified)",
+            },
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {"current_gap_focus": "Gap 10 — evidence write pending"},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        sm_out = updates["self_model"]
+        assert sm_out["state"]["current_gap_focus"] == "Gap 10 — Real action bridge (Level 2 verified)"
+
+    def test_self_model_update_focus_ignored_when_invalid(self, evolve_env: Dict) -> None:
+        """Non-string / over-long focus overrides are rejected, not persisted."""
+        td = evolve_env["module"]
+        from world_model import WorldModel
+
+        wm = WorldModel()
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "test",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            "plan_action": None,
+            "new_plan": None,
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "self_model_update": {
+                "weakness": None,
+                "unknown": None,
+                "new_commitment": None,
+                "focus": "x" * 600,  # over the 500-char cap
+            },
+            "next_gap": None,
+        }
+
+        state = {
+            "daemon_state": {"tick_count": 15, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {"version": 1, "past": {"events": []}, "present": {}, "future": {}},
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {"current_gap_focus": "keep me"},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+        import subprocess
+        original_run = subprocess.run
+        try:
+            def _mock_run(*a, **kw):
+                return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+            subprocess.run = _mock_run
+
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        sm_out = updates["self_model"]
+        assert sm_out["state"]["current_gap_focus"] == "keep me"
+
     def test_apply_insights_llm_weakness_survives_current_cycle_failure(
         self, evolve_env: Dict
     ) -> None:
