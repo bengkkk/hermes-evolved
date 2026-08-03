@@ -853,8 +853,84 @@ class TestGoals:
             "in auto-default commands"
         )
         gid2 = g.propose(variant, "Desc again", gap_reference="6")
-        assert gid2 != gid1
+        assert gid2 != gid1  # fresh investigation after the window
         assert len(g.data["goals"]) == 2
+
+    def test_find_duplicate_active_match(self) -> None:
+        """find_duplicate returns the ID of an existing active goal the
+        proposal would collide with — the daemon's read-only pre-check
+        must agree with what propose() would suppress."""
+        g = Goals()
+        gid = g.propose(
+            "Investigate llm_call prediction failures", "Desc",
+            gap_reference="6",
+        )
+        dup = g.find_duplicate(
+            "Investigate llm_call prediction failures", "6"
+        )
+        assert dup == gid
+        assert len(g.data["goals"]) == 1  # read-only: no side effects
+
+    def test_find_duplicate_completed_match(self) -> None:
+        """A completed goal with the same objective suppresses a re-proposal
+        (identical title → always, regardless of age). find_duplicate must
+        surface it so the daemon insight stops claiming an auto-created goal
+        that propose() would silently suppress.
+
+        Regression for the 2026-08-03 observation: daemon_state insight
+        claimed "Auto-created goal: Investigate llm_call prediction
+        failures" every fallback cycle while daemon.log showed
+        "Suppressed duplicate goal proposal" at the same ticks — the
+        daemon's active-only pre-check missed completed goals."""
+        g = Goals()
+        gid = g.propose(
+            "Investigate llm_call prediction failures", "Desc",
+            gap_reference="6",
+        )
+        g.update_status(gid, "completed")
+        # Backdate beyond the 24h window — identical titles still suppress.
+        old = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+        g.data["goals"][0]["completed_at"] = old
+
+        dup = g.find_duplicate(
+            "Investigate llm_call prediction failures", "6"
+        )
+        assert dup == gid
+        assert len(g.data["goals"]) == 1
+
+    def test_find_duplicate_none_for_fresh_objective(self) -> None:
+        """A genuinely new objective has no duplicate — the daemon may
+        report it as an auto-created goal."""
+        g = Goals()
+        g.propose(
+            "Investigate llm_call prediction failures", "Desc",
+            gap_reference="6",
+        )
+        assert g.find_duplicate("Build a moon base", "10") is None
+
+    def test_find_duplicate_reworded_variant_within_window(self) -> None:
+        """Moderate-overlap variants are duplicates only inside the 24h
+        completion window — matching propose()'s suppression tiers."""
+        g = Goals()
+        original = (
+            "Investigate shell prediction failures "
+            "(keywords: auto-default, sibling, dirs)"
+        )
+        gid1 = g.propose(original, "Desc", gap_reference="6")
+        g.update_status(gid1, "completed")
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        g.data["goals"][0]["completed_at"] = recent
+
+        variant = (
+            "Investigate recurring shell action failures "
+            "in auto-default commands"
+        )
+        assert g.find_duplicate(variant, "6") == gid1
+
+        # Outside the window → no duplicate.
+        old = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+        g.data["goals"][0]["completed_at"] = old
+        assert g.find_duplicate(variant, "6") is None
 
     def test_dedupe_completed_collapses_near_identical(self) -> None:
         """Pre-guard duplicate COMPLETED goals are collapsed into the most

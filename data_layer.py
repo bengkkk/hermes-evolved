@@ -1141,6 +1141,35 @@ class Goals:
             completed_within_hours=window_hours,
         )
 
+    def find_duplicate(
+        self,
+        title: str,
+        gap_reference: str = "",
+        completed_window_hours: float = 24.0,
+    ) -> Optional[str]:
+        """Return the ID of an existing goal a proposal would collide with.
+
+        Read-only mirror of the dedup chain in :meth:`propose`: checks
+        active goals first (similar title), then recently-completed goals.
+        Returns ``None`` when the proposal would create a fresh goal.
+
+        The daemon's local-analysis path uses this to decide whether a
+        world-model-driven goal suggestion is genuinely new BEFORE it
+        claims "Auto-created goal" in its insight.  Previously it checked
+        only ``get_active()`` — a completed goal with the same objective
+        (e.g. the 2026-08-01 "Investigate llm_call prediction failures"
+        investigation) was invisible to that check, so every fallback
+        cycle reported an auto-created goal while :meth:`propose` silently
+        suppressed the duplicate at the persistence boundary.
+        """
+        title = _coerce_stripped_str(title)
+        active_id = self._find_similar_active_goal(title, gap_reference)
+        if active_id is not None:
+            return active_id
+        return self._find_recently_completed_goal(
+            title, gap_reference, window_hours=completed_window_hours
+        )
+
     def _similar_goal_id(
         self,
         title: str,

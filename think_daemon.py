@@ -4494,7 +4494,16 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
                 ),
             }
             # Deduplicate: skip if an identical goal already exists
-            # in the Goals store (evolve/goals.json)
+            # in the Goals store (evolve/goals.json).  The check MUST
+            # mirror Goals.propose()'s full dedup chain (active AND
+            # recently-completed): the previous active-only check let a
+            # completed goal with the same objective (e.g. the 08-01
+            # "Investigate llm_call prediction failures" investigation)
+            # pass through, so every fallback cycle claimed
+            # "Auto-created goal" in the insight while propose() silently
+            # suppressed the duplicate at the persistence boundary
+            # (observed: insight text at 22:50/23:06 vs "Suppressed
+            # duplicate goal proposal" in daemon.log at the same ticks).
             try:
                 # ── Stale-module-safe import ──
                 try:
@@ -4505,13 +4514,37 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
                     _il.reload(_dl)
                     from data_layer import Goals as _Goals
                     logger.info("Reloaded data_layer module to pick up newly added Goals class")
-                existing = _Goals.load().get_active()
-                already_present = any(
-                    top["title"].lower() in g.get("title", "").lower()
-                    for g in existing
-                )
-                if already_present:
+                existing = _Goals.load()
+                try:
+                    _dup_id = existing.find_duplicate(
+                        top["title"], top.get("gap_reference", "")
+                    )
+                except AttributeError:
+                    # Running daemon still holds an older data_layer
+                    # without find_duplicate (module loaded before this
+                    # commit): fall back to the previous active-only
+                    # substring check so the transition window keeps
+                    # deduping instead of crashing or double-creating.
+                    _dup_id = next(
+                        (
+                            g.get("id")
+                            for g in existing.get_active()
+                            if top["title"].lower()
+                            in (g.get("title", "") or "").lower()
+                        ),
+                        None,
+                    )
+                if _dup_id is not None:
                     new_goal = None
+                    # Report the suppression truthfully instead of the old
+                    # false "Auto-created goal" claim.  Note: `insight`
+                    # was already assembled from insight_parts above, so
+                    # append to the string directly (same pattern as the
+                    # created-goal note below).
+                    insight += (
+                        f" | Auto-goal suppressed: {top['title']} "
+                        f"(duplicate of {_dup_id})"
+                    )
             except ImportError:
                 pass
             if new_goal:

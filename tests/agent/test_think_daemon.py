@@ -3226,6 +3226,149 @@ class TestCycleBodyEmptyLlmResponse:
         assert "Could not parse JSON" in (result.get("error") or "")
 
 
+class TestLocalAnalysisAutoGoalDedup:
+    """Local-analysis auto-goal dedup must mirror Goals.propose()'s chain.
+
+    Regression (2026-08-03): the daemon's pre-check only looked at ACTIVE
+    goals, so a world-model suggestion matching a COMPLETED goal (the
+    08-01 "Investigate llm_call prediction failures" investigation)
+    passed the check. Every fallback cycle then claimed "Auto-created
+    goal: ..." in the insight while Goals.propose() silently suppressed
+    the duplicate at the persistence boundary — daemon.log showed
+    "Suppressed duplicate goal proposal" at the same ticks the insight
+    claimed creation. The pre-check must use Goals.find_duplicate()
+    (active AND recently-completed) and report suppression truthfully.
+    """
+
+    def _make_state_with_llm_pattern(
+        self, evolve_env: Dict
+    ) -> Dict[str, Any]:
+        """Build a state dict whose world model has an llm_call discrepancy
+        pattern (2 confident-wrong triples, low overall avg so only the
+        investigate suggestion fires) — mirroring the live 0.85 case."""
+        td = evolve_env["module"]
+        import world_model as _wm
+
+        wm = _wm.WorldModel()
+        # 8 low-error llm_call triples keep per-type avg < 0.4 (so the
+        # calibrate suggestion at priority 2 does NOT outrank investigate)
+        for i in range(8):
+            tid = wm.record_action(
+                "llm_call", f"LLM thinking call {i}",
+                "success: LLM responds within 1 attempt(s) × 45s budget",
+            )
+            wm.complete_action(
+                tid,
+                "succeeded on attempt 1 (10.0s)",
+            )
+        # 2 confident-wrong (unhedged "success:" that timed out) → the
+        # discrepancy pattern. Put them LAST so the recency check keeps
+        # the pattern alive.
+        for i in range(2):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+            )
+            wm.complete_action(
+                tid,
+                "failed: timeout after 2 attempt(s)",
+            )
+        # Force per-type stats + patterns to recompute.
+        wm._update_accuracy_stats()
+        wm._update_discrepancy_patterns()
+        patterns = wm.get_discrepancy_patterns()
+        assert any(p["action_type"] == "llm_call" for p in patterns), (
+            f"test precondition: expected an llm_call pattern, got {patterns}"
+        )
+
+        return {
+            "world_model": wm,
+            "self_model": {},
+            "timeline": {},
+            "orientation": {},
+            "daemon_state": {"tick_count": 100},
+        }
+
+    def test_completed_duplicate_suppresses_false_auto_goal(
+        self, evolve_env: Dict
+    ) -> None:
+        """A suggestion colliding with a COMPLETED goal must not claim
+        'Auto-created goal' — it must report suppression."""
+        td = evolve_env["module"]
+
+        # Pre-create the completed goal the suggestion will collide with.
+        import data_layer as _dl
+
+        g = _dl.Goals.load()
+        gid = g.propose(
+            "Investigate llm_call prediction failures",
+            "Investigate whether the failure is in the heuristic or the "
+            "action description quality.",
+            gap_reference="6",
+        )
+        g.update_status(gid, "completed")
+        # Backdate completion beyond the 24h window — identical titles
+        # still suppress (near-exact tier), so this reproduces the live
+        # case where the completed goal is 2 days old.
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+        g.data["goals"][0]["completed_at"] = old
+        g.save()
+
+        state = self._make_state_with_llm_pattern(evolve_env)
+        result = td._local_analysis(state)
+
+        insight = result.get("insight", "")
+        assert "Auto-created goal" not in insight, (
+            f"insight must NOT claim an auto-created goal, got: {insight}"
+        )
+        assert "Auto-goal suppressed" in insight, (
+            f"insight should truthfully report suppression, got: {insight}"
+        )
+        # The returned new_goal must be None so the apply path cannot
+        # propose a duplicate either.
+        assert result.get("new_goal") is None
+
+    def test_active_duplicate_still_suppresses(self, evolve_env: Dict) -> None:
+        """The pre-existing active-goal suppression keeps working."""
+        td = evolve_env["module"]
+        import data_layer as _dl
+
+        g = _dl.Goals.load()
+        g.propose(
+            "Investigate llm_call prediction failures",
+            "Desc",
+            gap_reference="6",
+        )
+        g.save()
+
+        state = self._make_state_with_llm_pattern(evolve_env)
+        result = td._local_analysis(state)
+
+        insight = result.get("insight", "")
+        assert "Auto-created goal" not in insight
+        assert "Auto-goal suppressed" in insight
+        assert result.get("new_goal") is None
+
+    def test_fresh_objective_still_reports_auto_goal(self, evolve_env: Dict) -> None:
+        """A genuinely new objective is still reported as auto-created —
+        only duplicates are suppressed."""
+        td = evolve_env["module"]
+
+        # No goals exist → the suggestion is genuinely new.
+        state = self._make_state_with_llm_pattern(evolve_env)
+        result = td._local_analysis(state)
+
+        insight = result.get("insight", "")
+        assert "Auto-created goal" in insight, (
+            f"fresh objective should be reported as auto-created, got: {insight}"
+        )
+        ng = result.get("new_goal")
+        assert isinstance(ng, dict)
+        assert "llm_call" in ng.get("title", "")
+
+
 class TestLlmRetryPolicy:
     """Adaptive LLM retry budget (outage-aware retry policy).
 
