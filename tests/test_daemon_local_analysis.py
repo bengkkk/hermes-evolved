@@ -629,3 +629,82 @@ class TestLlmRetryPolicyBudget:
         assert think_daemon._cycle_budget_seconds is None
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Timeline commitment supersession
+# ══════════════════════════════════════════════════════════════════
+
+
+class TestTimelineCommitmentSupersession:
+    """Near-duplicate active commitments are superseded at write time.
+
+    Regression for the recurring stale-commitment accumulation: the LLM
+    re-emits the same standing commitment each cycle with minor phrasing
+    drift, and _apply_insights used to append every one as a fresh
+    'active' row. The prompt builder surfaces the newest 3 active rows,
+    so parallel duplicates reinforced the same guidance N times and the
+    active set never shrank. New behavior: before appending, any existing
+    ACTIVE row that is a near-duplicate (exact / substring / >50% word
+    overlap) is marked 'superseded', keeping the active set meaningfully
+    non-redundant while preserving history.
+    """
+
+    def _apply(self, commitments, what):
+        from think_daemon import _apply_insights
+        state = {
+            "timeline": {"present": {"commitments": commitments}},
+            "self_model": {"commitments": {}},
+            "orientation": {},
+            "daemon_state": {},
+        }
+        return _apply_insights({"commitment": {"what": what}}, state)
+
+    def test_exact_duplicate_is_superseded(self):
+        out = self._apply(
+            [{"id": "old1", "what": "Fire one GET per cycle",
+              "status": "active", "created_at": "x"}],
+            "fire one GET per cycle",
+        )
+        comms = out["timeline"]["present"]["commitments"]
+        assert [c["status"] for c in comms] == ["superseded", "active"]
+        assert comms[0]["superseded_at"], "superseded row must be stamped"
+
+    def test_phrasing_drift_is_superseded(self):
+        # The real observed pair from cycle 483/484: same commitment with
+        # 'Level 3 grants' vs 'user Level 3 grants, and do not re-plan'.
+        out = self._apply(
+            [{"id": "old1",
+              "what": ("Fire one allowlisted GET https://api.github.com/ per "
+                       "cycle while awaiting Level 3 grants; maintain "
+                       "no-reverify on committed Level 2 path."),
+              "status": "active", "created_at": "x"}],
+            ("Fire one allowlisted GET https://api.github.com/ per cycle while "
+             "awaiting user Level 3 grants, and do not re-plan/re-verify "
+             "committed Level 2 work."),
+        )
+        comms = out["timeline"]["present"]["commitments"]
+        assert [c["status"] for c in comms] == ["superseded", "active"]
+        assert len([c for c in comms if c["status"] == "active"]) == 1
+
+    def test_distinct_commitments_both_stay_active(self):
+        out = self._apply(
+            [{"id": "old1", "what": "Complete Phase 2",
+              "status": "active", "created_at": "x"}],
+            "Build a rocket",
+        )
+        comms = out["timeline"]["present"]["commitments"]
+        assert [c["status"] for c in comms] == ["active", "active"]
+
+    def test_prior_superseded_rows_untouched(self):
+        out = self._apply(
+            [{"id": "old1", "what": "Fire one GET per cycle",
+              "status": "superseded", "created_at": "x"},
+             {"id": "old2", "what": "Different standing task",
+              "status": "active", "created_at": "x"}],
+            "fire one GET per cycle",
+        )
+        comms = out["timeline"]["present"]["commitments"]
+        assert comms[0]["status"] == "superseded"  # already superseded, unchanged
+        assert comms[1]["status"] == "active"      # distinct, untouched
+        assert comms[2]["status"] == "active"      # the new row
+
+

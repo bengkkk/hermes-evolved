@@ -459,6 +459,47 @@ _PLACEHOLDER_VERIFY_RE = re.compile(
 )
 
 
+def _near_dup_text(candidate: str, existing: list) -> bool:
+    """Check if candidate is a near-duplicate of any existing entry.
+
+    Three criteria (any match = duplicate):
+      1. Exact match (ignoring case)
+      2. One is a substring of the other (longer >= 4 common chars)
+      3. Word overlap > 50% after removing common stop words
+
+    Shared by the self-model capability write path and the timeline
+    commitment write path so both surfaces dedupe identically.
+    """
+    if not candidate or not existing:
+        return False
+    c_lower = candidate.lower().strip()
+    # ── Exact (case-insensitive) ──
+    for e in existing:
+        if e.lower().strip() == c_lower:
+            return True
+    # ── Substring ──
+    for e in existing:
+        e_lower = e.lower().strip()
+        if len(c_lower) >= 4 and len(e_lower) >= 4:
+            if c_lower in e_lower or e_lower in c_lower:
+                return True
+    # ── Word overlap ──
+    _STOP = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
+                       "at", "to", "for", "of", "with", "by", "from", "is",
+                       "it", "as", "be", "this", "that", "not", "no", "how"})
+    c_words = {w for w in re.findall(r"[a-z0-9]+", c_lower) if w not in _STOP}
+    if not c_words:
+        return False
+    for e in existing:
+        e_words = {w for w in re.findall(r"[a-z0-9]+", e.lower()) if w not in _STOP}
+        if not e_words:
+            continue
+        overlap = len(c_words & e_words)
+        if overlap / max(len(c_words), len(e_words)) > 0.5:
+            return True
+    return False
+
+
 def _is_placeholder_step(step: Dict[str, Any]) -> bool:
     """Detect a plan step with no actionable content.
 
@@ -2701,14 +2742,29 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
     # ── Record commitment ──
     new_commit = result.get("commitment")
     if new_commit and isinstance(new_commit, dict) and new_commit.get("what"):
-        tl.setdefault("present", {}).setdefault("commitments", []).append({
+        commits_list = tl.setdefault("present", {}).setdefault("commitments", [])
+        # Supersede any existing ACTIVE commitment that is a near-duplicate of
+        # the incoming one before appending. Without this, the LLM re-emitting
+        # the same commitment each cycle (with minor phrasing drift) accumulates
+        # parallel active rows that all re-enter the prompt, reinforcing the
+        # stale-commitment fixation loop (see _build_thinking_prompt taking the
+        # newest 3 active rows). Marking them superseded keeps the active set
+        # meaningfully non-redundant while preserving history.
+        new_what = str(new_commit["what"])
+        for c in commits_list:
+            if c.get("status") == "active" and isinstance(c.get("what"), str) \
+                    and _near_dup_text(new_what, [c["what"]]):
+                c["status"] = "superseded"
+                c.setdefault("superseded_at",
+                             datetime.now(timezone.utc).isoformat())
+        commits_list.append({
             "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S"),
-            "what": new_commit["what"],
+            "what": new_what,
             "deadline": new_commit.get("deadline"),
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-        tl["present"]["commitments"] = tl["present"]["commitments"][-30:]
+        tl["present"]["commitments"] = commits_list[-30:]
 
     # ── Record prediction ──
     pred = result.get("prediction")
@@ -2793,39 +2849,11 @@ def _apply_insights(result: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, 
         def _is_near_duplicate(candidate: str, existing: list) -> bool:
             """Check if candidate is a near-duplicate of any existing entry.
 
-            Three criteria (any match = duplicate):
-              1. Exact match (ignoring case)
-              2. One is a substring of the other (longer >= 4 common chars)
-              3. Word overlap > 50% after removing common stop words
+            Delegates to the module-level _near_dup_text() so the self-model
+            capability path and the timeline commitment path share one
+            definition of near-duplicate (exact, substring, word overlap).
             """
-            if not candidate or not existing:
-                return False
-            c_lower = candidate.lower().strip()
-            # ── Exact (case-insensitive) ──
-            for e in existing:
-                if e.lower().strip() == c_lower:
-                    return True
-            # ── Substring ──
-            for e in existing:
-                e_lower = e.lower().strip()
-                if len(c_lower) >= 4 and len(e_lower) >= 4:
-                    if c_lower in e_lower or e_lower in c_lower:
-                        return True
-            # ── Word overlap ──
-            _STOP = frozenset({"the", "a", "an", "and", "or", "but", "in", "on",
-                               "at", "to", "for", "of", "with", "by", "from", "is",
-                               "it", "as", "be", "this", "that", "not", "no", "how"})
-            c_words = {w for w in re.findall(r"[a-z0-9]+", c_lower) if w not in _STOP}
-            if not c_words:
-                return False
-            for e in existing:
-                e_words = {w for w in re.findall(r"[a-z0-9]+", e.lower()) if w not in _STOP}
-                if not e_words:
-                    continue
-                overlap = len(c_words & e_words)
-                if overlap / max(len(c_words), len(e_words)) > 0.5:
-                    return True
-            return False
+            return _near_dup_text(candidate, existing)
 
         weakness = su.get("weakness")
         if weakness and isinstance(weakness, str) and not _subject_is_resolved(weakness):
