@@ -3406,6 +3406,146 @@ def _apply_insights(
 
 
 # ═════════════════════════════════════════════════════════════════
+#  Plan-continuity invariant monitor (P3, goal_20260803174119_0)
+# ═════════════════════════════════════════════════════════════════
+
+_PLAN_CONTINUITY_WINDOW = 20
+
+
+def _record_plan_continuity_observation(
+    tick: int,
+    parsed: Dict[str, Any],
+    active_plan_before: Optional[str],
+    timeline: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Record one daemon-cycle observation of the plan-continuity invariant.
+
+    P3 goal_20260803174119_0: the active-plan slot must never remain
+    occupied by a finished plan nor empty after a plan completion. A
+    completion MAY be followed by its replacement in the *next* cycle
+    (pending reinstantiation), but a slot left empty for two consecutive
+    cycles is a violation.
+
+    Called at the end of every successful daemon cycle, after the
+    timeline has been persisted.  Appends an observation to
+    ``<evolve>/plan_continuity_monitor.json`` and tracks the consecutive
+    clean streak; ``_PLAN_CONTINUITY_WINDOW`` (20) consecutive clean
+    observations complete the verification window that closes the P3
+    goal's closing evidence (plan_20260803184432 step_2).
+
+    Checks:
+      V1 — no *active* plan may have all steps complete (auto-complete
+           failed to fire — the finished-plan-still-active trap).
+      V2 — after a plan completion, the active-plan slot must not stay
+           empty for two consecutive cycles (replacement never created).
+
+    Best-effort: persistence failures are logged, never raised.
+    """
+    log_path = get_evolve_dir() / "plan_continuity_monitor.json"
+    log = safe_read_json(log_path, default=None)
+    if not isinstance(log, dict) or not isinstance(log.get("observations"), list):
+        log = {
+            "version": 1,
+            "window_target": _PLAN_CONTINUITY_WINDOW,
+            "observations": [],
+            "consecutive_clean": 0,
+            "window_complete": False,
+            "pending_reinstantiation": False,
+            "last_violation": None,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    observations = log["observations"]
+
+    plans = ((timeline.get("future") or {}).get("plans")) or []
+    active = [p for p in plans if p.get("status") == "active"]
+    active_after = active[0]["id"] if active else None
+    slot_empty = active_after is None
+
+    violations: List[str] = []
+    # V1 — a finished plan still occupying the active slot.
+    for p in active:
+        steps = p.get("steps") or []
+        if steps and all(s.get("status") == "complete" for s in steps):
+            violations.append(
+                "active plan {} has all {} steps complete but status is still "
+                "'active'".format(p.get("id"), len(steps))
+            )
+
+    pa = parsed.get("plan_action") if isinstance(parsed, dict) else None
+    np_ = parsed.get("new_plan") if isinstance(parsed, dict) else None
+    plan_action_issued = bool(
+        pa and isinstance(pa, dict) and pa.get("step_id")
+        and pa.get("new_status") in ("complete", "blocked", "in_progress")
+    )
+    new_plan_issued = bool(
+        np_ and isinstance(np_, dict) and np_.get("goal") and np_.get("steps")
+    )
+    was_pending = bool(log.get("pending_reinstantiation"))
+
+    # The active plan present at cycle start disappeared by cycle end
+    # (completed/auto-completed) with no replacement visible on disk.
+    completed_this_cycle = bool(active_plan_before and not active_after)
+
+    # V2 — empty slot persisting across two consecutive cycles.
+    if was_pending and slot_empty:
+        violations.append(
+            "active-plan slot empty for 2+ consecutive cycles after a plan "
+            "completion; no replacement plan was created"
+        )
+
+    # Reinstantiation state carried into the NEXT observation: the slot is
+    # empty AND the emptiness traces to a completion (this cycle or the
+    # previous one).  Filled slots always clear it.
+    pending_now = bool(slot_empty and (completed_this_cycle or was_pending))
+
+    if violations:
+        log["consecutive_clean"] = 0
+        log["last_violation"] = {
+            "tick": tick,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "violations": list(violations),
+        }
+    else:
+        log["consecutive_clean"] = log.get("consecutive_clean", 0) + 1
+    log["pending_reinstantiation"] = pending_now
+    log["window_complete"] = bool(
+        not violations and log.get("consecutive_clean", 0) >= _PLAN_CONTINUITY_WINDOW
+    )
+
+    observations.append({
+        "tick": tick,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "ok": not violations,
+        "active_plan_before": active_plan_before,
+        "active_plan_after": active_after,
+        "plan_action_issued": plan_action_issued,
+        "new_plan_issued": new_plan_issued,
+        "completed_this_cycle": completed_this_cycle,
+        "slot_empty": slot_empty,
+        "pending_reinstantiation": pending_now,
+        "violations": list(violations),
+    })
+    log["observations"] = observations[-40:]
+
+    try:
+        safe_write_json(log_path, log)
+    except Exception as e:  # pragma: no cover - best-effort persistence
+        logger.warning("Plan-continuity observation persist failed: %s", e)
+
+    if violations:
+        logger.warning(
+            "Plan-continuity VIOLATION(s) at tick %d: %s",
+            tick, "; ".join(violations),
+        )
+    elif log["window_complete"]:
+        logger.info(
+            "Plan-continuity window COMPLETE: %d consecutive clean cycles",
+            log["consecutive_clean"],
+        )
+    return log
+
+
+# ═════════════════════════════════════════════════════════════════
 #  LLM call
 # ═════════════════════════════════════════════════════════════════
 
@@ -5710,6 +5850,16 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # last_output.fallback heuristic reflects the PREVIOUS cycle). Cycle 501
     # regression (2026-08-03): LLM timed out twice, yet the post-cycle
     # prune removed the weakness claiming "LLM API is now reachable".
+    # Snapshot the active plan BEFORE applying insights so the plan-continuity
+    # monitor (step 6.5) can tell whether this cycle completed the plan.
+    _active_plan_before = next(
+        (
+            p.get("id")
+            for p in (state.get("timeline", {}).get("future", {}).get("plans", []) or [])
+            if p.get("status") == "active"
+        ),
+        None,
+    )
     updates = _apply_insights(
         parsed, state,
         llm_working=not bool(result.get("llm_fallback", False)),
@@ -5817,6 +5967,20 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     if ds.get("first_tick") is None:
         ds["first_tick"] = now_ts
     save_daemon_state(ds)
+
+    # 7.5 Plan-continuity invariant observation (P3, goal_20260803174119_0)
+    # Recorded after the timeline and daemon state are persisted so the
+    # observation reflects the cycle's final on-disk state. Best-effort:
+    # a monitor failure must never fail the cycle.
+    try:
+        _record_plan_continuity_observation(
+            ds.get("tick_count", 0),
+            parsed,
+            _active_plan_before,
+            updates.get("timeline", state.get("timeline", {})),
+        )
+    except Exception as e:
+        logger.warning("Plan-continuity observation failed (non-blocking): %s", e)
 
     # 8. Build result
     elapsed = time.time() - _cycle_start_time

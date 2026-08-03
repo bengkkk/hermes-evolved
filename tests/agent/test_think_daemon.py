@@ -5679,6 +5679,184 @@ class TestPlanContinuityInvariant:
         assert active["progress"] == "1/2 steps"
 
 
+class TestPlanContinuityMonitor:
+    """``_record_plan_continuity_observation`` per-cycle invariant checks.
+
+    P3 goal_20260803174119_0 closing evidence (plan_20260803184432 step_2):
+    every successful daemon cycle appends an observation to
+    ``<evolve>/plan_continuity_monitor.json``; 20 consecutive clean
+    observations complete the verification window.  Checks:
+
+      V1 — no active plan may have all steps complete (auto-complete trap).
+      V2 — after a plan completion, the slot must not stay empty for two
+           consecutive cycles (replacement never created).
+    """
+
+    @staticmethod
+    def _plan(pid: str, status: str, steps: list) -> Dict[str, Any]:
+        return {
+            "id": pid,
+            "goal": "Goal " + pid,
+            "steps": steps,
+            "status": status,
+            "progress": f"{sum(1 for s in steps if s.get('status') == 'complete')}/{len(steps)} steps",
+        }
+
+    @staticmethod
+    def _timeline(plans: list) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "past": {"events": []},
+            "present": {},
+            "future": {"plans": plans},
+        }
+
+    def test_clean_cycle_with_active_plan_increments_streak(
+        self, evolve_env: Dict
+    ) -> None:
+        td = evolve_env["module"]
+        tl = self._timeline([
+            self._plan("p1", "active", [
+                {"id": "step_1", "status": "complete"},
+                {"id": "step_2", "status": "pending"},
+            ]),
+        ])
+        log = td._record_plan_continuity_observation(
+            101, {"plan_action": None, "new_plan": None}, "p1", tl
+        )
+        assert log["consecutive_clean"] == 1
+        assert log["window_complete"] is False
+        assert log["pending_reinstantiation"] is False
+        obs = log["observations"][-1]
+        assert obs["ok"] is True
+        assert obs["violations"] == []
+        assert obs["active_plan_after"] == "p1"
+        # Log persisted at the expected path.
+        log_path = evolve_env["paths"]["evolve_dir"] / "plan_continuity_monitor.json"
+        assert log_path.exists()
+
+    def test_finished_active_plan_is_violation(
+        self, evolve_env: Dict
+    ) -> None:
+        """V1: an active plan whose steps are all complete is a violation."""
+        td = evolve_env["module"]
+        tl = self._timeline([
+            self._plan("p1", "active", [
+                {"id": "step_1", "status": "complete"},
+                {"id": "step_2", "status": "complete"},
+            ]),
+        ])
+        log = td._record_plan_continuity_observation(
+            102, {"plan_action": None, "new_plan": None}, "p1", tl
+        )
+        assert log["consecutive_clean"] == 0
+        assert log["window_complete"] is False
+        assert log["last_violation"]["tick"] == 102
+        obs = log["observations"][-1]
+        assert obs["ok"] is False
+        assert any("all 2 steps complete" in v for v in obs["violations"])
+
+    def test_completion_without_replacement_pending_then_violation(
+        self, evolve_env: Dict
+    ) -> None:
+        """V2: completion frees the slot; one empty cycle is allowed for
+        reinstantiation, a second consecutive empty cycle is a violation."""
+        td = evolve_env["module"]
+        # Cycle N: the active plan is completed (plan_action) and no
+        # replacement is issued in the same response.
+        tl_n = self._timeline([
+            self._plan("p1", "complete", [
+                {"id": "step_1", "status": "complete"},
+                {"id": "step_2", "status": "complete"},
+            ]),
+        ])
+        log = td._record_plan_continuity_observation(
+            103,
+            {
+                "plan_action": {"step_id": "step_2", "new_status": "complete", "note": ""},
+                "new_plan": None,
+            },
+            "p1",
+            tl_n,
+        )
+        obs_n = log["observations"][-1]
+        assert obs_n["ok"] is True, obs_n["violations"]  # deferred, not yet a violation
+        assert obs_n["completed_this_cycle"] is True
+        assert obs_n["slot_empty"] is True
+        assert log["pending_reinstantiation"] is True
+        assert log["consecutive_clean"] == 1
+
+        # Cycle N+1: still no active plan and no replacement → violation.
+        tl_n1 = self._timeline([])
+        log = td._record_plan_continuity_observation(
+            104, {"plan_action": None, "new_plan": None}, None, tl_n1
+        )
+        obs_n1 = log["observations"][-1]
+        assert obs_n1["ok"] is False
+        assert any("2+ consecutive cycles" in v for v in obs_n1["violations"])
+        assert log["consecutive_clean"] == 0
+
+    def test_completion_with_same_response_new_plan_is_clean(
+        self, evolve_env: Dict
+    ) -> None:
+        """Same-response reinstantiation: completion + new_plan keeps the
+        slot filled — clean, no pending state carried forward."""
+        td = evolve_env["module"]
+        tl = self._timeline([
+            self._plan("p2", "active", [
+                {"id": "step_1", "status": "pending"},
+            ]),
+        ])
+        log = td._record_plan_continuity_observation(
+            105,
+            {
+                "plan_action": {"step_id": "step_1", "new_status": "complete", "note": ""},
+                "new_plan": {"goal": "Replacement", "steps": [{"description": "S", "verification": "V"}]},
+            },
+            "p1",
+            tl,
+        )
+        obs = log["observations"][-1]
+        assert obs["ok"] is True
+        assert obs["new_plan_issued"] is True
+        assert log["pending_reinstantiation"] is False
+        assert log["consecutive_clean"] == 1
+
+    def test_window_completes_after_20_clean_observations(
+        self, evolve_env: Dict
+    ) -> None:
+        td = evolve_env["module"]
+        tl = self._timeline([
+            self._plan("p1", "active", [
+                {"id": "step_1", "status": "complete"},
+                {"id": "step_2", "status": "pending"},
+            ]),
+        ])
+        parsed = {"plan_action": None, "new_plan": None}
+        for i in range(20):
+            log = td._record_plan_continuity_observation(200 + i, parsed, "p1", tl)
+            if i < 19:
+                assert log["window_complete"] is False, f"premature at {i}"
+            else:
+                assert log["window_complete"] is True
+        assert log["consecutive_clean"] == 20
+        assert len(log["observations"]) == 20
+
+    def test_observation_log_capped_at_40(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        tl = self._timeline([
+            self._plan("p1", "active", [
+                {"id": "step_1", "status": "pending"},
+            ]),
+        ])
+        parsed = {"plan_action": None, "new_plan": None}
+        for i in range(45):
+            td._record_plan_continuity_observation(300 + i, parsed, "p1", tl)
+        log = td._record_plan_continuity_observation(345, parsed, "p1", tl)
+        assert len(log["observations"]) == 40
+        assert log["observations"][0]["tick"] == 306
+
+
 class TestCleanPatternCyclesCounter:
     """daemon_state.clean_pattern_cycles tracks consecutive pattern-free cycles.
 
