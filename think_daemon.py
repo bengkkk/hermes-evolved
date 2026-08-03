@@ -43,7 +43,12 @@ from data_layer import get_evolve_dir, safe_read_json, safe_write_json
 logger = logging.getLogger("think_daemon")
 
 # ── World Model integration (Gap 6) ──
-from world_model import WorldModel, load_world_model, save_world_model
+from world_model import (
+    WorldModel,
+    _is_hedged_expected,
+    load_world_model,
+    save_world_model,
+)
 
 # ── Gap 10 Level 2 policy contract (deny-by-default pre-flight reference) ──
 from gap10_level2_policy import method_aware_preflight
@@ -4307,11 +4312,41 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     total_completed = len(completed)
 
     per_type = wm.get_per_type_accuracy()
+    # Hedge-aware per-type reporting: calibrated disjunctive hedges
+    # ("success or timeout: ...") score 0.4 by design, so a raw avg_error
+    # overstates true prediction quality during LLM outages (observed:
+    # llm_call raw avg 0.32 from 63/88 hedged triples while confident-only
+    # avg is 0.12 — healthy). Report hedged counts and confident-only
+    # avg_error so fallback cycles stop re-flagging honest uncertainty as
+    # a phantom prediction-bias weakness.
+    _hedged_by_type: Dict[str, int] = {}
+    _conf_err_sum: Dict[str, float] = {}
+    _conf_count: Dict[str, int] = {}
+    for _t in completed:
+        _at = _t.get("action_type") or "?"
+        if _is_hedged_expected(_t.get("expected_outcome") or ""):
+            _hedged_by_type[_at] = _hedged_by_type.get(_at, 0) + 1
+        else:
+            _conf_err_sum[_at] = _conf_err_sum.get(_at, 0.0) + float(
+                _t.get("prediction_error") or 0.0
+            )
+            _conf_count[_at] = _conf_count.get(_at, 0) + 1
     type_summaries = []
     for atype, astats in sorted(per_type.items()):
-        type_summaries.append(
-            f"{atype}: {astats['count']} samples, avg_error={astats.get('avg_error', 0):.2f}"
-        )
+        _hedged = _hedged_by_type.get(atype, 0)
+        _conf_n = _conf_count.get(atype, 0)
+        if _hedged and _conf_n:
+            _conf_avg = _conf_err_sum.get(atype, 0.0) / _conf_n
+            type_summaries.append(
+                f"{atype}: {astats['count']} samples, avg_error="
+                f"{astats.get('avg_error', 0):.2f} "
+                f"({_hedged} hedged, confident avg {_conf_avg:.2f})"
+            )
+        else:
+            type_summaries.append(
+                f"{atype}: {astats['count']} samples, avg_error="
+                f"{astats.get('avg_error', 0):.2f}"
+            )
 
     predictions = wm.data.get("predictions", [])
     active_preds = [p for p in predictions if not p.get("verified")]

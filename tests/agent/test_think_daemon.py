@@ -4703,6 +4703,51 @@ class TestFallbackSearchQuery:
         })
         assert result["search_query"] is None
 
+    def test_local_analysis_reports_hedges_separately(self, evolve_env: Dict) -> None:
+        # Regression: calibrated disjunctive hedges ("success or timeout: ...")
+        # score 0.4 by design during outages, so a raw avg_error overstates
+        # true prediction quality. The per-type summary must report hedged
+        # counts and confident-only avg_error so fallback cycles stop
+        # re-flagging honest uncertainty as a phantom prediction-bias weakness.
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        wm.data["action_triples"] = [
+            {
+                "action_type": "llm_call",
+                "expected_outcome": "success or timeout: LLM responds within 2 attempt(s) × 90s budget (outage tier 'deep')",
+                "actual_outcome": "failed: timeout after 2 attempt(s)",
+                "prediction_error": 0.4,
+                "completed": True,
+            },
+            {
+                "action_type": "llm_call",
+                "expected_outcome": "success or timeout: LLM responds within 2 attempt(s) × 90s budget (outage tier 'deep')",
+                "actual_outcome": "failed: timeout after 2 attempt(s)",
+                "prediction_error": 0.4,
+                "completed": True,
+            },
+            {
+                "action_type": "llm_call",
+                "expected_outcome": "success: LLM responds within 2 attempt(s) × 90s budget",
+                "actual_outcome": "succeeded on attempt 1 (12.0s)",
+                "prediction_error": 0.15,
+                "completed": True,
+            },
+        ]
+        wm._update_per_type_accuracy()
+        wm.save()
+        try:
+            result = td._local_analysis({
+                "self_model": {"capabilities": {"unknown_areas": []}},
+                "daemon_state": {"tick_count": 1, "last_action_output": ""},
+                "world_model": wm,
+            })
+            insight = result["insight"]
+            assert "2 hedged, confident avg 0.15" in insight, insight
+        finally:
+            wm.data["action_triples"] = []
+            wm.save()
+
 
 class TestRecordWebSearchTriple:
     """Gap 5: an executed web search must land in the world model as a
