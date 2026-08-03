@@ -4620,6 +4620,175 @@ class TestRecordWebSearchTriple:
         assert len(wm.data["action_triples"]) == 0
 
 
+class TestStdlibSearchFallback:
+    """Gap 5: the search phase must survive without third-party search
+    packages. The production daemon env has neither ``duckduckgo_search``
+    nor ``ddgs`` installed, so every search attempt logged
+    "No search module available" and no web_search triple ever landed.
+    ``_run_web_search`` now falls back to a stdlib-only Bing RSS fetch so
+    self-directed info seeking keeps working on a bare Python env.
+    """
+
+    RSS = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+    <item><title>First Result</title><link>https://example.com/1</link>
+    <description>First body text.</description></item>
+    <item><title>Second Result</title><link>https://example.com/2</link>
+    <description>Second body text.</description></item>
+    <item><title>Third Result</title><link>https://example.com/3</link>
+    <description>Third body text.</description></item>
+    </channel></rss>"""
+
+    def test_parses_rss_into_ddgs_shape(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        res = td._parse_search_rss(self.RSS, max_results=4)
+        assert [r["title"] for r in res] == ["First Result", "Second Result", "Third Result"]
+        assert res[0]["href"] == "https://example.com/1"
+        assert res[0]["body"] == "First body text."
+
+    def test_parses_rss_caps_at_max_results(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        res = td._parse_search_rss(self.RSS, max_results=2)
+        assert len(res) == 2
+        assert res[0]["title"] == "First Result"
+
+    def test_parses_empty_feed_to_empty_list(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._parse_search_rss(
+            b'<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>'
+        ) == []
+
+    def test_parses_missing_fields_to_empty_strings(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        res = td._parse_search_rss(
+            b'<?xml version="1.0"?><rss version="2.0"><channel><item></item></channel></rss>'
+        )
+        assert res == [{"title": "", "href": "", "body": ""}]
+
+    def test_search_stdlib_builds_request_and_parses(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        td = evolve_env["module"]
+        captured: Dict[str, Any] = {}
+
+        class _FakeResp:
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *a: Any) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return TestStdlibSearchFallback.RSS
+
+        def _fake_urlopen(req: Any, timeout: int = 20) -> _FakeResp:
+            captured["url"] = req.full_url
+            captured["ua"] = req.get_header("User-agent")
+            captured["timeout"] = timeout
+            return _FakeResp()
+
+        monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+        res = td._search_stdlib("github api docs", max_results=4)
+        assert "bing.com/search" in captured["url"]
+        assert "q=github" in captured["url"]
+        assert captured["ua"] == "hermes-evolved/1.0 (self-improving agent)"
+        assert captured["timeout"] == 20
+        assert res[0]["title"] == "First Result"
+
+    def test_run_web_search_uses_ddgs_when_available(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+        import types
+
+        td = evolve_env["module"]
+        fake_mod = types.ModuleType("duckduckgo_search")
+        instances: list = []
+
+        class _FakeDDGS:
+            def __init__(self) -> None:
+                instances.append(self)
+
+            def __enter__(self) -> "_FakeDDGS":
+                return self
+
+            def __exit__(self, *a: Any) -> bool:
+                return False
+
+            def text(self, query: str, max_results: int = 4) -> list:
+                self.called_with = (query, max_results)
+                return [{"title": "ddg", "href": "https://ddg", "body": "b"}]
+
+        fake_mod.DDGS = _FakeDDGS
+        real_import = builtins.__import__
+
+        def _fake_import(name: str, *a: Any, **kw: Any) -> Any:
+            if name == "duckduckgo_search":
+                return fake_mod
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        res = td._run_web_search("query", max_results=3)
+        assert res[0]["title"] == "ddg"
+        assert instances[0].called_with == ("query", 3)
+
+    def test_run_web_search_falls_back_on_import_error(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+
+        td = evolve_env["module"]
+        real_import = builtins.__import__
+
+        def _fake_import(name: str, *a: Any, **kw: Any) -> Any:
+            if name in ("duckduckgo_search", "ddgs"):
+                raise ImportError(f"No module named {name}")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        monkeypatch.setattr(
+            td, "_search_stdlib",
+            lambda q, max_results=4: [{"title": "fallback", "href": "https://fb", "body": "b"}],
+        )
+        res = td._run_web_search("query")
+        assert res[0]["title"] == "fallback"
+
+    def test_run_web_search_falls_back_on_ddgs_runtime_failure(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import builtins
+        import types
+
+        td = evolve_env["module"]
+        fake_mod = types.ModuleType("duckduckgo_search")
+
+        class _BrokenDDGS:
+            def __enter__(self) -> "_BrokenDDGS":
+                return self
+
+            def __exit__(self, *a: Any) -> bool:
+                return False
+
+            def text(self, query: str, max_results: int = 4) -> list:
+                raise RuntimeError("rate limited")
+
+        fake_mod.DDGS = _BrokenDDGS
+        real_import = builtins.__import__
+
+        def _fake_import(name: str, *a: Any, **kw: Any) -> Any:
+            if name == "duckduckgo_search":
+                return fake_mod
+            return real_import(name, *a, **kw)
+
+        monkeypatch.setattr(builtins, "__import__", _fake_import)
+        monkeypatch.setattr(
+            td, "_search_stdlib",
+            lambda q, max_results=4: [{"title": "fb2", "href": "https://fb2", "body": "b"}],
+        )
+        res = td._run_web_search("query")
+        assert res[0]["title"] == "fb2"
+
+
 
 
 class TestRotatingAutoCommands:

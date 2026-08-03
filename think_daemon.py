@@ -3912,6 +3912,77 @@ def _fallback_search_query(sm: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _parse_search_rss(data: bytes, max_results: int = 4) -> List[Dict[str, str]]:
+    """Parse a Bing-RSS web-search response into DDGS-shaped results.
+
+    Each result is a dict with ``title``/``href``/``body`` keys matching
+    the shape ``duckduckgo_search`` returns, so downstream consumers
+    (``_record_web_search_triple``, the fallback-insight join) are
+    backend-agnostic. Missing fields degrade to empty strings rather than
+    raising. Stdlib only (``xml.etree``).
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(data)
+    results: List[Dict[str, str]] = []
+    for item in root.iter("item"):
+        title = (item.findtext("title") or "").strip()
+        href = (item.findtext("link") or "").strip()
+        body = (item.findtext("description") or "").strip()
+        results.append({"title": title, "href": href, "body": body[:300]})
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _search_stdlib(query: str, max_results: int = 4) -> List[Dict[str, str]]:
+    """Zero-dependency web search fallback (Gap 5).
+
+    Queries Bing's RSS endpoint using stdlib only (``urllib`` +
+    ``xml.etree``) so info seeking survives on bare Python environments
+    without ``duckduckgo_search``/``ddgs`` installed. Raises on network or
+    parse failure; the search-phase caller's outer guard logs the failure
+    and continues without results (graceful degradation).
+    """
+    import urllib.parse
+    import urllib.request
+
+    url = (
+        "https://www.bing.com/search?q="
+        + urllib.parse.quote(query)
+        + "&format=rss"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "hermes-evolved/1.0 (self-improving agent)"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = resp.read()
+    return _parse_search_rss(data, max_results=max_results)
+
+
+def _run_web_search(query: str, max_results: int = 4) -> List[Dict[str, str]]:
+    """Execute a web search with backend fallback (Gap 5).
+
+    Tries ``duckduckgo_search`` (primary), then ``ddgs`` (the renamed
+    package), then a stdlib-only Bing RSS fetch. Returns DDGS-shaped
+    results (list of dicts with title/href/body). A total failure raises;
+    the search-phase caller logs and continues without search results.
+    """
+    try:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            from ddgs import DDGS
+        with DDGS() as ddgs:
+            return list(ddgs.text(query, max_results=max_results))
+    except ImportError:
+        logger.info("Search package unavailable; using stdlib Bing RSS fallback (Gap 5)")
+    except Exception as e:  # DDGS runtime failure (rate limit, etc.)
+        logger.info("Primary search backend failed (%s); using stdlib Bing RSS fallback", e)
+    return _search_stdlib(query, max_results=max_results)
+
+
 def _record_web_search_triple(
     wm: "WorldModel",
     query: str,
@@ -5576,15 +5647,7 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     if sq and isinstance(sq, str) and sq.strip():
         try:
             logger.info("Searching: %s", sq[:80])
-            try:
-                from duckduckgo_search import DDGS
-            except ImportError:
-                try:
-                    from ddgs import DDGS
-                except ImportError:
-                    raise ImportError("No search module available (try: pip install duckduckgo_search)")
-            with DDGS() as ddgs:
-                search_results = list(ddgs.text(sq, max_results=4))
+            search_results = _run_web_search(sq, max_results=4)
             # Gap 5: record the search execution as a world-model triple so
             # info seeking is observable and its reliability learnable
             # (mirrors the llm_call recording pattern above).
