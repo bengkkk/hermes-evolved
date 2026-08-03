@@ -4526,6 +4526,57 @@ class TestLocalAnalysisStateCheckCommands:
         assert out.startswith("exit=0:"), f"daemon command failed: {out[:200]}"
 
 
+class TestFallbackSearchQuery:
+    """Gap 5: the local-analysis fallback must keep self-directed info
+    seeking alive during LLM outages by deriving a search_query from the
+    self-model's unresolved ``unknown_areas``.
+
+    Regression: the fallback hardcoded ``search_query=None``, so the only
+    channel that can ask questions (the LLM) was the same channel that was
+    down — the daemon's open questions were never searched during outages,
+    and the search phase (4.5) had nothing to act on. The fallback now
+    derives a bounded query from the top unknown area instead.
+    """
+
+    def test_helper_returns_top_unknown_area(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        sm = {"capabilities": {"unknown_areas": [
+            "How to persist a plan across restarts",
+            "Whether the bridge restart has a dry-run path",
+        ]}}
+        assert td._fallback_search_query(sm) == "How to persist a plan across restarts"
+
+    def test_helper_returns_none_when_no_unknowns(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        assert td._fallback_search_query({"capabilities": {}}) is None
+        assert td._fallback_search_query({}) is None
+        assert td._fallback_search_query({"capabilities": {"unknown_areas": []}}) is None
+        assert td._fallback_search_query({"capabilities": {"unknown_areas": "not-a-list"}}) is None
+
+    def test_helper_trims_overlong_unknown(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        long_unknown = "x" * 500
+        q = td._fallback_search_query({"capabilities": {"unknown_areas": [long_unknown]}})
+        assert q is not None and len(q) == 200
+
+    def test_local_analysis_emits_search_query_from_unknowns(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        result = td._local_analysis({
+            "self_model": {"capabilities": {"unknown_areas": ["How to persist a plan"]}},
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+        })
+        assert result["search_query"] == "How to persist a plan"
+
+    def test_local_analysis_search_query_none_without_unknowns(self, evolve_env: Dict) -> None:
+        td = evolve_env["module"]
+        result = td._local_analysis({
+            "self_model": {"capabilities": {"unknown_areas": []}},
+            "daemon_state": {"tick_count": 1, "last_action_output": ""},
+        })
+        assert result["search_query"] is None
+
+
+
 class TestRotatingAutoCommands:
     """Every rotating auto-default command (module-level ``_ROTATING_AUTOS``)
     must pass pre-flight validation and execute successfully (exit=0).

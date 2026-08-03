@@ -3887,6 +3887,31 @@ def _local_plan_maintenance(tl: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _fallback_search_query(sm: Dict[str, Any]) -> Optional[str]:
+    """Pick a search query for the local-analysis fallback (Gap 5).
+
+    When the LLM is down it cannot ask its own questions, so the fallback
+    derives a query from the self-model's unresolved ``unknown_areas`` —
+    the system's own open questions — keeping the info-seeking channel
+    alive during outages instead of hardcoding ``search_query=None``
+    (the pre-Gap-5 behavior dropped the only self-directed query path
+    exactly when the LLM was unavailable).
+
+    Returns the top unresolved unknown area, or None when there are none
+    (nothing to seek).
+    """
+    unknowns = (sm.get("capabilities") or {}).get("unknown_areas") or []
+    if not isinstance(unknowns, list):
+        return None
+    for u in unknowns:
+        if isinstance(u, str) and u.strip():
+            q = u.strip()
+            # Keep the query bounded so a pathological unknown area cannot
+            # balloon the prompt or the DDGS call.
+            return q if len(q) <= 200 else q[:200]
+    return None
+
+
 def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a useful thinking-cycle result from local data only, no LLM call.
 
@@ -3905,6 +3930,8 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
       - A conservative plan_action via _local_plan_maintenance when a
         plan step's deliverable is verifiably committed/delivered on disk,
         so plan state does not go stale during LLM outages.
+      - A search_query derived from unknown_areas (Gap 5), so self-directed
+        info seeking continues during outages instead of being dropped.
     """
     wm: WorldModel = state.get("world_model", load_world_model())
     sm: dict = state.get("self_model", load_self_model())
@@ -4167,7 +4194,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
         "new_plan": None,
         "new_goal": new_goal,
         "goal_action": goal_action,
-        "search_query": None,
+        "search_query": _fallback_search_query(sm),
         "episodic_record": {
             "mtype": "observation",
             "summary": f"LLM call failed; used local fallback for cycle {tick_count}",
@@ -5525,19 +5552,34 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                     f"- {r['title']}: {r['body'][:200]} ({r['href']})"
                     for r in search_results
                 )
-                followup = (
-                    f"Search results for '{sq}':\n{search_text}\n\n"
-                    f"Given these results, produce your final JSON. "
-                    f"Include a refined insight field that incorporates this new information. "
-                    f"Set search_query to null in the final output."
-                )
-                messages.append({"role": "user", "content": followup})
-                raw2 = await _call_llm(messages)
-                if raw2:
-                    parsed2 = _try_parse_json(raw2)
-                    if parsed2:
-                        parsed = parsed2
-                        logger.info("Search incorporated into insight")
+                if result.get("llm_fallback"):
+                    # LLM is down (this is a fallback cycle), so a
+                    # refinement call cannot succeed — and burning the
+                    # retry budget on it would slow the outage cycle for
+                    # nothing. Preserve the results in the fallback
+                    # insight directly instead, so Gap 5 info seeking
+                    # still yields usable output during outages.
+                    _ins = parsed.get("insight")
+                    if isinstance(_ins, str):
+                        parsed["insight"] = (
+                            _ins + "\n[search] " + sq[:80] + " -> "
+                            + search_text[:500]
+                        )
+                        logger.info("Search results preserved in fallback insight")
+                else:
+                    followup = (
+                        f"Search results for '{sq}':\n{search_text}\n\n"
+                        f"Given these results, produce your final JSON. "
+                        f"Include a refined insight field that incorporates this new information. "
+                        f"Set search_query to null in the final output."
+                    )
+                    messages.append({"role": "user", "content": followup})
+                    raw2 = await _call_llm(messages)
+                    if raw2:
+                        parsed2 = _try_parse_json(raw2)
+                        if parsed2:
+                            parsed = parsed2
+                            logger.info("Search incorporated into insight")
         except Exception as e:
             logger.warning("Search failed: %s", e)
 
