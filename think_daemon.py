@@ -3615,10 +3615,50 @@ async def _call_llm(messages: list, task: str = "thinking") -> Optional[str]:
     return None
 
 
+# Read-gate staleness threshold for fallback cycles (Gap 10 commitment).
+# The committed per-cycle GET must not go silent during LLM outages: if the
+# most recent api_call triple is older than this, the fallback prefers the
+# read-gate GET over least-sampled diversity.  1500s ≈ 1.7 cycles at the
+# live 900s interval (2.5 cycles at the 600s default) — enough to keep the
+# gate live without monopolizing every fallback cycle.
+_READ_GATE_DUE_SECONDS = 1500
+
+
+def _read_gate_is_due(wm: WorldModel, now: Optional[datetime] = None) -> bool:
+    """True when the committed read-gate GET should fire this fallback cycle.
+
+    Due when there is no api_call triple yet (fresh calibration), or the
+    most recent one is older than ``_READ_GATE_DUE_SECONDS`` (the gate has
+    gone silent).  Conservative on parse errors: an unreadable timestamp
+    counts as due so the gate re-fires rather than stalling.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    try:
+        triples = (wm.data or {}).get("action_triples", [])
+    except Exception:
+        return True
+    last_ts = None
+    for t in reversed(triples or []):
+        if isinstance(t, dict) and t.get("action_type") == "api_call":
+            last_ts = t.get("timestamp")
+            break
+    if not last_ts:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last_ts))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        return (now - last_dt).total_seconds() >= _READ_GATE_DUE_SECONDS
+    except Exception:
+        return True
+
+
 def _select_state_check_action(
     wm: WorldModel,
     tick_count: int,
     commands: list[Dict[str, Any]],
+    read_gate_granted: bool = False,
 ) -> Dict[str, Any]:
     """Pick the fallback state-check action for this cycle.
 
@@ -3630,24 +3670,53 @@ def _select_state_check_action(
     52 of 77 triples while git_commit sat at 11 — the model's
     calibration is only as good as its least-sampled type.
 
+    Read-gate priority (Gap 10, 2026-08-03): when an ``api_call``
+    candidate is present, ``read_gate_granted`` is True (the permission
+    registry grants github.read — otherwise the call would only produce
+    BLOCKED triples), AND the read gate is due (stale or absent api_call
+    triples), the api_call candidate wins outright — this keeps the
+    committed per-cycle GET firing during LLM outages.  Observed drift:
+    ticks 491-496 (LLM down) all emitted git_commit auto-sync because
+    api_call had no slot in the rotation at all, so the read gate went
+    silent for 6 cycles despite the standing commitment.
+
     Falls back to the plain ``tick_count % len(commands)`` rotation when
     the world model has no calibration data yet (fresh install, hermetic
     test env) or per-type stats are unavailable, preserving the existing
     rotation semantics for those cases.
 
     Args:
-        wm: The loaded world model (used only for per-type sample counts).
+        wm: The loaded world model (used for per-type sample counts and
+            read-gate staleness).
         tick_count: Daemon tick number, used to rotate within a type and
             to break ties between equally-sampled types.
         commands: The candidate action dicts (``_state_check_commands``).
+        read_gate_granted: True when the permission registry grants read
+            on the api_call candidate's resource (github).  The read gate
+            only wins when it can actually execute.
 
     Returns:
         A copy of the chosen action dict.
     """
+    # Read-gate priority: the committed GET wins when it is due AND
+    # permitted, so LLM outages cannot silently starve the read gate
+    # (see docstring).  When the grant is absent the api_call candidate
+    # is removed entirely — it could only produce BLOCKED triples, and
+    # dropping it preserves the pre-Gap-10 rotation exactly (5 slots,
+    # same modulo positions).
+    if not read_gate_granted:
+        commands = [c for c in commands if c.get("type") != "api_call"]
     # Group commands by action type, preserving rotation order within type
     type_slots: Dict[str, list[int]] = {}
     for i, c in enumerate(commands):
         type_slots.setdefault(str(c.get("type", "shell")), []).append(i)
+
+    # Read-gate priority: the committed GET wins when it is due AND
+    # permitted, so LLM outages cannot silently starve the read gate
+    # (see docstring).
+    api_slots = type_slots.get("api_call") or []
+    if api_slots and read_gate_granted and _read_gate_is_due(wm):
+        return dict(commands[api_slots[tick_count % len(api_slots)]])
 
     per_type: Dict[str, Dict[str, Any]] = {}
     try:
@@ -3663,7 +3732,8 @@ def _select_state_check_action(
 
     # Only consider types that actually appear in the rotation
     known_types = [
-        t for t in ("shell", "git_commit", "write_file") if t in type_slots
+        t for t in ("shell", "git_commit", "write_file", "api_call")
+        if t in type_slots
     ]
     counts = {t: _count(t) for t in known_types}
 
@@ -3917,6 +3987,13 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             "description": "State check: daemon health and cycle statistics",
         },
         {
+            "type": "api_call",
+            "endpoint": "https://api.github.com/",
+            "method": "GET",
+            "body": {},
+            "description": "Read gate: committed per-cycle allowlisted GET to api.github.com (Gap 10, awaiting Level 3 grants)",
+        },
+        {
             "type": "git_commit",
             "message": "Auto-sync: evolve state snapshot at tick " + str(tick_count),
             "description": "Auto-commit evolve state files as a periodic checkpoint",
@@ -3946,12 +4023,24 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             "description": "State check: write evolve state snapshot for diagnostics",
         },
     ]
-    _action = _select_state_check_action(wm, tick_count, _state_check_commands)
+    # Read-gate priority needs the permission registry: the fallback only
+    # prefers the committed GET when github.read is actually granted
+    # (otherwise the api_call would be BLOCKED pre-flight every cycle).
+    _github_perm = (sm.get("permissions") or {}).get("github") or {}
+    _read_gate_granted = bool(_github_perm.get("read"))
+    _action = _select_state_check_action(
+        wm, tick_count, _state_check_commands, read_gate_granted=_read_gate_granted
+    )
     # Set expected outcome for prediction feedback — specific per action
     if _action["type"] == "git_commit":
         _action["expected_outcome"] = "exit=0: auto-sync commit of evolve state files (may be 'nothing to commit')"
     elif _action["type"] == "write_file":
         _action["expected_outcome"] = f"Wrote state snapshot ({len(_action.get('content', ''))} bytes)"
+    elif _action["type"] == "api_call":
+        _action["expected_outcome"] = (
+            "exit=0: HTTP 200 JSON root from api.github.com (~2.3 KB) "
+            "with current_user_url and rate_limit fields"
+        )
     elif "Goals" in _action.get("command", ""):
         _action["expected_outcome"] = "exit=0: list of current goals with their statuses and priorities"
     elif "Self Model" in _action.get("command", ""):

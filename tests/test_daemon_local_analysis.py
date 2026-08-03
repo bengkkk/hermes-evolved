@@ -131,7 +131,7 @@ class TestLocalAnalysis:
         # a rotating state-check command to keep collecting data
         assert result["action"] is not None
         assert "type" in result["action"]
-        assert result["action"]["type"] == "shell" or result["action"]["type"] == "write_file" or result["action"]["type"] == "git_commit"
+        assert result["action"]["type"] in ("shell", "write_file", "git_commit", "api_call")
         assert result["commitment"] is None
         assert result["outcome_to_record"] is None
         assert result["new_plan"] is None
@@ -286,7 +286,7 @@ class TestLocalAnalysis:
         # The fallback action type varies with the world model's per-type
         # sample counts (data-driven selection) — it must be one of the
         # supported rotation types.
-        assert result["action"]["type"] in ("shell", "git_commit", "write_file")
+        assert result["action"]["type"] in ("shell", "git_commit", "write_file", "api_call")
 
         # Mock subprocess so _apply_insights never executes a REAL shell
         # command or git commit against the workspace repo. Without this,
@@ -788,6 +788,120 @@ class TestLocalPlanMaintenance:
         }])
         result = _local_analysis(state)
         assert result["plan_action"] is None
+
+
+class TestReadGatePriority:
+    """Fallback cycles must keep firing the committed read-gate GET (Gap 10).
+
+    Regression (2026-08-03): ticks 491-496 (LLM outage) all emitted
+    git_commit auto-sync because api_call had no slot in the fallback
+    rotation — the committed per-cycle allowlisted GET went silent for 6
+    cycles.  The read gate must win when due (stale/absent api_call
+    triples) and defer to least-sampled diversity when recently fired.
+    """
+
+    def _commands_with_api(self):
+        """State-check command list including the read-gate api_call slot."""
+        from think_daemon import _READ_GATE_DUE_SECONDS  # noqa: F401 (used in helpers below)
+        return [
+            {"type": "shell", "command": "echo goals", "description": "goals"},
+            {"type": "git_commit", "message": "sync", "description": "sync"},
+            {"type": "write_file", "path": "/tmp/snap.txt", "content": "x", "description": "snap"},
+            {
+                "type": "api_call",
+                "endpoint": "https://api.github.com/",
+                "method": "GET",
+                "body": {},
+                "description": "read gate",
+            },
+        ]
+
+    def test_fresh_world_model_prefers_api_call(self):
+        """No api_call triples yet → the read-gate GET wins the rotation."""
+        from think_daemon import _select_state_check_action
+
+        wm = _make_wm_with_triples(count=6)  # shell + write_file only
+        action = _select_state_check_action(
+            wm, tick_count=0, commands=self._commands_with_api(), read_gate_granted=True
+        )
+        assert action["type"] == "api_call"
+        assert action["endpoint"] == "https://api.github.com/"
+
+    def test_stale_api_call_triple_prefers_api_call(self):
+        """Last api_call older than the staleness window → gate re-fires."""
+        from datetime import datetime, timedelta, timezone
+
+        from think_daemon import _READ_GATE_DUE_SECONDS, _select_state_check_action
+
+        wm = WorldModel()
+        tid = wm.record_action(
+            action_type="api_call",
+            action_description="old read gate",
+            expected_outcome="HTTP 200",
+        )
+        wm.complete_action(tid, "exit=0: HTTP 200")
+        # Backdate the triple well past the staleness window
+        old = datetime.now(timezone.utc) - timedelta(seconds=_READ_GATE_DUE_SECONDS + 600)
+        wm.data["action_triples"][-1]["timestamp"] = old.isoformat()
+
+        action = _select_state_check_action(
+            wm, tick_count=0, commands=self._commands_with_api(), read_gate_granted=True
+        )
+        assert action["type"] == "api_call"
+
+    def test_recent_api_call_defers_to_least_sampled(self):
+        """api_call fired recently → fall back to least-sampled diversity."""
+        from think_daemon import _select_state_check_action
+
+        wm = WorldModel()
+        # A recent api_call triple (now) — gate not due
+        tid = wm.record_action(
+            action_type="api_call",
+            action_description="recent read gate",
+            expected_outcome="HTTP 200",
+        )
+        wm.complete_action(tid, "exit=0: HTTP 200")
+        # git_commit is the least-sampled type (0 samples) → it must win
+        action = _select_state_check_action(
+            wm, tick_count=0, commands=self._commands_with_api(), read_gate_granted=True
+        )
+        assert action["type"] != "api_call"
+
+    def test_read_gate_ignored_without_grant(self):
+        """No github.read grant → api_call never wins (avoid BLOCKED spam)."""
+        from think_daemon import _select_state_check_action
+
+        wm = _make_wm_with_triples(count=6)  # no api_call triples → due, but no grant
+        action = _select_state_check_action(
+            wm, tick_count=0, commands=self._commands_with_api(), read_gate_granted=False
+        )
+        assert action["type"] != "api_call"
+
+    def _state_with_github_read(self, wm):
+        """State like _make_state but with the live github.read grant."""
+        state = _make_state(wm)
+        state["self_model"]["permissions"] = {
+            "github": {"read": True, "write": False, "act": False, "cap": None}
+        }
+        return state
+
+    def test_local_analysis_emits_api_call_when_gate_due(self):
+        """End-to-end: _local_analysis returns the read-gate GET when due."""
+        wm = _make_wm_with_triples(count=6)  # no api_call triples → due
+        state = self._state_with_github_read(wm)
+        result = _local_analysis(state)
+        assert result["action"]["type"] == "api_call"
+        assert result["action"]["endpoint"] == "https://api.github.com/"
+        assert "HTTP 200" in result["action"]["expected_outcome"]
+
+    def test_local_analysis_emits_expected_outcome_for_api_call(self):
+        """The api_call fallback action carries a specific expected outcome."""
+        wm = _make_wm_with_triples(count=6)
+        state = self._state_with_github_read(wm)
+        result = _local_analysis(state)
+        if result["action"]["type"] == "api_call":
+            assert "api.github.com" in result["action"]["expected_outcome"]
+            assert "HTTP 200" in result["action"]["expected_outcome"]
 
 
 

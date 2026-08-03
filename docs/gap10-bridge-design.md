@@ -160,6 +160,34 @@ classic PAT is already stored in `~/.git-credentials` on the host — zero new
 credential setup, immediately testable read-only (`gh api repos/...`), and
 code repositories are one of the highest-value Gap 10 resources.
 
+### Read-gate resilience during LLM outages (2026-08-03)
+
+Observed drift: the committed per-cycle read-gate GET (`api.github.com/`)
+went silent during the 6-cycle LLM outage (ticks 491-496, all git_commit
+auto-sync). Root cause: the fallback action selector
+(`_select_state_check_action`) only knew `shell`/`git_commit`/`write_file`
+— api_call had no slot in the fallback rotation, so the standing
+commitment "fire one allowlisted GET per cycle" could only be honored by
+the LLM path, which was down.
+
+Fix (think_daemon.py):
+- `_state_check_commands` gains an `api_call` read-gate candidate
+  (allowlisted `GET https://api.github.com/`, same endpoint the LLM path
+  uses).
+- `_select_state_check_action` gains a read-gate priority: when
+  `read_gate_granted` (permission registry grants github.read) AND the
+  gate is due (`_read_gate_is_due`: no api_call triple yet, or the most
+  recent is older than `_READ_GATE_DUE_SECONDS` = 1500s ≈ 1.7 cycles),
+  the api_call candidate wins outright — fallback cycles keep the read
+  gate alive during outages.
+- Without the grant the api_call candidate is removed entirely, so the
+  pre-Gap-10 rotation (5 slots) is preserved exactly and no BLOCKED
+  triple spam can occur.
+- New tests: `TestReadGatePriority` in tests/test_daemon_local_analysis.py
+  (fresh WM → GET wins; stale triple → GET re-fires; recent triple →
+  defers to least-sampled diversity; no grant → never api_call; end-to-end
+  via `_local_analysis`). 298 daemon + bridge tests pass.
+
 ## 6. Verification criteria
 
 - `api_call` passes pre-flight for allowlisted endpoints; unauthorized
