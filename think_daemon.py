@@ -3564,7 +3564,8 @@ def _record_plan_continuity_observation(
     # LLM cycle can never see it and step_3 would stay pending forever.
     # One-shot via log["completion_recorded"]; a later violation resets
     # the streak but must not double-record.
-    if log["window_complete"] and not log.get("completion_recorded"):
+    _completion_fired = bool(log["window_complete"]) and not log.get("completion_recorded")
+    if _completion_fired:
         log["completion_recorded"] = True
         log["completion"] = {
             "tick": tick,
@@ -3607,6 +3608,19 @@ def _record_plan_continuity_observation(
             )
         except Exception as e:
             logger.warning("Plan-continuity step completion failed (non-blocking): %s", e)
+
+    # The monitor's own completion is a completion like any other: if the
+    # auto-record just emptied the active-plan slot, this cycle's
+    # observation must reflect it (completed_this_cycle + pending
+    # reinstantiation) so the V2 empty-slot discipline applies to the
+    # monitor's deterministic completion too — the next LLM-backed cycle
+    # must create a replacement plan.
+    if _completion_fired:
+        active_after = None
+        slot_empty = True
+        completed_this_cycle = True
+        pending_now = True
+        log["pending_reinstantiation"] = True
 
     observations.append({
         "tick": tick,
