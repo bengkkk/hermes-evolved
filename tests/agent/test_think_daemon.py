@@ -2131,6 +2131,73 @@ class TestPruneSelfModel:
         assert removed == len(stale_commitments)
         assert sm["commitments"]["promised_features"] == keep_commitments
 
+    def test_subject_is_resolved_covers_gap10_bridge_healthcheck(
+        self, evolve_env: Dict
+    ) -> None:
+        """The Gap 10 bridge health-check/restart validation gap is resolved.
+
+        Regression for the 2026-08-03 stale-weakness accumulation: commit
+        08dabcb2b completed the bridge health-check/restart goal with live
+        evidence (bridge stopped -> scripts/bridge_healthcheck.py detected
+        DOWN -> restarted -> re-probed UP -> following allowlisted GET HTTP
+        200; goal_20260802151450_3 completed), yet self_model.json still
+        carried a weakness claiming the restart path was "not yet validated",
+        a DOWN-bridge simulation unknown, and two promised_features about
+        validating/recording the recovery procedure by 2026-08-10.  Those
+        must now resolve so _prune_self_model removes them, while the durable
+        DOWN-recovery policy and genuinely new health-check design questions
+        survive.
+        """
+        td = evolve_env["module"]
+        stale_entries = [
+            "The bridge health-check script is committed but its restart "
+            "path is not yet validated against a real/simulated bridge DOWN; "
+            "until validated, the automation is only partially proven.",
+            "Risk of over-planning the DOWN-bridge validation and "
+            "disrupting a healthy live bridge; must first inspect for a "
+            "safe simulation path.",
+            "Whether a controlled DOWN-bridge simulation is safe and what "
+            "its invocation looks like.",
+            "Complete validation of the bridge health-check/restart path by "
+            "2026-08-10 while maintaining one allowlisted GET per cycle.",
+            "Inspect for a safe DOWN-bridge simulation path before any live "
+            "shutdown; validate and record the recovery procedure by "
+            "2026-08-10.",
+        ]
+        keep_entries = [
+            # Durable operational policy — bridge DOWN handling, no
+            # validation/restart-path vocabulary.
+            "On any cycle where the bridge is DOWN, spend the first action "
+            "on a targeted bridge recovery probe (locate launcher/health "
+            "script, attempt restart), not on passive ls or a doomed "
+            "api_call.",
+            # Genuinely new design question — health-check feature work
+            # without resolved-validation vocabulary.
+            "Should the health-check script alert a human operator when "
+            "the bridge fails to come back up?",
+        ]
+        for entry in stale_entries:
+            assert td._subject_is_resolved(entry), entry[:80]
+        for entry in keep_entries:
+            assert not td._subject_is_resolved(entry), entry[:80]
+
+        sm = {
+            "capabilities": {
+                "weaknesses": stale_entries[:2],
+                "unknown_areas": stale_entries[2:3],
+            },
+            "commitments": {
+                "promised_features": stale_entries[3:] + keep_entries
+            },
+        }
+        removed = td._prune_self_model(
+            sm, daemon_state={"tick_count": 340, "last_output": {"fallback": False}}
+        )
+        assert removed == len(stale_entries)
+        assert sm["commitments"]["promised_features"] == keep_entries
+        assert sm["capabilities"]["weaknesses"] == []
+        assert sm["capabilities"]["unknown_areas"] == []
+
     def test_subject_is_resolved_covers_p3_retry_telemetry(
         self, evolve_env: Dict
     ) -> None:

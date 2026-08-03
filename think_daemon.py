@@ -1875,6 +1875,27 @@ _DOCUMENTED_SUBJECTS: tuple = (
             re.IGNORECASE,
         ),
     ),
+    # Gap 10 bridge health-check/restart validation — resolved 2026-08-03
+    # (commit 08dabcb2b: live DOWN -> scripts/bridge_healthcheck.py detected
+    # DOWN -> restarted (new pid) -> re-probed UP -> following allowlisted GET
+    # HTTP 200; docs/gap10-bridge-design.md §"Bridge health-check/restart
+    # automation" records the procedure; goal_20260802151450_3 completed).
+    # Entries claiming the restart path is "not yet validated", asking for a
+    # safe DOWN-bridge simulation path, or promising to validate/record the
+    # recovery procedure by 2026-08-10 restate established facts. The keyword
+    # gate keeps genuinely new design questions (new health-check features,
+    # different restart strategies) alive because they lack the
+    # resolved-validation vocabulary.
+    (
+        ("bridge health", "bridge_healthcheck", "health-check", "healthcheck",
+         "down-bridge", "bridge down", "restart path", "recovery procedure"),
+        "scripts/bridge_healthcheck.py",
+        "docs/gap10-bridge-design.md",
+        re.compile(
+            r"validat|restart|recovery|simulat|partial|not yet",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _RESOLVED_FACT_KEYWORDS = re.compile(
     r"path|locat|line count|structure|internal|loop|read|outline|unresolved",
