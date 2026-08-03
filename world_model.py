@@ -1700,10 +1700,17 @@ class WorldModel:
 
             # ── Recency-based decay: check if all high-error actions are old ──
             # Sort the type's actions by timestamp. If the 5 most recent actions
-            # of this type ALL have prediction_error <= 0.3 (i.e., they succeeded
-            # as expected), then the high-error pattern is likely historical noise.
-            # Without this, a few early failures keep triggering action guidance
-            # warnings forever, even after dozens of successful subsequent actions.
+            # of this type show no confident-wrong surprises — error <= 0.3, or
+            # a calibrated hedge (disjunctive "success or timeout: ..."
+            # predictions are scored 0.4 BY DESIGN, not as failures) — then the
+            # high-error pattern is likely historical noise.  Without the hedge
+            # exemption this check contradicted the mining filter above (which
+            # excludes hedges): a run of healthy-but-hedged llm_call triples
+            # (e.g. post-outage probing) kept a stale "2/91 llm_call high-error"
+            # pattern alive forever even though every recent call was either
+            # confident-correct or honestly hedged.  Consistent rule: a triple
+            # is a prediction failure only when it is confident-wrong (unhedged
+            # error >= 0.4).
             all_of_type_sorted = sorted(
                 [t for t in completed if t.get("action_type") == atype],
                 key=lambda t: t.get("timestamp", ""),
@@ -1712,6 +1719,7 @@ class WorldModel:
             if len(recent_of_type) >= 3:
                 recent_all_good = all(
                     t.get("prediction_error", 1.0) <= 0.3
+                    or _is_hedged_expected(t.get("expected_outcome") or "")
                     for t in recent_of_type
                 )
                 if recent_all_good:
@@ -2158,10 +2166,17 @@ class WorldModel:
                     )
 
         # 3. Recent action trend — last 3 actions of this type
+        # Calibrated hedges ("success or timeout: ...") are EXCLUDED: they are
+        # scored 0.4 by design (see _compute_prediction_error), so including
+        # them makes a properly-hedged probe — the CORRECT response to an
+        # unreliable endpoint — read as elevated prediction error and
+        # discourage the very probing that detects recovery.  A warning here
+        # must mean confident-wrong surprises only.
         recent = [
             t for t in self.data.get("action_triples", [])[-10:]
             if t.get("action_type") == action_type
             and t.get("completed") and t.get("prediction_error") is not None
+            and not _is_hedged_expected(t.get("expected_outcome") or "")
         ]
         if len(recent) >= 2:
             recent_errors = [t["prediction_error"] for t in recent[-3:]]

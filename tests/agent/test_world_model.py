@@ -621,6 +621,130 @@ class TestDiscrepancyPatterns:
         )
         assert llm_pattern["count"] == 3
 
+    def test_recent_hedged_llm_call_decays_stale_pattern(self) -> None:
+        """Calibrated hedges count as 'good' in the recency-decay check.
+
+        Regression: the mining filter excludes hedged triples ("success or
+        timeout: ...", scored 0.4 by design) from the high-error pool, but the
+        recency-decay check compared raw prediction_error against 0.3 — so a
+        run of healthy-but-hedged llm_call triples (post-outage probing) kept
+        a stale "2/91 llm_call high-error" pattern alive forever, re-triggering
+        "Investigate llm_call prediction failures" goals for a failure mode the
+        predictor already hedges.  A triple is a prediction failure only when
+        it is confident-wrong (unhedged error >= 0.4).
+        """
+        wm = WorldModel()
+        hedge_exp = (
+            "success or timeout: LLM responds within 2 attempt(s) × 90s budget "
+            "(outage tier 'healthy', 1/5 recent calls near-budget)"
+        )
+        # 2 old confident-wrong timeouts (0.85) — the historical pattern
+        for _ in range(2):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        # Pattern is present while the failure is recent
+        assert len(wm.get_discrepancy_patterns()) >= 1
+        # The predictor then learns to hedge: 5 recent hedged probes (0.4)
+        for _ in range(5):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)", hedge_exp
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (47.8s)")
+        patterns = wm.get_discrepancy_patterns()
+        assert len(patterns) == 0, (
+            "stale confident-wrong pattern must decay once recent calls are "
+            f"hedged/healthy, got {patterns}"
+        )
+
+    def test_recent_confident_wrong_llm_call_keeps_pattern(self) -> None:
+        """A recent confident-wrong surprise must NOT be decayed by the hedge rule.
+
+        Guard: exempting hedges from the recency check must not also hide a
+        genuinely recent confident failure — a flat "success:" that timed out
+        again is a live discrepancy no matter how many hedges surround it.
+        """
+        wm = WorldModel()
+        hedge_exp = (
+            "success or timeout: LLM responds within 2 attempt(s) × 90s budget "
+            "(outage tier 'healthy', 1/5 recent calls near-budget)"
+        )
+        # 2 old hedged probes (excluded from mining, populate the type)
+        for _ in range(2):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)", hedge_exp
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (30.0s)")
+        # 3 RECENT confident-wrong timeouts — the live failure
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        patterns = wm.get_discrepancy_patterns()
+        llm_pattern = next(
+            (p for p in patterns if p["action_type"] == "llm_call"), None
+        )
+        assert llm_pattern is not None, (
+            "recent confident-wrong triples must still surface as a pattern, "
+            f"got {patterns}"
+        )
+        assert llm_pattern["count"] == 3
+
+    def test_action_guidance_ignores_calibrated_hedges(self) -> None:
+        """The recent-trend risk check must not read hedges as failures.
+
+        Regression: during an outage the daemon's llm_call triples are mostly
+        calibrated hedges (0.4 by design).  The recent-trend warning averaged
+        raw prediction_error, so three hedged probes in a row (avg 0.40)
+        produced a false "⚠ Last 3 'llm_call' actions averaged 0.40 prediction
+        error" warning — discouraging the very probing that detects recovery.
+        """
+        wm = WorldModel()
+        hedge_exp = (
+            "success or timeout: LLM responds within 2 attempt(s) × 90s budget "
+            "(outage tier 'healthy', 1/5 recent calls near-budget)"
+        )
+        # 2 confident-correct, then 3 hedged — total avg 0.30 (< 0.4, so the
+        # per-type check stays silent and any warning must come from the
+        # recent-trend check)
+        for _ in range(2):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (15.0s)")
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)", hedge_exp
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (47.8s)")
+        warning = wm.format_action_guidance(
+            "llm_call", "LLM thinking call (adaptive retry policy)"
+        )
+        assert warning is None, (
+            "calibrated hedges must not produce an elevated-error warning, "
+            f"got: {warning}"
+        )
+
+    def test_action_guidance_warns_on_recent_confident_wrong(self) -> None:
+        """Recent confident-wrong surprises still trigger the trend warning."""
+        wm = WorldModel()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        warning = wm.format_action_guidance(
+            "llm_call", "LLM thinking call (adaptive retry policy)"
+        )
+        assert warning is not None
+        assert "Last 3" in warning and "averaged" in warning, warning
+
     def test_recurring_below_threshold_still_decayed(self) -> None:
         """2 identical failures (< min_recurrence=3) stay suppressed by the ratio check."""
         wm = WorldModel()
