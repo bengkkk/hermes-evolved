@@ -2884,6 +2884,16 @@ def _apply_insights(
             from agent.self_evolve import update_plan_step as _ups
             _ups(next((p["id"] for p in tl.get("future", {}).get("plans", []) if p.get("status") == "active"), ""),
                  pa["step_id"], new_status, pa.get("note", ""))
+            # Plan-continuity invariant (P3, goal_20260803174119_0): reload
+            # the timeline after a step update. update_plan_step now
+            # auto-completes a plan whose steps are all complete; the
+            # has_active guard for new_plan below must see that fresh state
+            # or a same-response new_plan is rejected against the stale
+            # in-memory copy, leaving the active-plan slot empty at end of
+            # cycle (the empty-slot trap — plan completion without
+            # reinstantiation).
+            tl = load_timeline()
+            state["timeline"] = tl
 
     # ── New plan creation ──
     np = result.get("new_plan")

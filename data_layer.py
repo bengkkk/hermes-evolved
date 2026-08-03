@@ -1696,6 +1696,16 @@ def update_plan_step(
                     total = len(p["steps"])
                     done = sum(1 for st in p["steps"] if st.get("status") == "complete")
                     p["progress"] = f"{done}/{total} steps"
+                    # Plan-continuity invariant (P3, goal_20260803174119_0):
+                    # a plan whose steps are ALL complete IS complete.
+                    # Auto-transition it so the active-plan slot frees up and
+                    # a same-cycle new_plan can be accepted (immediate plan
+                    # reinstantiation). Previously a 3/3-steps plan stayed
+                    # "active" forever and the daemon's has_active guard
+                    # rejected every replacement plan — the empty-slot trap.
+                    if total > 0 and done == total:
+                        p["status"] = "complete"
+                        p["completed_at"] = p.get("completed_at") or now_iso()
                     _save_timeline_dict(timeline)
                     return True
     return False

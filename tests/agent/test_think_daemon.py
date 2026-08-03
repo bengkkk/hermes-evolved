@@ -5507,6 +5507,178 @@ class TestAutoCreatePlanGuard:
         assert len(self._plans(td)) == 2  # failed one + new active one
 
 
+class TestPlanContinuityInvariant:
+    """P3 (goal_20260803174119_0): the active-plan slot must never remain
+    occupied by a finished plan nor empty after a plan completion.
+
+    Regression (2026-08-03): update_plan_step marked steps complete but never
+    transitioned the plan itself to "complete", so a 3/3-steps plan stayed
+    "active" forever.  The new_plan guard (has_active) then read the stale
+    in-memory timeline and rejected every same-response replacement plan —
+    the active-plan slot was permanently occupied by a done plan and plan
+    reinstantiation never happened.  Fix: update_plan_step auto-completes a
+    plan whose steps are all complete, and _apply_insights reloads the
+    timeline after a plan_action so the has_active guard sees fresh state.
+    """
+
+    def _make_state(self, wm=None) -> Dict[str, Any]:
+        return {
+            "daemon_state": {"tick_count": 5, "last_action_output": ""},
+            "world_model": wm,
+            "timeline": {
+                "version": 1,
+                "past": {"events": []},
+                "present": {},
+                "future": {"plans": []},
+            },
+            "self_model": {
+                "identity": {"name": "test", "role": "test"},
+                "state": {},
+                "capabilities": {"strengths": [], "weaknesses": [], "unknown_areas": []},
+                "commitments": {},
+            },
+            "orientation": {"vision": "Test", "phase": "test"},
+        }
+
+    def test_last_step_complete_accepts_same_response_new_plan(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Completing the final step frees the slot and a same-response
+        new_plan is accepted (immediate plan reinstantiation)."""
+        from data_layer import create_plan, get_active_plan, load_timeline_dict
+
+        td = evolve_env["module"]
+        steps = [
+            {"description": "Step 1", "verification": "V1"},
+            {"description": "Step 2", "verification": "V2"},
+        ]
+        old_pid = create_plan("Old plan", steps)
+        # Mark step_1 complete so the plan is at 1/2 → still active
+        from data_layer import update_plan_step
+
+        update_plan_step(old_pid, "step_1", "complete")
+
+        state = self._make_state()
+        # Reload the timeline so _apply_insights starts from disk truth
+        state["timeline"] = load_timeline_dict()
+
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "plan completes",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            # Complete the LAST step in the same response that proposes the
+            # replacement plan.
+            "plan_action": {"step_id": "step_2", "new_status": "complete", "note": ""},
+            "new_plan": {
+                "goal": "Replacement plan",
+                "steps": [{"description": "Run calibration check", "verification": "calibration report generated"}],
+            },
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "semantic_record": None,
+            "procedural_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        import subprocess
+
+        original_run = subprocess.run
+
+        def _mock_run(*a, **kw):
+            return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        try:
+            subprocess.run = _mock_run
+            updates = td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        # Old plan: complete, no longer active (slot freed).
+        assert get_active_plan() is not None, "replacement plan must be active"
+        active = get_active_plan()
+        assert active["goal"] == "Replacement plan"
+        # The old plan must be persisted as complete in the timeline.
+        data = load_timeline_dict()
+        old = next(p for p in data["future"]["plans"] if p["goal"] == "Old plan")
+        assert old["status"] == "complete"
+        assert old["steps"][1]["status"] == "complete"
+
+    def test_partial_completion_keeps_active_and_blocks_new_plan(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plan with pending steps stays active; a new_plan is rejected
+        (the slot is legitimately occupied)."""
+        from data_layer import create_plan, get_active_plan, load_timeline_dict
+
+        td = evolve_env["module"]
+        steps = [
+            {"description": "Step 1", "verification": "V1"},
+            {"description": "Step 2", "verification": "V2"},
+        ]
+        old_pid = create_plan("Old plan", steps)
+
+        state = self._make_state()
+        state["timeline"] = load_timeline_dict()
+
+        result = {
+            "action": None,
+            "fallback": True,
+            "insight": "partial",
+            "focus_next": "continue",
+            "confidence": 0.5,
+            "reasoning": "test",
+            "event_to_record": None,
+            "outcome_to_record": None,
+            "commitment": None,
+            "prediction": None,
+            "session_record": None,
+            # Only step_1 completes; step_2 pending → plan stays active.
+            "plan_action": {"step_id": "step_1", "new_status": "complete", "note": ""},
+            "new_plan": {
+                "goal": "Replacement plan",
+                "steps": [{"description": "Run calibration check", "verification": "calibration report generated"}],
+            },
+            "new_goal": None,
+            "goal_action": None,
+            "search_query": None,
+            "episodic_record": None,
+            "semantic_record": None,
+            "procedural_record": None,
+            "self_model_update": {"weakness": None, "unknown": None, "new_commitment": None},
+            "next_gap": None,
+        }
+
+        import subprocess
+
+        original_run = subprocess.run
+
+        def _mock_run(*a, **kw):
+            return type("_R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        try:
+            subprocess.run = _mock_run
+            td._apply_insights(result, state)
+        finally:
+            subprocess.run = original_run
+
+        active = get_active_plan()
+        assert active is not None
+        assert active["id"] == old_pid, "pending plan must remain active"
+        assert active["goal"] == "Old plan"
+        assert active["progress"] == "1/2 steps"
+
+
 class TestCleanPatternCyclesCounter:
     """daemon_state.clean_pattern_cycles tracks consecutive pattern-free cycles.
 

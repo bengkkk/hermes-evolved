@@ -1166,10 +1166,40 @@ class TestPlans:
         pid = create_plan("Test", steps)
         assert update_plan_step(pid, "step_1", "complete", "Done!") is True
 
+        # Completing the ONLY step completes the plan (plan-continuity
+        # invariant): the active-plan slot frees up for reinstantiation.
         active = get_active_plan()
+        assert active is None
+
+        data = load_timeline_dict()
+        plan = next(p for p in data["future"]["plans"] if p["id"] == pid)
+        assert plan["steps"][0]["status"] == "complete"
+        assert plan["steps"][0]["note"] == "Done!"
+        assert plan["progress"] == "1/1 steps"
+        assert plan["status"] == "complete"
+
+    def test_update_plan_step_partial_keeps_active(self, evolve_env: Dict) -> None:
+        steps = [
+            {"description": "Step 1", "verification": "V"},
+            {"description": "Step 2", "verification": "V"},
+        ]
+        pid = create_plan("Test", steps)
+        assert update_plan_step(pid, "step_1", "complete", "Done!") is True
+
+        # One of two steps complete → plan stays active, progress updates.
+        active = get_active_plan()
+        assert active is not None
         assert active["steps"][0]["status"] == "complete"
         assert active["steps"][0]["note"] == "Done!"
-        assert active["progress"] == "1/1 steps"
+        assert active["progress"] == "1/2 steps"
+        assert active["status"] == "active"
+
+        # Completing the last step completes the plan (continuity invariant).
+        assert update_plan_step(pid, "step_2", "complete") is True
+        assert get_active_plan() is None
+        data = load_timeline_dict()
+        plan = next(p for p in data["future"]["plans"] if p["id"] == pid)
+        assert plan["status"] == "complete"
 
     def test_update_nonexistent_step(self, evolve_env: Dict) -> None:
         pid = create_plan("Test", [{"description": "S1", "verification": "V"}])
