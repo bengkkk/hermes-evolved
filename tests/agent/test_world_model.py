@@ -1412,6 +1412,56 @@ class TestEvidenceBasedVerification:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Web-search prediction learn loop (Gap 5)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestWebSearchPredictionLearnLoop:
+    """Recorded ``web_search`` triples must feed the type-agnostic
+    predictor so info-seeking reliability becomes learnable (Gap 5):
+    once searches are recorded, ``predict_action_outcome`` returns a
+    data-driven prediction for the type with a learned sample count,
+    confidence, and success probability — no type-specific wiring.
+    """
+
+    def _wm_with_search_history(self) -> "WorldModel":
+        wm = WorldModel()
+        for i, (q, n) in enumerate([
+            ("github api", 4), ("llm retry", 3), ("bridge health", 2),
+            ("duckduckgo", 1), ("calibration", 4),
+        ]):
+            tid = wm.record_action(
+                "web_search", f"Web search: {q}",
+                "exit=0: web search returns at least 1 result",
+                expected_source="daemon",
+            )
+            wm.complete_action(tid, f"exit=0: {n} result(s); first: result {i}")
+        return wm
+
+    def test_web_search_type_appears_in_accuracy(self) -> None:
+        wm = self._wm_with_search_history()
+        pta = wm.get_per_type_accuracy()
+        assert "web_search" in pta
+        assert pta["web_search"]["count"] == 5
+
+    def test_predictor_learns_from_recorded_searches(self) -> None:
+        wm = self._wm_with_search_history()
+        pred = wm.predict_action_outcome(
+            "web_search", "Web search: some query",
+            parameters={"query": "some query", "max_results": 4},
+        )
+        assert pred["sample_count"] == 5
+        assert pred["avg_error"] is not None
+        assert pred["success_probability"] >= 0.7  # all searches succeeded
+        assert pred["predicted_outcome"] is not None
+
+    def test_predictor_unknown_type_returns_empty(self) -> None:
+        wm = WorldModel()
+        pred = wm.predict_action_outcome("web_search", "Web search: x")
+        assert pred["sample_count"] == 0
+        assert pred["predicted_outcome"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ═══════════════════════════════════════════════════════════════════
 
