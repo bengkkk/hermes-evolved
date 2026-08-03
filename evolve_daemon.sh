@@ -278,7 +278,16 @@ case "${1:-status}" in
                 cmd_bridge_stop || true
                 cmd_bridge_start
                 ;;
-            *) echo "usage: $0 bridge {start [--port N] | stop | status | restart}" >&2; exit 2 ;;
+            healthcheck)
+                # Gap 10 resilience: probe the host bridge; restart it if
+                # DOWN. Delegates to the standalone stdlib-only script so
+                # the same probe/restart/re-probe path works from cron, the
+                # daemon, or a human shell. Extra args (e.g. --check-only)
+                # pass straight through to the script.
+                shift 2
+                .venv/bin/python3 scripts/bridge_healthcheck.py "$@"
+                ;;
+            *) echo "usage: $0 bridge {start [--port N] | stop | status | restart | healthcheck [--check-only]}" >&2; exit 2 ;;
         esac
         ;;
     permissions)
@@ -289,7 +298,7 @@ case "${1:-status}" in
         .venv/bin/python3 evolve_permissions.py "$@"
         ;;
     *)
-        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop | bridge {start [--port N] | stop | status | restart} | permissions {show | grant | revoke | check}}" >&2
+        echo "usage: $0 {start [--interval SECONDS] | restart [--interval SECONDS] | status | stop | bridge {start [--port N] | stop | status | restart | healthcheck [--check-only]} | permissions {show | grant | revoke | check}}" >&2
         exit 2
         ;;
 esac

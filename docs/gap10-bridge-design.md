@@ -188,6 +188,31 @@ Fix (think_daemon.py):
   defers to least-sampled diversity; no grant → never api_call; end-to-end
   via `_local_analysis`). 298 daemon + bridge tests pass.
 
+### Bridge health-check/restart automation (2026-08-03)
+
+Standalone recovery path for when the host bridge dies while the daemon is
+mid-cycle, asleep, or absent (the in-process `_bridge_ensure_running` only
+covers daemon-alive windows). Goal
+`goal_20260802151450_3` — "Automate host bridge health check and restart".
+
+Components:
+
+- `scripts/bridge_healthcheck.py` — stdlib-only probe → restart → re-probe
+  with deterministic exit codes (0 = UP at end, 1 = DOWN). Probe is
+  `GET {BRIDGE_URL}/bridge/v1/health`; restart reuses the launcher's own
+  path (`evolve_daemon.sh bridge restart`) so token/PID/log handling stays
+  consistent. `--check-only` probes without side effects.
+- `evolve_daemon.sh bridge healthcheck [--check-only]` — launcher entry
+  point that delegates to the script; makes recovery reachable on demand
+  (cron, daemon startup, or a human shell) as one shell action.
+
+Verified end-to-end 2026-08-03 (live, not just fake-bridge tests): bridge
+stopped → `scripts/bridge_healthcheck.py` detected DOWN, ran the restart,
+re-probed UP (new PID) → following allowlisted GET `https://api.github.com/`
+completed HTTP 200. Still-down path (restart can't recover) exits 1. Tests:
+`tests/test_bridge_healthcheck.py` (5), `tests/test_evolve_bridge.py` (22),
+daemon bridge/self-heal slice (22) — all green.
+
 ## 6. Verification criteria
 
 - `api_call` passes pre-flight for allowlisted endpoints; unauthorized
