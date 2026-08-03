@@ -1395,7 +1395,15 @@ def _build_thinking_prompt(state: Dict[str, Any]) -> str:
         c for c in tl_commits
         if c.get("status") == "active" and isinstance(c.get("what"), str)
     ]
-    timeline_commit_text = "; ".join(c["what"] for c in active_commits[:3]) if active_commits else "(none)"
+    # Newest active commitments first: add_commitment() appends (oldest →
+    # newest), so the tail of the list holds the CURRENT commitments. Taking
+    # the head would surface the OLDEST still-active rows — stale pre-grant
+    # read-gate commitments that shadow the actual current guidance (known
+    # weakness: stale commitments re-enter the prompt and reinforce fixation
+    # loops). The most recent active rows supersede older ones.
+    timeline_commit_text = (
+        "; ".join(c["what"] for c in active_commits[-3:]) if active_commits else "(none)"
+    )
 
     # Filter out stale/self-referential promised_features that trap the LLM in loops.
     # The LLM often adds items like "Verify data layer import" or "Complete step 1"

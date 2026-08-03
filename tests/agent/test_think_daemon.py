@@ -991,6 +991,32 @@ class TestBuildThinkingPrompt:
         prompt = td._build_thinking_prompt(state)
         assert "Write daemon tests" in prompt
 
+    def test_prompt_prefers_newest_active_commitments(self, evolve_env: Dict) -> None:
+        """The prompt must surface the MOST RECENT active commitments.
+
+        add_commitment() appends (oldest -> newest), so taking the head of
+        the active list would show stale pre-grant read-gate commitments
+        and shadow the current guidance (e.g. an old 'awaiting github.write
+        grant' row after that grant already landed). Regression test for the
+        active_commits[-3:] selection fix.
+        """
+        td = evolve_env["module"]
+        state = self._make_state()
+        state["timeline"]["present"]["commitments"] = [
+            {"what": "STALE: fire GET until github.write grant", "status": "active", "deadline": None},
+            {"what": "STALE: old read-gate steady state", "status": "active", "deadline": None},
+            {"what": "STALE: pre-grant calibration", "status": "active", "deadline": None},
+            {"what": "CURRENT: one GET per cycle while awaiting Level 3 grants", "status": "active", "deadline": None},
+        ]
+        prompt = td._build_thinking_prompt(state)
+        assert "CURRENT: one GET per cycle while awaiting Level 3 grants" in prompt
+        # The oldest stale row must not be the one surfaced at the front.
+        stale_idx = prompt.find("STALE: fire GET until github.write grant")
+        current_idx = prompt.find("CURRENT: one GET per cycle")
+        assert stale_idx == -1 or current_idx < stale_idx, (
+            "newest active commitment must be surfaced over stale older rows"
+        )
+
     def test_world_model_unavailable_graceful(self, evolve_env: Dict) -> None:
         """When world model fails to load, prompt should be graceful."""
         td = evolve_env["module"]
