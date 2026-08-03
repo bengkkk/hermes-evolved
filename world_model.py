@@ -463,6 +463,28 @@ def _command_changed_since(
     return " ".join(cur.split()) != " ".join(past_cmd.split())
 
 
+def _is_hedged_expected(expected: str) -> bool:
+    """True when the expected outcome is a deliberate disjunctive hedge.
+
+    Mirrors the success/failure marker detection used by the
+    disjunctive-prediction scoring in ``_compute_prediction_error``: an
+    expected string naming BOTH a success branch and a failure branch
+    (``"success or timeout: ..."``) is a calibrated hedge emitted when the
+    predictor is honestly unsure — not a confident prediction.
+
+    Used by the discrepancy-pattern miner to keep calibrated uncertainty
+    out of the "prediction failure" pool: a hedge that resolves to one of
+    its named branches is honest calibration (scored 0.4 by design), NOT a
+    discrepancy.  Only confident-wrong surprises (e.g. ``"success: ..."``
+    that timed out) are genuine prediction failures.
+    """
+    e = (expected or "").lower()
+    return bool(
+        re.search(r"\b(success|succeed|ok)\b", e)
+        and re.search(r"\b(timeout|fail|error)\b", e)
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  WorldModel class
 # ═══════════════════════════════════════════════════════════════════
@@ -1615,7 +1637,21 @@ class WorldModel:
             return
 
         # ─ Group high-error triples (>= 0.4) by action type ──
-        high_error = [t for t in completed if t["prediction_error"] >= 0.4]
+        # Deliberate hedges ("success or timeout: ...") are EXCLUDED: a
+        # disjunctive prediction resolving to one of its named branches is
+        # calibrated uncertainty (0.4 by design), not a prediction failure.
+        # Counting hedges as discrepancies inflated the pattern (observed
+        # 2026-08-03: 44/89 llm_call triples "high error" while the endpoint
+        # was in a genuine multi-hour outage and every hedge resolved to a
+        # named branch), auto-creating spurious "Investigate llm_call
+        # prediction failures" goals and a "Systematic prediction bias"
+        # self-model weakness.  The miner must surface confident-wrong
+        # surprises only — e.g. a flat "success: ..." that timed out.
+        high_error = [
+            t for t in completed
+            if t["prediction_error"] >= 0.4
+            and not _is_hedged_expected(t.get("expected_outcome") or "")
+        ]
         by_type: Dict[str, List[Dict[str, Any]]] = {}
         for t in high_error:
             atype = t.get("action_type", "unknown")

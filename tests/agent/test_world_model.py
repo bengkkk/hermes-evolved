@@ -546,6 +546,81 @@ class TestDiscrepancyPatterns:
         )
         assert "recurring" in shell_pattern["description"]
 
+    def test_hedged_llm_call_triples_not_counted_as_discrepancy(self) -> None:
+        """Deliberate hedges are calibrated uncertainty, not prediction failures.
+
+        The daemon emits \"success or timeout: ...\" when the LLM endpoint is
+        unreliable; _compute_prediction_error scores such disjunctive
+        predictions 0.4 by design (confident-correct 0.15 < hedge 0.4 <
+        confident-wrong 0.85) whichever branch realizes.  The discrepancy
+        miner must NOT count these as failures — doing so inflated the
+        production pattern to 44/89 llm_call \"high error\" during a genuine
+        multi-hour endpoint outage and auto-created spurious
+        \"Investigate llm_call prediction failures\" goals and a
+        \"Systematic prediction bias\" self-model weakness.
+        """
+        wm = WorldModel()
+        hedge_exp = (
+            "success or timeout: LLM responds within 2 attempt(s) × 90s budget "
+            "(outage tier 'healthy', 1/5 recent calls near-budget)"
+        )
+        # 3 hedged predictions resolving to NAMED branches (success + timeout)
+        for i in range(3):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)", hedge_exp
+            )
+            actual = (
+                "succeeded on attempt 1 (47.8s)"
+                if i % 2 == 0
+                else "failed: timeout after 2 attempt(s)"
+            )
+            wm.complete_action(tid, actual)
+        # Sanity: these really are 0.4 hedged triples
+        llm = [
+            t for t in wm.data["action_triples"]
+            if t.get("action_type") == "llm_call"
+        ]
+        assert len(llm) == 3
+        assert all(t["prediction_error"] == 0.4 for t in llm)
+        # No discrepancy pattern may be mined from calibrated hedges
+        patterns = wm.get_discrepancy_patterns()
+        llm_pattern = next(
+            (p for p in patterns if p["action_type"] == "llm_call"), None
+        )
+        assert llm_pattern is None, (
+            f"hedged triples must not form a discrepancy pattern, got {patterns}"
+        )
+
+    def test_confident_wrong_llm_call_still_surfaces(self) -> None:
+        """A flat confident prediction that times out is a REAL discrepancy.
+
+        Guard for the hedge-exclusion fix: excluding \"success or timeout\"
+        hedges must not also hide confident-wrong surprises.  A bare
+        \"success: ...\" expected outcome that resolves to a timeout scores
+        0.85 and must still be mined into a pattern.
+        """
+        wm = WorldModel()
+        confident_exp = "success: LLM responds within 2 attempt(s) × 90s budget"
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call", "LLM thinking call (adaptive retry policy)", confident_exp
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        llm = [
+            t for t in wm.data["action_triples"]
+            if t.get("action_type") == "llm_call"
+        ]
+        assert len(llm) == 3
+        assert all(t["prediction_error"] == 0.85 for t in llm)
+        patterns = wm.get_discrepancy_patterns()
+        llm_pattern = next(
+            (p for p in patterns if p["action_type"] == "llm_call"), None
+        )
+        assert llm_pattern is not None, (
+            "confident-wrong triples must still surface as a discrepancy pattern"
+        )
+        assert llm_pattern["count"] == 3
+
     def test_recurring_below_threshold_still_decayed(self) -> None:
         """2 identical failures (< min_recurrence=3) stay suppressed by the ratio check."""
         wm = WorldModel()
