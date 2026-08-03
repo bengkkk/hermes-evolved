@@ -1193,6 +1193,20 @@ class WorldModel:
         avg_trip_err = acc.get("avg_triple_error", 0.0)
 
         parts.append("## World Model State")
+        # Tell the LLM where the triple store actually lives. Without this
+        # pointer, cycles wasted 3+ turns hunting for "the triple-store
+        # schema" in state.db (the Hermes SQLite session store) when the
+        # world-model action triples/predictions are JSON in
+        # evolve/world_model.json (2026-08-03 observation).
+        try:
+            store_path = self.storage_path()
+        except Exception:
+            store_path = None
+        if store_path is not None:
+            parts.append(
+                f"  Triple store: {store_path} (JSON; action triples and "
+                f"predictions live here — NOT in state.db)"
+            )
         if total_preds > 0:
             # Count uncertain auto-verifications
             uncertain = sum(
