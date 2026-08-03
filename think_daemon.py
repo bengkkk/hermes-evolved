@@ -3449,6 +3449,17 @@ def _record_plan_continuity_observation(
     observations complete the verification window that closes the P3
     goal's closing evidence (plan_20260803184432 step_2).
 
+    Closing-evidence auto-record: when the window completes, the result
+    is recorded deterministically in the same call — a timeline event
+    (type "verify") is appended and step_3 of plan_20260803184432
+    ("Record the 20-cycle verification result") is marked complete via
+    data_layer.update_plan_step (which auto-completes the plan once all
+    steps are complete).  This must NOT depend on a future LLM cycle:
+    ``window_complete`` is never injected into the LLM prompt, so an
+    LLM cycle could never see it.  Guarded one-shot by
+    ``log["completion_recorded"]`` so a later streak reset (violation)
+    does not double-record.
+
     Checks:
       V1 — no *active* plan may have all steps complete (auto-complete
            failed to fire — the finished-plan-still-active trap).
@@ -3545,6 +3556,57 @@ def _record_plan_continuity_observation(
     log["window_complete"] = bool(
         not violations and log.get("consecutive_clean", 0) >= _PLAN_CONTINUITY_WINDOW
     )
+
+    # P3 closing-evidence auto-record (plan_20260803184432 step_3): the
+    # verification window completing IS the evidence. Record it here
+    # deterministically instead of waiting for a future LLM cycle — the
+    # window_complete flag is never injected into the LLM prompt, so an
+    # LLM cycle can never see it and step_3 would stay pending forever.
+    # One-shot via log["completion_recorded"]; a later violation resets
+    # the streak but must not double-record.
+    if log["window_complete"] and not log.get("completion_recorded"):
+        log["completion_recorded"] = True
+        log["completion"] = {
+            "tick": tick,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "consecutive_clean": log.get("consecutive_clean", 0),
+            "window_target": _PLAN_CONTINUITY_WINDOW,
+        }
+        try:
+            from data_layer import record_event as _dl_record_event
+            _dl_record_event(
+                "verify",
+                "Plan-continuity window COMPLETE: %d consecutive clean cycles "
+                "(target %d), 0 violations — P3 goal_20260803174119_0 closing "
+                "evidence recorded; plan_20260803184432 step_3 auto-completed."
+                % (log.get("consecutive_clean", 0), _PLAN_CONTINUITY_WINDOW),
+                "Active-plan-slot invariant held across the full verification "
+                "window; step_3 recorded by the daemon monitor (deterministic, "
+                "not LLM-dependent).",
+            )
+        except Exception as e:
+            logger.warning("Plan-continuity completion event failed (non-blocking): %s", e)
+        try:
+            from data_layer import update_plan_step as _dl_update_plan_step
+            # The window completing satisfies BOTH remaining verification
+            # steps: step_2 ("Monitor 20 consecutive daemon cycles") and
+            # step_3 ("Record the 20-cycle verification result").  Mark
+            # both so the plan auto-completes at 3/3 (update_plan_step
+            # transitions a plan whose steps are all complete).
+            _dl_update_plan_step(
+                "plan_20260803184432", "step_3", "complete",
+                "Auto-recorded by plan-continuity monitor: verification window "
+                "completed at tick %d (%d clean cycles)."
+                % (tick, log.get("consecutive_clean", 0)),
+            )
+            _dl_update_plan_step(
+                "plan_20260803184432", "step_2", "complete",
+                "Satisfied by monitor: %d consecutive clean observations "
+                "(target %d) with no violations."
+                % (log.get("consecutive_clean", 0), _PLAN_CONTINUITY_WINDOW),
+            )
+        except Exception as e:
+            logger.warning("Plan-continuity step completion failed (non-blocking): %s", e)
 
     observations.append({
         "tick": tick,
@@ -6120,14 +6182,26 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     # 7.5 Plan-continuity invariant observation (P3, goal_20260803174119_0)
     # Recorded after the timeline and daemon state are persisted so the
     # observation reflects the cycle's final on-disk state. Best-effort:
-    # a monitor failure must never fail the cycle.
+    # a monitor failure must never fail the cycle.  The returned log is
+    # surfaced into daemon_state.last_output.plan_continuity so the next
+    # cycle (LLM-backed or local-analysis) can see the verification
+    # window's progress and completion without re-reading the monitor file.
     try:
-        _record_plan_continuity_observation(
+        _pc_log = _record_plan_continuity_observation(
             ds.get("tick_count", 0),
             parsed,
             _active_plan_before,
             updates.get("timeline", state.get("timeline", {})),
         )
+        if isinstance(_pc_log, dict):
+            ds["last_output"]["plan_continuity"] = {
+                "window_target": _pc_log.get("window_target", _PLAN_CONTINUITY_WINDOW),
+                "consecutive_clean": _pc_log.get("consecutive_clean", 0),
+                "window_complete": bool(_pc_log.get("window_complete")),
+                "completion_recorded": bool(_pc_log.get("completion_recorded")),
+                "last_violation": _pc_log.get("last_violation"),
+            }
+            save_daemon_state(ds)
     except Exception as e:
         logger.warning("Plan-continuity observation failed (non-blocking): %s", e)
 

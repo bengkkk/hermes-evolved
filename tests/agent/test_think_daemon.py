@@ -6090,6 +6090,74 @@ class TestPlanContinuityMonitor:
         assert log["consecutive_clean"] == 20
         assert len(log["observations"]) == 20
 
+    def test_window_completion_auto_records_closing_evidence(
+        self, evolve_env: Dict
+    ) -> None:
+        """When the 20-cycle window completes, the monitor deterministically
+        records the verification result — a timeline event plus step_3 of
+        plan_20260803184432 marked complete (which auto-completes the plan)
+        — instead of leaving the closing evidence to a future LLM cycle that
+        can never observe window_complete (it is not injected into the LLM
+        prompt).  One-shot: a later clean cycle must not double-record.
+        """
+        td = evolve_env["module"]
+        plan = {
+            "id": "plan_20260803184432",
+            "goal": "Verify plan-continuity invariant over 20 daemon cycles "
+                    "(P3 goal_20260803174119_0 closing evidence)",
+            "steps": [
+                {"id": "step_1", "description": "Confirm restart", "status": "complete"},
+                {"id": "step_2", "description": "Monitor 20 consecutive daemon cycles",
+                 "status": "in_progress"},
+                {"id": "step_3", "description": "Record the 20-cycle verification result",
+                 "status": "pending"},
+            ],
+            "status": "active",
+            "progress": "2/3 steps",
+        }
+        tl = {
+            "version": 1,
+            "past": {"events": []},
+            "present": {},
+            "future": {"plans": [plan]},
+        }
+        # Persist the timeline so data_layer.update_plan_step (which reads
+        # from disk, not the in-memory dict) can find the plan.
+        td.save_timeline(tl)
+        parsed = {"plan_action": None, "new_plan": None}
+        log = None
+        for i in range(20):
+            log = td._record_plan_continuity_observation(
+                200 + i, parsed, "plan_20260803184432", tl
+            )
+        assert log["window_complete"] is True
+        assert log["completion_recorded"] is True
+        assert log["completion"]["tick"] == 219
+        assert log["completion"]["consecutive_clean"] == 20
+
+        # Closing evidence landed on disk: step_3 complete, plan auto-complete,
+        # verify event appended.
+        disk_tl = td.load_timeline()
+        plan_on_disk = next(
+            p for p in disk_tl["future"]["plans"]
+            if p["id"] == "plan_20260803184432"
+        )
+        step3 = next(s for s in plan_on_disk["steps"] if s["id"] == "step_3")
+        assert step3["status"] == "complete"
+        assert step3.get("note", "").startswith("Auto-recorded by plan-continuity")
+        assert plan_on_disk["status"] == "complete"
+        assert any(e.get("type") == "verify" for e in disk_tl["past"]["events"])
+
+        # One-shot: a further clean cycle does not double-record.
+        log = td._record_plan_continuity_observation(220, parsed, None, tl)
+        assert log["completion_recorded"] is True
+        assert log["completion"]["tick"] == 219
+        verify_events = [
+            e for e in td.load_timeline()["past"]["events"]
+            if e.get("type") == "verify"
+        ]
+        assert len(verify_events) == 1
+
     def test_observation_log_capped_at_40(self, evolve_env: Dict) -> None:
         td = evolve_env["module"]
         tl = self._timeline([
