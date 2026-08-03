@@ -140,6 +140,15 @@ _DEFAULT_DAEMON_STATE: Dict[str, Any] = {
     "last_output": None,
     "cycle_history": [],  # list of {timestamp, status, error, duration, tick_count} — last 20
     "consecutive_fallback_cycles": 0,  # How many consecutive cycles used local fallback (LLM unavailable)
+    # How many consecutive completed cycles ended with ZERO discrepancy
+    # patterns.  Incremented once per cycle in _run_cycle_body step 7 from
+    # the world model's live discrepancy_patterns; reset to 0 the first
+    # cycle a pattern appears.  Gives the llm_call error-reduction plan's
+    # "no llm_call discrepancy pattern for 5 consecutive cycles"
+    # verification a programmatic counter instead of a manual JSON read
+    # every cycle (added 2026-08-03 while closing the hedge-aware decay
+    # loop; the pattern has been clean for 2 cycles as of tick 534).
+    "clean_pattern_cycles": 0,
 }
 
 # ── Adaptive LLM retry policy ──
@@ -5609,12 +5618,27 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     ds["last_tick"] = now_ts
     ds["tick_count"] = ds.get("tick_count", 0) + 1
     ds["status"] = "ok"
+    # 7.1 Consecutive clean-pattern counter (plan verification)
+    # The llm_call error-reduction plan requires "no llm_call discrepancy
+    # pattern for 5 consecutive cycles" before closing the P3 goal; the
+    # world model's discrepancy_patterns list is the single source of
+    # truth.  Increment once per completed cycle when the list is empty,
+    # reset on the first cycle a pattern appears.  Read fresh from the
+    # in-memory world model so both llm-backed and local-analysis cycles
+    # update it identically.
+    _patterns_now = wm.get_discrepancy_patterns()
+    ds["clean_pattern_cycles"] = (
+        ds.get("clean_pattern_cycles", 0) + 1
+        if not _patterns_now
+        else 0
+    )
     ds["last_output"] = {
         "insight": parsed.get("insight", ""),
         "focus_next": parsed.get("focus_next", ""),
         "confidence": parsed.get("confidence", 0),
         "next_gap": parsed.get("next_gap"),
         "reasoning": parsed.get("reasoning"),
+        "clean_pattern_cycles": ds["clean_pattern_cycles"],
     }
     ds["last_output"]["fallback"] = result.get("llm_fallback", False)
     # Inject fallback recovery note (set when LLM came back after consecutive fallbacks)

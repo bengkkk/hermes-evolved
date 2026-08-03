@@ -5241,3 +5241,116 @@ class TestAutoCreatePlanGuard:
         assert get_active_plan() is not None, "failed goal may be re-planned"
         assert len(self._plans(td)) == 2  # failed one + new active one
 
+
+class TestCleanPatternCyclesCounter:
+    """daemon_state.clean_pattern_cycles tracks consecutive pattern-free cycles.
+
+    The llm_call error-reduction plan's closing gate is "no llm_call
+    discrepancy pattern for 5 consecutive cycles"; without a counter that
+    verification was a manual JSON read every cycle.  ``_run_cycle_body``
+    step 7 now increments ``clean_pattern_cycles`` when the world model's
+    live discrepancy_patterns list is empty and resets it to 0 on the
+    first cycle a pattern appears (both llm-backed and local-analysis
+    paths converge on the same code).
+    """
+
+    _VALID_JSON = json.dumps({
+        "insight": "test insight",
+        "self_model_update": [],
+        "timeline_update": {"events": []},
+        "goals_update": [],
+        "search_query": "",
+        "action": None,
+        "prediction": None,
+    })
+
+    async def _run_cycle(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple:
+        td = evolve_env["module"]
+
+        async def _fake_llm(messages: list, task: str = "thinking") -> str:
+            return self._VALID_JSON
+
+        monkeypatch.setattr(td, "_call_llm", _fake_llm)
+
+        result = {"status": "ok", "tick_duration": 0, "insight": None, "error": None}
+        ds = td.load_daemon_state()
+        ds.setdefault(
+            "cycle_stats",
+            {"total": 0, "ok": 0, "error": 0, "parse_error": 0,
+             "avg_duration": 0.0, "max_duration": 0.0},
+        )
+        # The LLM-backed path executes an action via subprocess; mock it
+        # (same pattern as TestCycleBodyEmptyLlmResponse) for hermeticity.
+        import subprocess
+
+        original_run = subprocess.run
+
+        def _mock_run(*a, **kw):
+            return type("_R", (), {"returncode": 0, "stdout": "mocked\n", "stderr": ""})()
+
+        try:
+            subprocess.run = _mock_run
+            result = await td._run_cycle_body(result, ds)
+        finally:
+            subprocess.run = original_run
+
+        return result, ds
+
+    def test_increments_on_clean_cycle(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cycle ending with zero discrepancy patterns bumps the counter."""
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        assert wm.get_discrepancy_patterns() == []  # fresh store: no patterns
+
+        _, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        assert ds["clean_pattern_cycles"] == 1, ds
+        assert ds["last_output"]["clean_pattern_cycles"] == 1, ds["last_output"]
+
+    def test_resets_when_pattern_appears(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cycle where a discrepancy pattern exists resets the counter to 0."""
+        td = evolve_env["module"]
+
+        # Seed a real discrepancy: 3 identical unhedged confident-wrong
+        # llm_call triples (recurrence >= 3 bypasses the ratio-decay
+        # suppression, so the miner must surface a pattern).
+        wm = td.load_world_model()
+        for _ in range(3):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                expected_outcome="success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                prediction_confidence=0.5,
+            )
+            wm.complete_action(tid, "failed: timeout after 2 attempt(s)")
+        wm.save()
+        patterns = wm.get_discrepancy_patterns()
+        assert any(p.get("action_type") == "llm_call" for p in patterns), patterns
+
+        # Pre-seed the counter at 4 so the reset is observable.
+        ds0 = td.load_daemon_state()
+        ds0["clean_pattern_cycles"] = 4
+        td.save_daemon_state(ds0)
+
+        _, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+
+        assert ds["clean_pattern_cycles"] == 0, ds
+
+    def test_persisted_across_save(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The counter survives a daemon_state round-trip."""
+        td = evolve_env["module"]
+        _, ds = asyncio.run(self._run_cycle(evolve_env, monkeypatch))
+        td.save_daemon_state(ds)
+
+        reloaded = td.load_daemon_state()
+        assert reloaded["clean_pattern_cycles"] == 1, reloaded
+
