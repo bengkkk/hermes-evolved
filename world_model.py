@@ -2468,6 +2468,14 @@ class WorldModel:
         # all buckets exceeds the number of actually-verified predictions
         # (correct + incorrect), some entries are stale.
         result._clean_stale_calibration_buckets()
+        # Backfill calibration buckets from completed action triples if
+        # the stored curve is meaningfully short.  error_history and
+        # per_type_accuracy are already rebuilt from the triples above;
+        # the confidence-vs-error curve is the one derived cache that
+        # was never repopulated, so after a reset/wipe the calibration
+        # guidance stays blind until N new actions complete (observed
+        # 2026-08-03: 200 triples on disk, buckets held 1 sample).
+        result._backfill_calibration_from_triples()
         return result
 
     def _backfill_error_history(self) -> None:
@@ -2492,6 +2500,56 @@ class WorldModel:
         logger.info(
             "Backfilled error_history from %d → %d entries (%d completed triples)",
             len(history), len(new_history), len(completed),
+        )
+
+    def _backfill_calibration_from_triples(self) -> None:
+        """Rebuild the confidence-vs-error calibration curve from completed
+        action triples when the stored curve is meaningfully short.
+
+        Mirrors :meth:`_backfill_error_history`: ``calibration_buckets``
+        and ``action_triple_calibrations`` are derived caches whose
+        authoritative source is the action triples (each completed triple
+        stores ``prediction_confidence`` + ``prediction_error``).  After a
+        schema upgrade, a data reset, or the stale-bucket cleaner wiping
+        legacy pollution, the curve can be empty or nearly so even though
+        hundreds of triples carry the exact (confidence, error) pairs the
+        curve needs.  Until enough NEW actions complete, the calibration
+        guidance (``format_calibration_guidance``) reports no data and the
+        confidence-band calibration goal stays blind.
+
+        The rebuild is conservative: it only fires when the bucket total is
+        meaningfully shorter than the number of calibratable triples
+        (gap >= 3), matching the ``_backfill_error_history`` threshold, so
+        live-updated buckets are never clobbered for off-by-one drift.
+        Only triples with a stored confidence are fed (triples recorded
+        without one never contributed at runtime either).
+        """
+        acc = self.data.setdefault("prediction_accuracy", {})
+        buckets = acc.get("calibration_buckets", [])
+        bucket_total = sum(b.get("count", 0) for b in buckets)
+        calibratable = [
+            t for t in self.data.get("action_triples", [])
+            if t.get("completed")
+            and t.get("prediction_confidence") is not None
+            and t.get("prediction_error") is not None
+        ]
+        if len(calibratable) - bucket_total < 3:
+            return  # Nothing to backfill, or gap is too small to matter
+        # Rebuild the curve from the authoritative source (the triples),
+        # using the same per-triple path runtime completion uses.
+        acc["calibration_buckets"] = []
+        acc["action_triple_calibrations"] = 0
+        for t in calibratable:
+            self._calibrate_from_action(
+                t["prediction_confidence"], t["prediction_error"]
+            )
+        new_total = sum(
+            b.get("count", 0) for b in acc["calibration_buckets"]
+        )
+        logger.info(
+            "Backfilled calibration buckets from %d → %d entries "
+            "(%d completed triples)",
+            bucket_total, new_total, len(calibratable),
         )
 
     def _clean_stale_calibration_buckets(self) -> None:

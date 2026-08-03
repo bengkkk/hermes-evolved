@@ -2198,3 +2198,123 @@ class TestCalibrationBucketCleanup:
                 f"got {loaded.data['prediction_accuracy']['calibration_buckets']}"
             )
 
+
+class TestCalibrationBackfill:
+    """Tests for _backfill_calibration_from_triples on load.
+
+    Regression for the 2026-08-03 observation: 200 completed triples on
+    disk each carrying prediction_confidence + prediction_error, but the
+    confidence-vs-error calibration curve held a single sample because
+    buckets were only ever fed by NEW completions — the derived cache was
+    never rebuilt from its authoritative source (the triples), unlike
+    error_history and per_type_accuracy.
+    """
+
+    def _wm_with_triples(self, confs_errors):
+        """Build a WorldModel with completed triples from (conf, err) pairs."""
+        wm = WorldModel()
+        for conf, err_signal in confs_errors:
+            # actual outcome chosen so the scorer yields the wanted error:
+            # exact-match expected/actual → 0.0; mismatch → nonzero.
+            expected = f"outcome-{err_signal}"
+            tid = wm.record_action(
+                "shell", "backfill test action", expected,
+                prediction_confidence=conf,
+            )
+            wm.complete_action(tid, expected)  # exact match → error 0.0
+        return wm
+
+    def test_backfill_repopulates_wiped_buckets(self):
+        """After a wipe (bucket_total=0) with many calibratable triples,
+        the curve is rebuilt from the triples and the counter restored."""
+        wm = self._wm_with_triples([(0.5, 1), (0.7, 2), (0.95, 3), (0.3, 4)])
+        acc = wm.data["prediction_accuracy"]
+        # Simulate the observed broken state: buckets emptied by a wipe.
+        acc["calibration_buckets"] = []
+        acc["action_triple_calibrations"] = 0
+        wm._backfill_calibration_from_triples()
+        buckets = acc["calibration_buckets"]
+        total = sum(b["count"] for b in buckets)
+        assert total == 4, f"expected 4 bucket entries, got {total}"
+        assert acc["action_triple_calibrations"] == 4
+        # Confidence 0.5 → bucket 2, 0.7 → bucket 3, 0.95 → bucket 4, 0.3 → bucket 1
+        assert buckets[2]["count"] == 1
+        assert buckets[3]["count"] == 1
+        assert buckets[4]["count"] == 1
+        assert buckets[1]["count"] == 1
+
+    def test_backfill_skips_when_curve_current(self):
+        """A populated curve that is not meaningfully short is untouched."""
+        wm = self._wm_with_triples([(0.5, 1), (0.5, 2), (0.5, 3), (0.5, 4)])
+        acc = wm.data["prediction_accuracy"]
+        # Runtime already populated the curve from these completions.
+        before = [dict(b) for b in acc["calibration_buckets"]]
+        wm._backfill_calibration_from_triples()
+        assert acc["calibration_buckets"] == before
+
+    def test_backfill_excludes_triples_without_confidence(self):
+        """Legacy triples lacking prediction_confidence never fed the
+        curve at runtime, so the backfill must not count them either.
+        (record_action always derives a default confidence from the
+        source, so a None confidence can only arrive as legacy data —
+        which is exactly what load() must tolerate.)"""
+        wm = WorldModel()
+        triples = [
+            {
+                "id": f"legacy-{i}", "action_type": "shell",
+                "action_description": "legacy no-conf",
+                "expected_outcome": "expected-out",
+                "expected_source": "llm",
+                "prediction_confidence": None,  # legacy: no confidence stored
+                "prediction_error": 0.0,
+                "actual_outcome": "expected-out",
+                "completed": True,
+            }
+            for i in range(2)
+        ]
+        triples += [
+            {
+                "id": f"conf-{i}", "action_type": "shell",
+                "action_description": "with-conf",
+                "expected_outcome": "expected-out",
+                "expected_source": "llm",
+                "prediction_confidence": 0.6,
+                "prediction_error": 0.0,
+                "actual_outcome": "expected-out",
+                "completed": True,
+            }
+            for i in range(3)
+        ]
+        wm.data["action_triples"] = triples
+        acc = wm.data["prediction_accuracy"]
+        acc["calibration_buckets"] = []
+        acc["action_triple_calibrations"] = 0
+        wm._backfill_calibration_from_triples()
+        total = sum(b["count"] for b in acc["calibration_buckets"])
+        assert total == 3  # only the confidence-carrying triples
+        assert acc["action_triple_calibrations"] == 3
+
+    def test_backfill_invoked_on_load(self):
+        """load() repopulates the curve from on-disk triples when the
+        stored curve is empty (the observed production state)."""
+        import tempfile, json
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "test_wm.json"
+            wm = self._wm_with_triples(
+                [(0.5, 1), (0.5, 2), (0.5, 3), (0.8, 4), (0.8, 5)]
+            )
+            # Simulate the wipe that production suffered.
+            wm.data["prediction_accuracy"]["calibration_buckets"] = []
+            wm.data["prediction_accuracy"]["action_triple_calibrations"] = 0
+            path.write_text(json.dumps(wm.data), encoding="utf-8")
+
+            loaded = WorldModel.load(path)
+            acc = loaded.data["prediction_accuracy"]
+            total = sum(b["count"] for b in acc["calibration_buckets"])
+            assert total == 5, (
+                f"expected 5 bucket entries after load-backfill, got {total}"
+            )
+            assert acc["action_triple_calibrations"] == 5
+
