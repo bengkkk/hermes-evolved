@@ -5019,7 +5019,57 @@ class TestCycleBodyLlmCallWorldModelRecording:
         t = triples[-1]
         assert "success or timeout" in t["expected_outcome"], t["expected_outcome"]
         assert "outage tier 'healthy'" in t["expected_outcome"], t["expected_outcome"]
-        assert "3/5 recent calls near-budget" in t["expected_outcome"], t["expected_outcome"]
+        assert "3/10 recent calls near-budget" in t["expected_outcome"], t["expected_outcome"]
+        assert t["prediction_error"] == 0.4, t["prediction_error"]
+
+    def test_healthy_tier_strain_outside_failure_window_still_hedges(
+        self, evolve_env: Dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Near-budget strain 6-10 calls back must still hedge a healthy tier.
+
+        Regression guard for the 2026-08-03 12:33Z observation: a 94.9%-
+        of-budget success at 10:52Z (near-budget strain, a LEADING
+        degradation indicator) was followed by five clean cycles and then
+        a 2-attempt timeout.  By the time the timeout hit, the strain sat
+        6+ calls back — outside the 5-call hard-failure window — so the
+        healthy tier saw a clean window, predicted flat "success:", and
+        scored a confident 0.85.  The strain lookback (_LLM_STRAIN_WINDOW)
+        is wider than the failure lookback (_LLM_HEALTH_WINDOW) so a
+        success that ground near its budget 6-10 calls back still hedges.
+        """
+        td = evolve_env["module"]
+        wm = td.load_world_model()
+        # 7 clean, fast successes (would clear a 5-call failure window)...
+        for _ in range(7):
+            tid = wm.record_action(
+                "llm_call",
+                "LLM thinking call (adaptive retry policy)",
+                "success: LLM responds within 2 attempt(s) × 90s budget",
+                expected_source="daemon",
+                parameters={"success": True, "last_error": None},
+            )
+            wm.complete_action(tid, "succeeded on attempt 1 (1.5s)")
+        # ...then one near-budget strain (94.9% of 2×90s) 8 calls back
+        tid = wm.record_action(
+            "llm_call",
+            "LLM thinking call (adaptive retry policy)",
+            "success: LLM responds within 2 attempt(s) × 90s budget",
+            expected_source="daemon",
+            parameters={"success": True, "last_error": None},
+        )
+        wm.complete_action(tid, "succeeded on attempt 2 (170.9s)")
+        wm.save()
+
+        asyncio.run(self._run_cycle(evolve_env, monkeypatch,
+                                    populate_stats=True,
+                                    fallback_cycles=0))
+
+        wm = td.load_world_model()
+        triples = [t for t in wm.data.get("action_triples", [])
+                   if t["action_type"] == "llm_call"]
+        t = triples[-1]
+        assert "success or timeout" in t["expected_outcome"], t["expected_outcome"]
+        assert "1/10 recent calls near-budget" in t["expected_outcome"], t["expected_outcome"]
         assert t["prediction_error"] == 0.4, t["prediction_error"]
 
     def test_healthy_tier_fast_recovery_stays_confident(

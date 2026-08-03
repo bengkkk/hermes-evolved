@@ -174,6 +174,19 @@ _LLM_RETRY_DEFAULTS = (2, 90.0)  # (max_retries, per-attempt timeout s)
 # tier (2026-08-02 — 03:16Z timeout scored a confident 0.85 right after
 # a successful cycle).
 _LLM_HEALTH_WINDOW = 5
+# Lookback window for NEAR-BUDGET strain, wider than _LLM_HEALTH_WINDOW
+# (2026-08-03).  A hard failure is a strong, immediate signal — 5 calls
+# back is the right horizon.  But a near-budget success (>= 85% of the
+# total retry budget consumed) is a LEADING degradation indicator: it
+# precedes the hard failure by several cycles.  Observed 2026-08-03
+# 12:33Z: the 10:52Z success consumed 94.9% of its 2×90s budget, then
+# five clean cycles followed, then a 2-attempt timeout — by which point
+# the strain sat 6+ calls back, outside the 5-call failure window, so
+# the healthy tier predicted flat "success:" and scored a confident
+# 0.85.  Strain needs a longer memory than failure: a success that
+# ground near its budget 6-10 calls back still means the endpoint is
+# degrading, so it must still hedge.
+_LLM_STRAIN_WINDOW = 10
 _llm_max_retries: int = _LLM_RETRY_DEFAULTS[0]
 _llm_attempt_timeout: float = _LLM_RETRY_DEFAULTS[1]
 # Tier name of the most recent _set_llm_retry_policy application. Populated
@@ -408,6 +421,15 @@ def _recent_llm_call_near_budget(wm) -> int:
     alongside hard failures makes the healthy-tier hedge fire on the
     degradation itself, not just the outage that follows it.
 
+    The lookback is _LLM_STRAIN_WINDOW (wider than the hard-failure
+    window) because strain is a LEADING indicator: observed 2026-08-03
+    12:33Z, a 94.9%-of-budget success at 10:52Z was followed by five
+    clean cycles before a 2-attempt timeout — the strain sat 6+ calls
+    back, outside the 5-call failure window, so a 5-call strain lookback
+    would have let the healthy tier predict flat "success:" into the
+    timeout and score a confident 0.85.  A success that ground near its
+    budget 6-10 calls back still means the endpoint is degrading.
+
     Parsing is defensive: any triple whose strings do not carry the
     attempt/budget numbers is skipped (not strained), never a crash.
     """
@@ -419,7 +441,7 @@ def _recent_llm_call_near_budget(wm) -> int:
             if t.get("action_type") == "llm_call" and t.get("completed")
         ]
         near = 0
-        for t in triples[-_LLM_HEALTH_WINDOW:]:
+        for t in triples[-_LLM_STRAIN_WINDOW:]:
             m = _LLM_ACTUAL_ATTEMPT_RE.search(
                 (t.get("actual_outcome") or "").lower()
             )
@@ -5386,7 +5408,7 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
                         )
                     if _recent_near_budget:
                         _hedge_parts.append(
-                            f"{_recent_near_budget}/{_LLM_HEALTH_WINDOW} "
+                            f"{_recent_near_budget}/{_LLM_STRAIN_WINDOW} "
                             "recent calls near-budget"
                         )
                     _hedge_note = (
