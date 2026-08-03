@@ -708,3 +708,86 @@ class TestTimelineCommitmentSupersession:
         assert comms[2]["status"] == "active"      # the new row
 
 
+# ══════════════════════════════════════════════════════════════════
+#  Local plan maintenance (LLM-down plan_action parity)
+# ══════════════════════════════════════════════════════════════════
+
+
+def _plan_state(plan_steps):
+    """Build a state dict whose timeline has one active plan."""
+    wm = _make_wm_with_triples()
+    state = _make_state(wm)
+    state["timeline"]["future"]["plans"] = [{
+        "id": "plan_test",
+        "goal": "Test plan",
+        "steps": plan_steps,
+        "status": "active",
+        "progress": "0/0 steps",
+    }]
+    return state
+
+
+class TestLocalPlanMaintenance:
+    """Verify _local_plan_maintenance emits plan_action only on real evidence."""
+
+    def test_completes_step_with_delivered_artifact(self):
+        """A pending step whose note says 'delivered' AND names an on-disk
+        artifact is auto-completed — the observed 2026-08-03 step_4 case."""
+        state = _plan_state([{
+            "id": "step_1",
+            "description": "Propose Level 3 allowlist entries for user review",
+            "verification": "docs/gap10-level3-scope.md exists with bounded candidates",
+            "status": "pending",
+            "note": "Proposal delivered via docs/gap10-level3-scope.md (committed b2103c9b1)",
+        }])
+        result = _local_analysis(state)
+        pa = result["plan_action"]
+        assert pa is not None
+        assert pa["step_id"] == "step_1"
+        assert pa["new_status"] == "complete"
+
+    def test_no_plan_action_without_delivery_marker(self):
+        """A pending step with no 'delivered/committed' marker is untouched."""
+        state = _plan_state([{
+            "id": "step_1",
+            "description": "Draft Level 3 scope",
+            "verification": "docs/gap10-level3-scope.md exists",
+            "status": "pending",
+            "note": "in progress",
+        }])
+        result = _local_analysis(state)
+        assert result["plan_action"] is None
+
+    def test_no_plan_action_when_artifact_missing(self):
+        """'delivered' in the note is NOT enough — the artifact must exist."""
+        state = _plan_state([{
+            "id": "step_1",
+            "description": "Publish doc",
+            "verification": "docs/does-not-exist-xyz.md",
+            "status": "pending",
+            "note": "delivered via docs/does-not-exist-xyz.md",
+        }])
+        result = _local_analysis(state)
+        assert result["plan_action"] is None
+
+    def test_no_plan_action_when_no_active_plan(self):
+        """No active plan → no plan_action (existing behaviour preserved)."""
+        wm = _make_wm_with_triples()
+        state = _make_state(wm)  # plans: []
+        result = _local_analysis(state)
+        assert result["plan_action"] is None
+
+    def test_completed_step_not_touched(self):
+        """Already-complete steps are skipped even if they mention delivery."""
+        state = _plan_state([{
+            "id": "step_1",
+            "description": "Done step",
+            "verification": "docs/gap10-level3-scope.md exists",
+            "status": "complete",
+            "note": "delivered via docs/gap10-level3-scope.md",
+        }])
+        result = _local_analysis(state)
+        assert result["plan_action"] is None
+
+
+

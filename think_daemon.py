@@ -3683,6 +3683,50 @@ def _select_state_check_action(
     return dict(commands[idx])
 
 
+def _local_plan_maintenance(tl: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Emit a ``plan_action`` from local evidence when the LLM is down.
+
+    The LLM path marks plan steps complete via ``plan_action``; the
+    fallback path never did, so a step whose deliverable is verifiably
+    done stayed ``pending`` for the whole outage. Observed 2026-08-03:
+    step_4 of plan_20260802233856 — the Level 3 scope doc was committed
+    (b2103c9b1) and delivered to the user at 00:27, yet the step remained
+    ``pending`` for cycles because only the LLM can emit plan_action, and
+    the world-model prediction "step_4 complete will be reflected in the
+    next cycle's plan state" failed (avg_error 0.9).
+
+    This closes that gap with a CONSERVATIVE check: a pending/in_progress
+    step is auto-completed only when its own note or verification records
+    delivery ("delivered"/"committed"/"published") AND a referenced
+    artifact path exists on disk. No heuristic guessing — both signals
+    must be present, so a step is never completed on weak evidence.
+    """
+    plans = (tl.get("future") or {}).get("plans", [])
+    active = next((p for p in plans if p.get("status") == "active"), None)
+    if not active:
+        return None
+    for s in active.get("steps", []):
+        if s.get("status") not in ("pending", "in_progress"):
+            continue
+        text = "{} {}".format(s.get("note") or "", s.get("verification") or "")
+        if not any(
+            m in text.lower()
+            for m in ("delivered", "committed", "published", "proposal delivered")
+        ):
+            continue
+        # Require a referenced artifact path that actually exists on disk.
+        for p in re.findall(r"[\w./-]+\.(?:md|py|json|yaml|yml|txt)", text):
+            p = p.rstrip(".,;:)]}")
+            cand = Path(p) if Path(p).is_absolute() else Path(_WORKSPACE_ROOT_STR) / p
+            if cand.exists():
+                return {
+                    "step_id": str(s.get("id", "")),
+                    "new_status": "complete",
+                    "note": "auto-completed by local fallback: deliverable committed/delivered on disk (LLM down)",
+                }
+    return None
+
+
 def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate a useful thinking-cycle result from local data only, no LLM call.
 
@@ -3698,6 +3742,9 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
       - A data-driven state-check action via _select_state_check_action
         that prefers under-sampled action types, so fallback cycles keep
         collecting data for the world model even when the LLM is down.
+      - A conservative plan_action via _local_plan_maintenance when a
+        plan step's deliverable is verifiably committed/delivered on disk,
+        so plan state does not go stale during LLM outages.
     """
     wm: WorldModel = state.get("world_model", load_world_model())
     sm: dict = state.get("self_model", load_self_model())
@@ -3937,7 +3984,7 @@ def _local_analysis(state: Dict[str, Any]) -> Dict[str, Any]:
             ],
         },
         "action": _action,
-        "plan_action": None,
+        "plan_action": _local_plan_maintenance(tl),
         "new_plan": None,
         "new_goal": new_goal,
         "goal_action": goal_action,
