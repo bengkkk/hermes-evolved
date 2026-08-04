@@ -738,16 +738,33 @@ class WorldModel:
             Error score (0.0–1.0) or None if not found.
         """
         for pred in self.data.get("predictions", []):
-            if pred.get("id") == pred_id and not pred.get("verified"):
-                pred["verified"] = True
-                pred["actual"] = actual_outcome
-                pred["verification_note"] = note
+            if pred.get("id") != pred_id:
+                continue
+            was_uncertain = (
+                pred.get("verified")
+                and pred.get("outcome_class") == "uncertain"
+                and pred.get("error") == 0.5
+            )
+            if pred.get("verified") and not was_uncertain:
+                continue
+            pred["verified"] = True
+            pred["actual"] = actual_outcome
+            pred["verification_note"] = note
 
-                error = _compute_prediction_error(pred.get("text", ""), actual_outcome)
-                pred["error"] = error
-                pred["verified_at"] = now_iso()
-                pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
+            error = _compute_prediction_error(pred.get("text", ""), actual_outcome)
+            pred["error"] = error
+            pred["verified_at"] = now_iso()
+            pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
 
+            if was_uncertain:
+                # Late-evidence upgrade: the expiry fallback already counted
+                # this record in verified_predictions without a
+                # correct/incorrect class.  Recompute all counters from the
+                # retained list so the invariant
+                # ``verified == correct + incorrect + uncertain`` holds and
+                # the 0.5 placeholder leaves the running average.
+                self._reconcile_prediction_stats()
+            else:
                 # Update accuracy stats
                 acc = self.data.setdefault("prediction_accuracy", {})
                 acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
@@ -763,9 +780,9 @@ class WorldModel:
                     (prev_avg * (total_verified - 1) + error) / total_verified, 4
                 )
 
-                self._update_calibration(pred.get("confidence", 0.5), error)
-                self._add_to_error_history(error)
-                return error
+            self._update_calibration(pred.get("confidence", 0.5), error)
+            self._add_to_error_history(error)
+            return error
         return None
 
     # ── Evidence-based verification (Gap 6 learning loop) ─────────
@@ -888,29 +905,58 @@ class WorldModel:
         for the caller to handle, e.g. via timeout-based auto-verification).
         """
         for pred in self.data.get("predictions", []):
-            if pred.get("id") != pred_id or pred.get("verified"):
+            if pred.get("id") != pred_id:
                 continue
-            evidence = self._find_prediction_evidence(pred.get("text", ""))
-            if evidence is None:
-                return None
-            blob_l, matched = evidence
-            error = self._score_evidence_blob(blob_l)
-            if error is None:
-                return None
-            pred["verified"] = True
-            pred["actual"] = (
-                "fulfilled — action evidence found"
-                if error <= 0.3
-                else "contradicted — action evidence shows failure"
+            was_uncertain = (
+                pred.get("verified")
+                and pred.get("outcome_class") == "uncertain"
+                and pred.get("error") == 0.5
             )
-            pred["verification_note"] = (
-                f"Auto-verified via action-triple evidence "
-                f"(matched: {', '.join(matched)})"
-            )
-            pred["verified_at"] = now_iso()
-            pred["error"] = error
-            pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
+            if pred.get("verified") and not was_uncertain:
+                continue
+            return self._apply_evidence_verification(pred)
+        return None
 
+    def _apply_evidence_verification(self, pred: Dict[str, Any]) -> Optional[float]:
+        """Shared evidence-verification core.
+
+        Searches recorded action triples for the prediction's topic terms
+        and, when decisive evidence exists, marks the prediction verified
+        with the real error — handling stats both for fresh verifications
+        and for upgrades of auto-verified ``uncertain`` placeholders
+        (see :meth:`reconcile_uncertain_predictions`).
+        """
+        evidence = self._find_prediction_evidence(pred.get("text", ""))
+        if evidence is None:
+            return None
+        blob_l, matched = evidence
+        error = self._score_evidence_blob(blob_l)
+        if error is None:
+            return None
+        was_uncertain = (
+            pred.get("verified")
+            and pred.get("outcome_class") == "uncertain"
+            and pred.get("error") == 0.5
+        )
+        pred["verified"] = True
+        pred["actual"] = (
+            "fulfilled — action evidence found"
+            if error <= 0.3
+            else "contradicted — action evidence shows failure"
+        )
+        pred["verification_note"] = (
+            f"Auto-verified via action-triple evidence "
+            f"(matched: {', '.join(matched)})"
+        )
+        pred["verified_at"] = now_iso()
+        pred["error"] = error
+        pred["outcome_class"] = "correct" if error <= 0.3 else "incorrect"
+
+        if was_uncertain:
+            # Late-evidence upgrade — same invariant rationale as
+            # verify_prediction's upgrade branch.
+            self._reconcile_prediction_stats()
+        else:
             acc = self.data.setdefault("prediction_accuracy", {})
             acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
             if error <= 0.3:
@@ -924,10 +970,32 @@ class WorldModel:
                 (prev_avg * (total_verified - 1) + error) / total_verified, 4
             )
 
-            self._update_calibration(pred.get("confidence", 0.5), error)
-            self._add_to_error_history(error)
-            return error
-        return None
+        self._update_calibration(pred.get("confidence", 0.5), error)
+        self._add_to_error_history(error)
+        return error
+
+    def reconcile_uncertain_predictions(self) -> int:
+        """Upgrade auto-verified ``uncertain`` predictions with late evidence.
+
+        The expiry fallback (:meth:`verify_expired_predictions`) stamps a
+        prediction ``uncertain`` (error 0.5, deliberately excluded from
+        calibration) when no decisive evidence existed at expiry time.
+        Evidence arriving in later cycles was never reconciled, so real
+        observations stayed degraded at 0.5 forever — the learning loop
+        discarded them.  This sweep re-runs the evidence stage over every
+        verified-``uncertain`` prediction and upgrades those with
+        now-decisive evidence to their real error, feeding calibration
+        exactly as a fresh verification would.
+
+        Returns the number of predictions upgraded.
+        """
+        upgraded = 0
+        for pred in self.data.get("predictions", []):
+            if pred.get("outcome_class") != "uncertain" or pred.get("error") != 0.5:
+                continue
+            if self._apply_evidence_verification(pred) is not None:
+                upgraded += 1
+        return upgraded
 
     # ── Auto-verification of expired predictions ──────────────────
 

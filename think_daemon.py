@@ -5799,7 +5799,16 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
         pending_count = wm.verify_pending_predictions()
         if pending_count > 0:
             logger.info("Evidence-verified %d pending predictions", pending_count)
-        if expired_count + pending_count > 0:
+        # Late-evidence reconciliation: upgrade auto-verified 'uncertain'
+        # predictions (error 0.5 placeholders) to real outcomes once
+        # decisive action-triple evidence has accumulated since expiry.
+        uncertain_upgraded = wm.reconcile_uncertain_predictions()
+        if uncertain_upgraded > 0:
+            logger.info(
+                "Upgraded %d uncertain predictions with late evidence",
+                uncertain_upgraded,
+            )
+        if expired_count + pending_count + uncertain_upgraded > 0:
             # Save immediately so changes persist even if the LLM call fails
             # or the cycle returns early on parse errors (line 1986).
             wm.save()

@@ -250,6 +250,107 @@ class TestMacroPredictions:
         wm = WorldModel()
         assert wm.verify_prediction("pred_nonexistent", "outcome") is None
 
+    def test_verify_prediction_upgrades_auto_verified_uncertain(self) -> None:
+        """A manual verification can upgrade an auto-verified 'uncertain'
+        placeholder (error 0.5) once the real outcome is known — late
+        evidence must feed calibration instead of staying degraded."""
+        wm = WorldModel()
+        pid = wm.record_prediction(
+            "clean_pattern_cycles counter present in daemon_state.json",
+            timeframe="1 cycle",
+            confidence=0.7,
+            basis="test",
+        )
+        # Simulate the expiry fallback: the prediction was stamped
+        # 'uncertain' (error 0.5) and counted in verified/avg without a
+        # correct/incorrect class.
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        pred["verified"] = True
+        pred["actual"] = "timeframe expired — no confirmation"
+        pred["error"] = 0.5
+        pred["outcome_class"] = "uncertain"
+        acc = wm.data.setdefault("prediction_accuracy", {})
+        acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
+        acc["avg_prediction_error"] = 0.5
+
+        err = wm.verify_prediction(
+            pid,
+            "clean_pattern_cycles counter present in daemon_state.json (value 3)",
+            "late evidence",
+        )
+        assert err is not None and err <= 0.3
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        assert pred["outcome_class"] == "correct"
+        acc = wm.data["prediction_accuracy"]
+        # Invariant restored: verified_predictions must NOT be double-counted.
+        assert acc["verified_predictions"] == 1
+        assert acc["correct_predictions"] == 1
+        assert acc["incorrect_predictions"] == 0
+        assert acc["avg_prediction_error"] == pytest.approx(err)
+
+    def test_reconcile_uncertain_predictions_upgrades_with_late_evidence(self) -> None:
+        """reconcile_uncertain_predictions upgrades uncertain placeholders
+        once decisive action-triple evidence has accumulated."""
+        wm = WorldModel()
+        pid = wm.record_prediction(
+            "the audit will confirm clean_pattern_cycles durability in daemon_state.json",
+            timeframe="1 cycle",
+            confidence=0.7,
+            basis="test",
+        )
+        # Simulate the expiry fallback (uncertain placeholder).
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        pred["verified"] = True
+        pred["actual"] = "timeframe expired — no confirmation"
+        pred["error"] = 0.5
+        pred["outcome_class"] = "uncertain"
+        acc = wm.data.setdefault("prediction_accuracy", {})
+        acc["verified_predictions"] = acc.get("verified_predictions", 0) + 1
+        acc["avg_prediction_error"] = 0.5
+
+        # Evidence arrives in a later cycle: an inspection triple records
+        # the audit outcome containing the prediction's topic terms.
+        tid = wm.record_action(
+            "inspection",
+            "audit clean_pattern_cycles durability in daemon_state.json",
+            expected_outcome="counter present with increment site",
+            expected_source="fallback",
+        )
+        wm.complete_action(
+            tid,
+            "clean_pattern_cycles found in daemon_state.json with increment site in live source",
+        )
+
+        assert wm.reconcile_uncertain_predictions() == 1
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        assert pred["error"] == 0.15
+        assert pred["outcome_class"] == "correct"
+        acc = wm.data["prediction_accuracy"]
+        assert acc["verified_predictions"] == 1
+        assert acc["correct_predictions"] == 1
+        assert acc["incorrect_predictions"] == 0
+        assert acc["avg_prediction_error"] == pytest.approx(0.15)
+
+    def test_reconcile_uncertain_predictions_noop_without_evidence(self) -> None:
+        """Uncertain predictions stay untouched when no evidence exists."""
+        wm = WorldModel()
+        pid = wm.record_prediction(
+            "some unrelated future event prediction",
+            timeframe="1 cycle",
+            confidence=0.5,
+            basis="test",
+        )
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        pred["verified"] = True
+        pred["actual"] = "timeframe expired — no confirmation"
+        pred["error"] = 0.5
+        pred["outcome_class"] = "uncertain"
+
+        assert wm.reconcile_uncertain_predictions() == 0
+        pred = next(p for p in wm.data["predictions"] if p["id"] == pid)
+        assert pred["error"] == 0.5
+        assert pred["outcome_class"] == "uncertain"
+
     def test_predictions_capped_at_100(self) -> None:
         wm = WorldModel()
         for i in range(150):
