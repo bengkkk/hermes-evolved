@@ -6187,17 +6187,20 @@ async def _run_cycle_body(result: Dict[str, Any], ds: Dict[str, Any]) -> Dict[st
     ds["last_tick"] = now_ts
     ds["tick_count"] = ds.get("tick_count", 0) + 1
     ds["status"] = "ok"
-    # 7.1 Consecutive clean-pattern counter (plan verification)
-    # The llm_call error-reduction plan requires "no llm_call discrepancy
-    # pattern for 5 consecutive cycles" before closing the P3 goal; the
-    # world model's discrepancy_patterns list is the single source of
-    # truth.  Increment once per completed cycle when NO llm_call pattern
-    # is present, reset on the first cycle an llm_call pattern appears.
-    # The check is scoped to action_type == "llm_call": the counter exists
-    # to gate the llm_call plan, so an unrelated pattern (e.g. a flaky
-    # shell command) must not reset the llm_call verification streak.
-    # Read fresh from the in-memory world model so both llm-backed and
-    # local-analysis cycles update it identically.
+    # 7.1 Consecutive clean-pattern counter (informational health metric)
+    # The 5-cycle clean gate for the llm_call error-reduction goal
+    # (goal_20260802090333_0) was reached (26 consecutive clean cycles as
+    # of tick 561) and the goal is completed, so this counter no longer
+    # gates any plan — it is a closed health metric tracking consecutive
+    # cycles without an llm_call discrepancy pattern (see commit
+    # 4357eaf30).  Keep the mechanism unchanged: increment once per
+    # completed cycle when NO llm_call pattern is present in the world
+    # model's discrepancy_patterns list, reset to 0 on the first cycle an
+    # llm_call pattern appears.  The check is scoped to
+    # action_type == "llm_call" so an unrelated pattern (e.g. a flaky
+    # shell command) must not reset the streak.  Read fresh from the
+    # in-memory world model so both llm-backed and local-analysis cycles
+    # update it identically.
     _patterns_now = wm.get_discrepancy_patterns()
     _llm_pattern_now = any(
         p.get("action_type") == "llm_call" for p in _patterns_now
